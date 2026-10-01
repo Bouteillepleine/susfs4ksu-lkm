@@ -36,6 +36,12 @@ jobs:
           - android14-5.15
           - android14-6.1
           - android15-6.6
+          # 6.12 (Android 16) is where LSM dispatch became per-hook static calls
+          # (static_calls_table) and security_hook_list lost its hlist node, so the
+          # < 6.12 head-insertion path cannot work there.  It is in the matrix so that
+          # the >= 6.12 code path is compiled at all - it had never been built before -
+          # and nothing is published for it until it has been run on hardware.
+          - android16-6.12
     container:
       # DDK-min image with the GKI kernel headers (modules_prepare done), Module.symvers
       # and the matching Clang toolchain.  KMI freezing guarantees symbol CRCs match the
