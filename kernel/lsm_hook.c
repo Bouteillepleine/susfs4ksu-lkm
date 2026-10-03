@@ -320,15 +320,18 @@ static int ksu_lsm_hook_update_scall(struct lsm_static_call *scall, void *value)
  *
  * The only symbol it needs is static_calls_table itself (resolved by name, like every
  * other symbol here) plus the slot's own key/trampoline, which lsm_static_call_init()
- * already filled.  The write itself goes through __static_call_update(), i.e. the kernel
- * own primitive: x86-64 builds (CONFIG_HAVE_STATIC_CALL_INLINE) import it from
- * kernel/static_call_inline.c, while arm64 takes linux/static_call.h's inline flavour -
- * measured, not assumed: the android16-6.12 and android17-6.18 .ko files import neither
- * __static_call_update nor cpus_read_lock() nor arch_static_call_transform(), which is
- * what the HAVE_STATIC_CALL/HAVE_STATIC_CALL_INLINE branches of that header would have
- * pulled in.  Nothing here patches text by hand, which is the point: whatever flavour
- * the tree uses, the same call the kernel's own lsm_static_call_init() makes is the call
- * this code makes.
+ * already filled.  The write itself goes through __static_call_update(), i.e. the
+ * kernel's own primitive.  Which of its three definitions linux/static_call.h compiles
+ * is decided by CONFIG_HAVE_STATIC_CALL(_INLINE) and NOT by the architecture: the extern
+ * one (kernel/static_call_inline.c, the only one that pulls in cpus_read_lock() and
+ * arch_static_call_transform()) needs HAVE_STATIC_CALL_INLINE, and neither option is set
+ * in the trees this module is built against.  Measured, not assumed: the android16-6.12
+ * and android17-6.18 .ko files import neither __static_call_update nor cpus_read_lock()
+ * nor arch_static_call_transform(), i.e. the generic `WRITE_ONCE(key->func, func)`
+ * flavour is what got compiled - the same config that makes the trampoline those trees
+ * register NULL (security.c's LSM_HOOK_TRAMP()).  Nothing here patches text by
+ * hand, which is the point: whatever flavour the tree uses, the same call the
+ * kernel's own lsm_static_call_init() makes is the call this code makes.
  *
  * NOTHING IS WRITTEN until every offset has been validated against the LIVE table,
  * because the failure this must not have is a jump target that is wrong rather than
@@ -554,10 +557,21 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
      * pass-through path, so the field has to be visible BEFORE the static call can
      * reach the replacement.  The reverse order would let one call arrive in between
      * and see original == NULL - i.e. drop SELinux's decision for that call, which is
-     * the single failure mode this whole path is built to avoid. */
+     * the single failure mode this whole path is built to avoid.
+     *
+     * The store-store fence is what makes that true on a weakly ordered CPU: the
+     * kernel's own static_call_update is a plain WRITE_ONCE of key->func, and on arm64
+     * two stores from one CPU can be observed in the opposite order by another.  (The
+     * smp_wmb() inside ksu_lsm_hook_update_scall() is AFTER that store and therefore
+     * orders nothing between it and hook->original.)  The matching load-load fence is
+     * on the reader side, in SUS_LSM_PASS_ORIG(): a writer-side fence alone still
+     * leaves the reader free to reorder its load of original before the load of
+     * key->func that sent it here, which is the same dropped-decision window by
+     * another route - so both halves are needed and both are cheap. */
     hook->scall = chosen;
     hook->entry = chosen_hl;
     hook->original = chosen_orig;
+    smp_wmb();
     ksu_lsm_hook_update_scall(chosen, hook->replacement);
 
     SUSFS_LOGI("lsm_hook: insert via static call slot (selinux, slot %d, %s static call) %s: %px -> %px\n",

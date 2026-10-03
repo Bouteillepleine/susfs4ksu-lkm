@@ -735,8 +735,17 @@ static int sus_path_inode_permission(struct inode *inode, int mask);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #define SUS_LSM_PASS_ORIG(hook, member, ...)						\
 	do {										\
-		LSM_HOOK_FN_TYPE(member) __susfs_orig =				\
-			(LSM_HOOK_FN_TYPE(member))READ_ONCE((hook).original);		\
+		LSM_HOOK_FN_TYPE(member) __susfs_orig;				\
+		/* Load-load fence before the read.  The switch that sent this call		\
+		 * here is a plain store of key->func (the publish order in			\
+		 * ksu_lsm_hook_insert_scall()), and on a weakly ordered CPU the load	\
+		 * of original may be satisfied before the load of key->func that			\
+		 * preceded it - which is how this reads NULL on an armed hook and drops	\
+		 * SELinux's decision for that call.  The writer-side smp_wmb() closes	\
+		 * the propagation half, this closes the reader half; it is one			\
+		 * dmb ishld and only on the non-hidden path. */				\
+		smp_rmb();								\
+		__susfs_orig = (LSM_HOOK_FN_TYPE(member))READ_ONCE((hook).original);	\
 		if (__susfs_orig)							\
 			return __susfs_orig(__VA_ARGS__);				\
 	} while (0)
@@ -862,19 +871,25 @@ static struct ksu_lsm_hook sus_path_link_hook =
 
 /* ---- inode_setattr's FIRST argument, which followed later ----
  *
- * 6.12 added the id-mapping to this hook as well (the DDK's own declaration, printed
- * per variant by the "Show authoritative LSM hook signatures" CI step):
+ * inode_setattr is the one hook of our 13 whose prototype moved between the trees
+ * this module supports (compared per variant from each tree's own
+ * include/linux/lsm_hook_defs.h):
  *
- *   v6.11  LSM_HOOK(int, 0, inode_setattr, struct dentry *dentry, struct iattr *iattr)
- *   v6.12  LSM_HOOK(int, 0, inode_setattr, struct mnt_idmap *idmap,
- *                   struct dentry *dentry, struct iattr *iattr)
+ *   android15-6.6   LSM_HOOK(int, 0, inode_setattr, struct dentry *dentry, struct iattr *attr)
+ *   android16-6.12  LSM_HOOK(int, 0, inode_setattr, struct mnt_idmap *idmap,
+ *                            struct dentry *dentry, struct iattr *attr)
  *
- * and the same for 6.18.  The idmap is not used by the replacement (it matches on the
- * dentry's inode), but the parameter has to be there: the static_assert below turns a
- * missing one into a build failure, and a missing one at RUNTIME would be a kCFI panic
- * on the pass-through call.  Both spellings are needed for the same three positions the
- * xattr pair needs them for: a parameter list (named), a function-pointer type (no name)
- * and the leading call argument. */
+ * and android17-6.18 is line-for-line the 6.12 declaration.  Upstream the parameter
+ * arrived earlier (v6.8 has the dentry/iattr pair only, v6.9 has the idmap; the ACK
+ * 6.6 tree is LTS-frozen, so it kept the old KMI), which is why this gate is on the
+ * 6.12 tree boundary rather than on the release that changed it upstream: 6.6 and 6.12
+ * are the only two mount-id-relevant trees that exist as GKI, and each one is compiled
+ * here.  The idmap is not used by the replacement (it matches on the dentry's inode),
+ * but the parameter has to be there: the static_assert below turns a missing one into a
+ * build failure, and a missing one at RUNTIME would be a kCFI panic on the pass-through
+ * call.  Both spellings are needed for the same three positions the xattr pair needs
+ * them for: a parameter list (named), a function-pointer type (no name) and the leading
+ * call argument. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #define SUS_SETATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
 #define SUS_SETATTR_MNT_ID_ARG	idmap,

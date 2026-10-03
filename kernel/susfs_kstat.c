@@ -905,11 +905,18 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	struct timespec64 ctime;
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	/* 6.12 finished the job for atime/mtime as well: the fields are gone from
-	 * struct inode ("no member named 'i_atime' in 'struct inode'"), split into
-	 * i_atime_sec/i_atime_nsec and read through inode_get_atime()/inode_get_mtime(),
-	 * which return the same struct timespec64 by value.  Upstream marks all three
-	 * "use inode_*_*time accessors!". */
+	/* Same story for atime/mtime, one move later: v6.11 replaced the
+	 * `struct timespec64 i_atime/i_mtime` fields of struct inode with the split
+	 * `time64_t i_atime_sec/i_mtime_sec` + `u32 i_atime_nsec/i_mtime_nsec` (in the
+	 * trees built here: android16-6.12 include/linux/fs.h:669-674, android15-6.6
+	 * still has the old `struct timespec64 i_atime` at :664), so those two stopped
+	 * compiling the same way.  inode_get_atime()/inode_get_mtime() reassemble the
+	 * very same struct timespec64 by value (fs.h:1616-1622 and :1651-1657), which is
+	 * what the < 6.12 branch below reads directly.
+	 *
+	 * The gate is on 6.12 rather than on 6.11 because 6.11 is not a GKI kernel: the
+	 * trees this module is built for are 6.6 (old fields) and 6.12/6.18 (accessors),
+	 * and an untested 6.7-6.11 kernel is not something this branch claims. */
 	struct timespec64 atime, mtime;
 #endif
 
