@@ -709,8 +709,40 @@ static int sus_path_inode_permission(struct inode *inode, int mask);
  * hashes.  A mismatched signature panics, and __nocfi panics just as hard because
  * the function then emits no hash at all.  These assertions turn any mistake into
  * a build failure instead of a reboot.  NOTE: the address-of is required -
- * typeof(fn) is the function type while the hook field is a function pointer. */
+ * typeof(fn) is the function type while the hook field is a function pointer.
+ *
+ * They cover BOTH mechanisms: on < 6.12 our node is called by the dispatcher
+ * through this exact type, and on >= 6.12 our replacement sits in SELinux's
+ * static-call slot (same type) AND makes an indirect call back to the stolen
+ * original through a pointer of this type (SUS_LSM_PASS_ORIG below) - which is
+ * checked against the hook's own hash at that call site. */
 #define LSM_HOOK_FN_TYPE(member) typeof(((union security_list_options *)0)->member)
+
+/* ---- >= 6.12: the pass-through call to the stolen original ----
+ *
+ * The insert path on 6.12+ takes over the static-call slot SELinux was dispatched
+ * through, so the call that used to reach SELinux now reaches us.  A bare
+ * `return 0` would then NOT mean "no opinion, the chain continues" the way it does
+ * for a list node (< 6.12, where our node is simply first and SELinux is still
+ * walked): there is no chain here, each hook has one slot per LSM and SELinux's
+ * function would silently never run again - a fail-open in the one place it must
+ * not happen.  So the stored original is called, and the -ENOENT above
+ * short-circuits it exactly like a head node would.
+ *
+ * The call goes through a pointer typed by the hook declaration (the static_asserts
+ * above are what guarantees that type is right), hence the non-__nocfi rule: this
+ * call site is itself subject to kCFI. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define SUS_LSM_PASS_ORIG(hook, member, ...)						\
+	do {										\
+		LSM_HOOK_FN_TYPE(member) __susfs_orig =				\
+			(LSM_HOOK_FN_TYPE(member))READ_ONCE((hook).original);		\
+		if (__susfs_orig)							\
+			return __susfs_orig(__VA_ARGS__);				\
+	} while (0)
+#else
+#define SUS_LSM_PASS_ORIG(hook, member, ...) do { } while (0)
+#endif
 
 static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getattr),
 					   typeof(&sus_path_inode_getattr)),
@@ -828,8 +860,32 @@ static struct ksu_lsm_hook sus_path_link_hook =
 #define SUS_XATTR_MNT_ID_ARG
 #endif
 
+/* ---- inode_setattr's FIRST argument, which followed later ----
+ *
+ * 6.12 added the id-mapping to this hook as well (the DDK's own declaration, printed
+ * per variant by the "Show authoritative LSM hook signatures" CI step):
+ *
+ *   v6.11  LSM_HOOK(int, 0, inode_setattr, struct dentry *dentry, struct iattr *iattr)
+ *   v6.12  LSM_HOOK(int, 0, inode_setattr, struct mnt_idmap *idmap,
+ *                   struct dentry *dentry, struct iattr *iattr)
+ *
+ * and the same for 6.18.  The idmap is not used by the replacement (it matches on the
+ * dentry's inode), but the parameter has to be there: the static_assert below turns a
+ * missing one into a build failure, and a missing one at RUNTIME would be a kCFI panic
+ * on the pass-through call.  Both spellings are needed for the same three positions the
+ * xattr pair needs them for: a parameter list (named), a function-pointer type (no name)
+ * and the leading call argument. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define SUS_SETATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
+#define SUS_SETATTR_MNT_ID_ARG	idmap,
+#else
+#define SUS_SETATTR_MNT_ID_DECL
+#define SUS_SETATTR_MNT_ID_ARG
+#endif
+
 static int sus_path_sb_statfs(struct dentry *dentry);
-static int sus_path_inode_setattr(struct dentry *dentry, struct iattr *attr);
+static int sus_path_inode_setattr(SUS_SETATTR_MNT_ID_DECL
+				  struct dentry *dentry, struct iattr *attr);
 static int sus_path_inode_getxattr(struct dentry *dentry, const char *name);
 static int sus_path_inode_listxattr(struct dentry *dentry);
 static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
@@ -1054,7 +1110,9 @@ static int sus_path_inode_getattr(const struct path *path)
         }
     }
     /* Not hidden: no opinion.  The chain continues into SELinux, whose answer (and its
-     * AVC record) is what the caller gets. */
+     * AVC record) is what the caller gets - on >= 6.12 by calling it, since we hold the
+     * static-call slot it used to be dispatched through (see SUS_LSM_PASS_ORIG). */
+    SUS_LSM_PASS_ORIG(sus_path_getattr_hook, inode_getattr, path);
     return 0;
 }
 
@@ -1067,6 +1125,7 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
     /* Not hidden: 0, so SELinux still decides.  This matters most here: for an RCU walk
      * SELinux answers -ECHILD and the ref-walk retry in inode_permission() depends on
      * that answer reaching the caller unchanged. */
+    SUS_LSM_PASS_ORIG(sus_path_perm_hook, inode_permission, inode, mask);
     return 0;
 }
 
@@ -1095,6 +1154,7 @@ static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry)
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_nameop_hit();
+    SUS_LSM_PASS_ORIG(sus_path_unlink_hook, inode_unlink, dir, dentry);
     return 0;
 }
 
@@ -1102,6 +1162,7 @@ static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry)
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_nameop_hit();
+    SUS_LSM_PASS_ORIG(sus_path_rmdir_hook, inode_rmdir, dir, dentry);
     return 0;
 }
 
@@ -1112,6 +1173,8 @@ static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentr
      * overwriting a hidden file through its target name is the other. */
     if (sus_path_dentry_hidden(old_dentry) || sus_path_dentry_hidden(new_dentry))
         return sus_path_nameop_hit();
+    SUS_LSM_PASS_ORIG(sus_path_rename_hook, inode_rename, old_dir, old_dentry,
+                      new_dir, new_dentry);
     return 0;
 }
 
@@ -1122,6 +1185,7 @@ static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
      * is hidden and the new name is not. */
     if (sus_path_dentry_hidden(old_dentry))
         return sus_path_nameop_hit();
+    SUS_LSM_PASS_ORIG(sus_path_link_hook, inode_link, old_dentry, dir, new_dentry);
     return 0;
 }
 
@@ -1141,13 +1205,17 @@ static int sus_path_sb_statfs(struct dentry *dentry)
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_statfs_hook, sb_statfs, dentry);
     return 0;
 }
 
-static int sus_path_inode_setattr(struct dentry *dentry, struct iattr *attr)
+static int sus_path_inode_setattr(SUS_SETATTR_MNT_ID_DECL
+				  struct dentry *dentry, struct iattr *attr)
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_setattr_hook, inode_setattr,
+                      SUS_SETATTR_MNT_ID_ARG dentry, attr);
     return 0;
 }
 
@@ -1155,6 +1223,7 @@ static int sus_path_inode_getxattr(struct dentry *dentry, const char *name)
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_getxattr_hook, inode_getxattr, dentry, name);
     return 0;
 }
 
@@ -1162,6 +1231,7 @@ static int sus_path_inode_listxattr(struct dentry *dentry)
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_listxattr_hook, inode_listxattr, dentry);
     return 0;
 }
 
@@ -1171,6 +1241,8 @@ static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_setxattr_hook, inode_setxattr,
+                      SUS_XATTR_MNT_ID_ARG dentry, name, value, size, flags);
     return 0;
 }
 
@@ -1179,6 +1251,8 @@ static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
 {
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_removexattr_hook, inode_removexattr,
+                      SUS_XATTR_MNT_ID_ARG dentry, name);
     return 0;
 }
 
@@ -1188,6 +1262,7 @@ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int 
      * inode permission check on the target itself. */
     if (path && sus_path_dentry_hidden(path->dentry))
         return sus_path_meta_hit();
+    SUS_LSM_PASS_ORIG(sus_path_notify_hook, path_notify, path, mask, obj_type);
     return 0;
 }
 

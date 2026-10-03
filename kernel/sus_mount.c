@@ -72,9 +72,11 @@
  *
  * The fix is identity, not a wider scan: sweeping every namespace from the task
  * list would mean walking another namespace's mount list, and only the ns_lock
- * half of that protocol is reachable from a module (namespace_sem is static in
- * fs/namespace.c) - a foreign namespace mounts and unmounts while we walk it,
- * which is exactly the class of thing that takes a device down.  Instead the
+ * half of that protocol is reachable from a module on < 6.12 (namespace_sem is
+ * static in fs/namespace.c; on >= 6.12 that symbol is resolved by name because the
+ * caller's own namespace cannot be walked without it - see SUS_MOUNT_ITER_FOR) - a
+ * foreign namespace mounts and unmounts while we walk it, which is exactly the
+ * class of thing that takes a device down.  Instead the
  * mount's IDENTITY is remembered by the scan that already runs safely in the
  * caller's namespace:
  *
@@ -118,6 +120,8 @@
 #include <linux/limits.h>   /* PATH_MAX, INT_MAX (via vdso/limits.h) */
 #include <linux/security.h> /* security_secctx_to_secid() */
 #include <linux/proc_fs.h>  /* proc_create() for /proc/susfs_hide_mounts */
+#include <linux/rbtree.h>   /* >= 6.12: ns->mounts is an rb-tree, not a list */
+#include <linux/rwsem.h>    /* >= 6.12: namespace_sem is a struct rw_semaphore */
 #include "mount.h"      /* fs/mount.h: struct mount + struct mnt_namespace + real_mount() */
 #include "symbol_resolver.h"
 #include "susfs_abi.h"
@@ -743,17 +747,93 @@ static void sus_mount_note_id(struct mount *r)
 static atomic_t n_clone_walks = ATOMIC_INIT(0);
 static atomic_t n_clone_learned = ATOMIC_INIT(0);
 
+/* ---- how one iterates the mounts of a namespace, per kernel version ----
+ *
+ * < 6.12: struct mnt_namespace carries a plain `struct list_head list` of every
+ * struct mount (mnt_list), protected by ns_lock, and /proc/mounts anchors a fake
+ * "cursor" mount in that same list (MNT_CURSOR) which has to be skipped.
+ *
+ * >= 6.12 (both GKI android16-6.12 and android17-6.18): the list, ns_lock and
+ * MNT_CURSOR are GONE.  The mounts now live in `struct rb_root mounts`, keyed on
+ * mnt_id_unique, and the kernel's own iterator - the /proc/mounts one - takes
+ * namespace_sem for read and walks rb_next(&mnt->mnt_node) (fs/namespace.c m_start()/
+ * m_next()/m_stop(); fs/mount.h marks the tree "Protected by namespace_sem").  So:
+ *
+ *   - the walk is an rb_first()/rb_next() walk of ns->mounts;
+ *   - the cursor mount no longer exists; the equivalent "is this a real, attached
+ *     mount of this namespace" test is mnt_ns_attached() (the mnt_node is linked)
+ *     plus the same mnt_ns check as before;
+ *   - namespace_sem is `static DECLARE_RWSEM(namespace_sem)` in fs/namespace.c, so
+ *     it is not an exported symbol - it is resolved by NAME at load time like
+ *     mnt_id_ida is, and KALLSYMS_ALL (set in both GKI defconfigs) is what makes a
+ *     static data symbol findable.  If it cannot be resolved the walk REFUSES to
+ *     run: an unlocked rb-tree walk against a namespace another task is mounting
+ *     into is a rotated/torn tree, and reading it lockless is how a module panics
+ *     the device.  Refusing costs the marking (and says so loudly), never memory.
+ *
+ * The lock is taken by the caller through sus_mount_ns_walk_begin(): it may SLEEP
+ * (down_read), so it can only be used from process context - which is why the
+ * kretprobe path (sus_mount_learn_ns) walks without it and relies on the namespace
+ * being private instead (see its comment). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+static struct rw_semaphore *sus_mount_namespace_sem;
+
+static bool sus_mount_ns_walk_begin(void)
+{
+    if (!sus_mount_namespace_sem)
+        return false;
+    down_read(sus_mount_namespace_sem);
+    return true;
+}
+
+static void sus_mount_ns_walk_end(void)
+{
+    up_read(sus_mount_namespace_sem);
+}
+
+#define SUS_MOUNT_ITER_TYPE		struct rb_node *
+#define SUS_MOUNT_ITER_FOR(ns, it)	for ((it) = rb_first(&(ns)->mounts); (it); (it) = rb_next(it))
+#define SUS_MOUNT_ITER_MOUNT(it)	rb_entry((it), struct mount, mnt_node)
+#define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns) || !mnt_ns_attached(r))
+#else
+static bool sus_mount_ns_walk_begin(void)
+{
+    return true;	/* the caller takes ns_lock instead */
+}
+
+static void sus_mount_ns_walk_end(void)
+{
+}
+
+#define SUS_MOUNT_ITER_TYPE		struct list_head *
+#define SUS_MOUNT_ITER_FOR(ns, it)	for ((it) = (ns)->list.next; (it) != &(ns)->list; (it) = (it)->next)
+#define SUS_MOUNT_ITER_MOUNT(it)	list_entry((it), struct mount, mnt_list)
+#define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns) || ((r)->mnt.mnt_flags & MNT_CURSOR))
+#endif
+
 static void sus_mount_learn_ns(struct mnt_namespace *ns)
 {
-    struct list_head *pos;
+    SUS_MOUNT_ITER_TYPE pos;
+    struct mount *r;
     int learned = 0;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     spin_lock(&ns->ns_lock);
-    for (pos = ns->list.next; pos != &ns->list; pos = pos->next) {
-        struct mount *r = list_entry(pos, struct mount, mnt_list);
+#else
+    /* No lock here, deliberately.  This runs from the copy_mnt_ns return probe, i.e.
+     * with preemption disabled, so the 6.12 equivalent (namespace_sem, a sleeping
+     * rwsem) cannot be taken.  It does not need to be: the only namespace this ever
+     * sees is the one copy_mnt_ns just built for THIS task, which is not installed in
+     * any nsproxy yet (switch_task_namespaces() runs later), so no other task can
+     * mount into it or umount from it while the tree is walked - the same argument
+     * the < 6.12 branch makes for not needing a cross-namespace sweep.  The rbtree is
+     * only read here; nothing is inserted or erased. */
+#endif
+    SUS_MOUNT_ITER_FOR(ns, pos) {
         int shown;
 
-        if (r->mnt_ns != ns || (r->mnt.mnt_flags & MNT_CURSOR))
+        r = SUS_MOUNT_ITER_MOUNT(pos);
+        if (SUS_MOUNT_MNT_NOT_IN_NS(r, ns))
             continue;
         if (!sus_mount_is_ours(r))
             continue;
@@ -765,7 +845,9 @@ static void sus_mount_learn_ns(struct mnt_namespace *ns)
             learned++;
         }
     }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     spin_unlock(&ns->ns_lock);
+#endif
     atomic_inc(&n_clone_walks);
     if (learned)
         atomic_add(learned, &n_clone_learned);
@@ -1407,7 +1489,16 @@ static bool sus_mount_path_is_ours(const char *s)
  * GFP_KERNEL may allocate a radix node and therefore sleep, and this loop runs
  * with a spinlock held.  A batch that is not fully used is handed back to the ida
  * afterwards (allocated and freed through the same ida, so the pairing the kernel
- * expects stays intact). */
+ * expects stays intact).
+ *
+ * >= 6.12 replaces all of that with namespace_sem plus an rb-tree; the walk itself
+ * and the version difference are spelled out at SUS_MOUNT_ITER_FOR() above - the
+ * short version is that the lock is namespace_sem for read (taken first, because it
+ * may sleep) and the "still there" guarantee comes from holding it, not from RCU.
+ * Note also that 6.18 moved the mount ids themselves from mnt_id_ida to an xarray
+ * (mnt_id_xa), so id ownership on 6.18 is a separate, still-open gap - the scan
+ * reports it as "mnt_id_ida not found" and marks nothing rather than inventing an
+ * id. */
 #define SUS_MOUNT_ID_BATCH 8
 
 /* ---- control surface: which mounts are ours ---- */
@@ -1692,7 +1783,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
 {
     int batch[SUS_MOUNT_ID_BATCH];
     int n_batch = 0, used = 0;
-    struct list_head *pos;
+    SUS_MOUNT_ITER_TYPE pos;
     unsigned int seen = 0;
     int scan_logged = 0;
     int marked = 0;
@@ -1701,6 +1792,18 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
     bool hit_cap = false;
     bool failed = false;
     int i;
+
+    /* The namespace lock first, and BEFORE any id is taken out of the allocator:
+     * on >= 6.12 this is namespace_sem (down_read, i.e. it may sleep) and it is the
+     * only thing that makes a live namespace's rb-tree walkable; on < 6.12 it is a
+     * no-op and the ns_lock is taken below instead.  Refusing here is a deliberate
+     * fail-closed: the caller reports it (see susfs_sus_mount_supercall), and no id
+     * has been allocated yet so nothing leaks either way. */
+    if (!sus_mount_ns_walk_begin()) {
+        pr_warn("sus_mount: namespace_sem could not be resolved at load time - refusing to walk ns %p without the lock the kernel's own mount-table iterator holds (mounts stay unmarked)\n",
+                ns);
+        return -ENOSYS;
+    }
 
     for (i = 0; i < SUS_MOUNT_ID_BATCH; i++) {
         int id = sus_mount_ida_alloc();
@@ -1718,12 +1821,15 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
     if (!n_batch) {
         pr_warn("sus_mount: could not allocate KSU-range ids for ns %p - that namespace is left unmarked\n",
                 ns);
+        sus_mount_ns_walk_end();
         return 0;
     }
 
     rcu_read_lock();
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     spin_lock(&ns->ns_lock);
-    for (pos = ns->list.next; pos != &ns->list; pos = pos->next) {
+#endif
+    SUS_MOUNT_ITER_FOR(ns, pos) {
         struct path mnt_path;
         struct mount *r;
         const char *shown;
@@ -1734,10 +1840,12 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
             hit_cap = true;
             break;
         }
-        r = list_entry(pos, struct mount, mnt_list);
-        /* proc_mounts cursors are fake mounts anchored in this same list
-         * (fs/namespace.c:678-681 mnt_is_cursor(), include/linux/mount.h:70). */
-        if (r->mnt_ns != ns || (r->mnt.mnt_flags & MNT_CURSOR)) {
+        r = SUS_MOUNT_ITER_MOUNT(pos);
+        /* < 6.12: proc_mounts cursors are fake mounts anchored in this same list
+         * (fs/namespace.c mnt_is_cursor()).  >= 6.12: there is no cursor mount any
+         * more, and the equivalent test is that the mount is really attached to a
+         * namespace's tree (mnt_node linked) - see SUS_MOUNT_MNT_NOT_IN_NS(). */
+        if (SUS_MOUNT_MNT_NOT_IN_NS(r, ns)) {
             n_skipped_ns++;
             continue;
         }
@@ -1810,8 +1918,11 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         sus_mount_ident_add(r);
         marked++;
     }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     spin_unlock(&ns->ns_lock);
+#endif
     rcu_read_unlock();
+    sus_mount_ns_walk_end();
 
     /* Hand back whatever the batch did not use. */
     for (i = used; i < n_batch; i++)
@@ -1864,10 +1975,13 @@ static int sus_mount_mark_ksu_mounts(void)
 
     /* ONE namespace: the caller's.  A sweep over every namespace reachable from
      * the task list was tried and is NOT done here, because walking another
-     * namespace's mount list is only safe under namespace_sem - which is static in
-     * fs/namespace.c and therefore out of reach for this module (see the protocol
-     * note above sus_mount_scan_ns).  Only the ns_lock half could be taken, and a
-     * foreign namespace mounts and unmounts while we walk it.
+     * namespace's mounts is only safe under namespace_sem (fs/namespace.c), and a
+     * foreign namespace mounts and unmounts while we walk it.  On >= 6.12 that
+     * symbol IS resolved (it has to be, to walk the caller's own namespace at all -
+     * see the note above SUS_MOUNT_ITER_FOR), so the reason for one namespace is now
+     * the design rather than the reachability of the lock: holding namespace_sem
+     * across N namespaces means holding it while other tasks try to mount, and the
+     * identity table below already covers the case the sweep was for.
      *
      * The zygote's copy of a KSU mount (the one every app inherits) is reached
      * through the identity table instead: same superblock, same root dentry, and
@@ -1877,9 +1991,12 @@ static int sus_mount_mark_ksu_mounts(void)
 
     kfree(buf);
 
-    if (marked)
+    if (marked > 0)
         SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu), %d identity record(s) cached\n",
                 marked, DEFAULT_KSU_MNT_ID, READ_ONCE(n_ident));
+    else if (marked < 0)
+        SUSFS_LOGI("sus_mount: scan refused (%d), nothing marked - the reason is the pr_warn above\n",
+                marked);
     else
         SUSFS_LOGI("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
                 min);
@@ -1896,6 +2013,16 @@ int susfs_sus_mount_init(void)
     sus_mount_mnt_id_ida = (struct ida *)find_kernel_symbol_exact("mnt_id_ida");
     pfn_ida_alloc_range = (void *)find_kernel_symbol_exact("ida_alloc_range");
     pfn_ida_free = (void *)find_kernel_symbol_exact("ida_free");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* >= 6.12 has no ns_lock: the per-namespace mount collection is an rb-tree and the
+     * only lock that makes it walkable is namespace_sem, the same one the kernel's own
+     * /proc/mounts iterator takes for read (fs/namespace.c m_start()/m_stop()).  It is
+     * `static DECLARE_RWSEM(namespace_sem)` there, so it is not an exported symbol -
+     * resolved by name like mnt_id_ida above, which works because GKI sets
+     * CONFIG_KALLSYMS_ALL.  A NULL here turns the scan into a refusal, never into an
+     * unlocked walk of a tree another task is rotating. */
+    sus_mount_namespace_sem = (struct rw_semaphore *)find_kernel_symbol_exact("namespace_sem");
+#endif
 
     err = security_secctx_to_secid(param_su_ctx, strlen(param_su_ctx), &su_sid);
     if (err) {
@@ -1923,6 +2050,10 @@ int susfs_sus_mount_init(void)
         pr_warn("sus_mount: ida_alloc_range not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
     if (!pfn_ida_free)
         pr_warn("sus_mount: ida_free not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    if (!sus_mount_namespace_sem)
+        pr_warn("sus_mount: namespace_sem not found - the namespace scan will refuse to walk, so KSU mounts will NOT be marked (feature does nothing)\n");
+#endif
 
     /* upstream defaults this OFF (static key false) so zygisk can see sus
      * mounts during post-fs-data; the LKM mirrors that: no hook until

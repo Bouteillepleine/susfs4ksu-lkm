@@ -904,6 +904,14 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	 * 6.6, so those two keep being read directly. */
 	struct timespec64 ctime;
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	/* 6.12 finished the job for atime/mtime as well: the fields are gone from
+	 * struct inode ("no member named 'i_atime' in 'struct inode'"), split into
+	 * i_atime_sec/i_atime_nsec and read through inode_get_atime()/inode_get_mtime(),
+	 * which return the same struct timespec64 by value.  Upstream marks all three
+	 * "use inode_*_*time accessors!". */
+	struct timespec64 atime, mtime;
+#endif
 
 	err = kern_path(path, 0, &p);
 	if (err)
@@ -917,6 +925,10 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	ctime = inode_get_ctime(inode);
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	atime = inode_get_atime(inode);
+	mtime = inode_get_mtime(inode);
+#endif
 
 	e->target_ino = inode->i_ino;
 	e->target_dev = new_encode_dev(inode->i_sb->s_dev);
@@ -924,10 +936,17 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	e->spoofed_dev = new_encode_dev(inode->i_sb->s_dev);
 	e->spoofed_nlink = inode->i_nlink;
 	e->spoofed_size = inode->i_size;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	e->spoofed_atime_tv_sec = atime.tv_sec;
+	e->spoofed_atime_tv_nsec = atime.tv_nsec;
+	e->spoofed_mtime_tv_sec = mtime.tv_sec;
+	e->spoofed_mtime_tv_nsec = mtime.tv_nsec;
+#else
 	e->spoofed_atime_tv_sec = inode->i_atime.tv_sec;
 	e->spoofed_atime_tv_nsec = inode->i_atime.tv_nsec;
 	e->spoofed_mtime_tv_sec = inode->i_mtime.tv_sec;
 	e->spoofed_mtime_tv_nsec = inode->i_mtime.tv_nsec;
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	e->spoofed_ctime_tv_sec = ctime.tv_sec;
 	e->spoofed_ctime_tv_nsec = ctime.tv_nsec;
