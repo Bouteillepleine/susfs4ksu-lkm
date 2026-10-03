@@ -5,6 +5,53 @@
 #include <linux/string.h>
 #include <linux/err.h>	/* IS_ERR */
 #include <linux/mm.h>	/* PAGE_SIZE */
+#include <linux/version.h>	/* LINUX_VERSION_CODE for the pre-5.10 shims below */
+
+/* ---- pre-5.10 portability shims (legacy branch; see LEGACY_PORTING.md) ----
+ *
+ * This branch exists so that somebody with a pre-5.10 non-GKI kernel (4.14/4.19/5.4) can
+ * port this module themselves.  Nothing below 5.10 is built or tested here - there is no
+ * DDK image and no device for it, and no binary is provided - so the shims are kept to
+ * what can be named from the upstream sources at the release that changed it, and the
+ * rest of what such a port needs is the porter's own verification problem, listed area by
+ * area in LEGACY_PORTING.md.
+ *
+ * Everything here sits inside one explicit < 5.10 gate, so on every kernel this module is
+ * built and tested against (5.10 and up) the token stream is unchanged: the macros do not
+ * exist there and every gate below is false.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+/* struct proc_ops does not exist before 5.6: proc_create() takes a file_operations
+ * (v5.5 include/linux/proc_fs.h:49) and proc_ops appears in v5.6 (:15) with the changed
+ * prototype (:64).  Only the fields this module uses are mapped. */
+# if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
+#  define proc_ops	file_operations
+#  define proc_read	read
+#  define proc_write	write
+#  define proc_open	open
+#  define proc_release	release
+#  define proc_lseek	llseek
+# endif
+/* The nofault accessors are probe_kernel_read()/probe_kernel_write() before 5.8
+ * (include/linux/uaccess.h, same call shape; this module only ever calls them directly). */
+# if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+#  define copy_from_kernel_nofault(dst, src, size)	probe_kernel_read(dst, src, size)
+#  define copy_to_kernel_nofault(dst, src, size)	probe_kernel_write(dst, src, size)
+# endif
+/* Symbol namespaces (and with them MODULE_IMPORT_NS) arrived in 5.4
+ * (v5.4 include/linux/module.h:276); before that the import cannot exist. */
+# if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+#  define MODULE_IMPORT_NS(ns)
+# endif
+/* __nocfi comes with CFI_CLANG, which is an ACK 5.10 addition (its
+ * include/linux/compiler_types.h:240 is the definition this module relies on; upstream at
+ * that tag has none).  Without CFI there is nothing to disable, so defining it away is
+ * correct - but it also means the prototype rules that exist FOR CFI (see sus_path.c's
+ * static_asserts) stop being enforced at runtime, which LEGACY_PORTING.md states. */
+# ifndef __nocfi
+#  define __nocfi
+# endif
+#endif /* < 5.10 */
 
 /* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1
  * and a kretprobe hands that sentinel over as "the argument" - the sus_map vma probe panicked on exactly that (fault

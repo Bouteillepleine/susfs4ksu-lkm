@@ -40,6 +40,10 @@ art/
 !README.md
 # 接口文档是要给使用者的，与 README 同级发布；其余 *.md 仍是内部文档（会写清隐藏手法本身）。
 !PROC_INTERFACES.md
+# The legacy branch's porting map is meant to be read by whoever ports this to a pre-5.10
+# kernel, so it ships with that branch.  It is written at the API/porting level (which
+# release moved which interface), not at the evasion level the internal notes are about.
+!LEGACY_PORTING.md
 
 # development-only scaffolding: the probe/test modules and C test programs used
 # while working the hooks out.  They are not built by kernel/Makefile and are not
