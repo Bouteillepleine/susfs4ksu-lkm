@@ -91,6 +91,9 @@
                              * version gates below into hard errors when it was missing */
 #include <linux/rbtree.h>   /* >= 6.12: ns->mounts is an rb-tree, not a list */
 #include <linux/rwsem.h>    /* >= 6.12: namespace_sem is a struct rw_semaphore */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/workqueue.h> /* >= 6.12: the deferred walk of a cloned namespace */
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 #include <linux/xarray.h>   /* >= 6.18: struct xarray + XA_LIMIT()/xa_lock() for mnt_id_xa */
 #endif
@@ -687,15 +690,25 @@ static void sus_mount_note_id(struct mount *r)
  * first mount-table read makes it consistent (29117, listed=1).  Upstream assigns the big
  * id at mount creation, so its copy is marked from the start.
  *
- * Walking that tree is safe (this trap once panicked the device): it is the namespace
- * copy_mnt_ns() has just built for THIS task and no nsproxy carries yet
- * (switch_task_namespaces() runs later), so no other task can mount into or umount from
- * it, and namespace_sem was released inside copy_mnt_ns() (fs/namespace.c:3986).  The
- * flags are checked first - without CLONE_NEWNS copy_mnt_ns() returns the CURRENT
- * namespace, the plain fork path, and walking a live namespace there is exactly that bug -
- * and nothing is allocated or slept on: the id table is fixed size. */
+ * On < 6.12 that tree is walked right here (see sus_mount_learn_ns below).  On >= 6.12 it
+ * is NOT walked here, because the mount collection is an rb-tree that may only be walked
+ * under namespace_sem - a sleeping rwsem this probe cannot take with preemption disabled -
+ * and "the namespace is fresh, so nothing else can touch it" is not a proof about that
+ * tree: copy_mnt_ns() passes neither CL_PRIVATE nor CL_SLAVE, so the copy of a SHARED
+ * mount stays a propagation peer, and another task can insert into the very tree we would
+ * be walking (under namespace_sem alone).  The >= 6.12 probe therefore only RECORDS the
+ * namespace; a work item walks it later in process context under namespace_sem for read,
+ * exactly like the marking scan, with the same refuse-and-log when that lock cannot be
+ * resolved.  This trap once panicked the device when it walked a live namespace, and the
+ * flags check below (no CLONE_NEWNS -> the CURRENT namespace, the plain fork path) is what
+ * keeps the deferred path from being handed one. */
 static atomic_t n_clone_walks = ATOMIC_INIT(0);
 static atomic_t n_clone_learned = ATOMIC_INIT(0);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+static atomic_t n_clone_queued = ATOMIC_INIT(0);
+static atomic_t n_clone_dropped = ATOMIC_INIT(0);
+static atomic_t n_clone_refused_logged = ATOMIC_INIT(0);
+#endif
 
 /* ---- how one iterates the mounts of a namespace, per kernel version ----
  *
@@ -750,20 +763,17 @@ static void sus_mount_ns_walk_end(void)
 #define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns) || ((r)->mnt.mnt_flags & MNT_CURSOR))
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+/* Immediate walk: only for < 6.12, where ns_lock is a spinlock this probe may take.
+ * Unchanged on purpose - the < 6.12 build is shipped and verified, so this body must
+ * generate the same code it always did. */
 static void sus_mount_learn_ns(struct mnt_namespace *ns)
 {
     SUS_MOUNT_ITER_TYPE pos;
     struct mount *r;
     int learned = 0;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     spin_lock(&ns->ns_lock);
-#else
-    /* No lock, deliberately: this runs from the copy_mnt_ns return probe with preemption
-     * disabled, so the 6.12 equivalent (namespace_sem, a sleeping rwsem) cannot be taken -
-     * and need not be, because the only namespace seen here is the one copy_mnt_ns has just
-     * built for THIS task and that no nsproxy carries yet. */
-#endif
     SUS_MOUNT_ITER_FOR(ns, pos) {
         int shown;
 
@@ -780,13 +790,154 @@ static void sus_mount_learn_ns(struct mnt_namespace *ns)
             learned++;
         }
     }
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     spin_unlock(&ns->ns_lock);
-#endif
     atomic_inc(&n_clone_walks);
     if (learned)
         atomic_add(learned, &n_clone_learned);
 }
+#else
+/* ---- >= 6.12: record the namespace in the probe, walk it in the worker ----
+ *
+ * The recorded pointer is kept alive with the kernel's own get_mnt_ns() (fs/mount.h, an
+ * inline - no symbol needed) and released with put_mnt_ns() (a global in fs/namespace.c,
+ * resolved by name at init).  Both halves are load-bearing: the task that cloned the
+ * namespace can exit and drop the last reference before the worker runs, and put_mnt_ns()
+ * must be called with no read lock held because on 6.18 it takes namespace_sem for write
+ * itself.  If put_mnt_ns cannot be resolved nothing is queued at all - a reference we
+ * could not drop would be a leak and a walk without one a use-after-free.
+ *
+ * The ring is fixed size and drops on overflow (counted): the probe may not allocate, and
+ * a dropped namespace only means its ids are learned by a later scan instead. */
+#define SUS_MOUNT_LEARN_RING 16
+static struct mnt_namespace *sus_mount_learn_ring[SUS_MOUNT_LEARN_RING];
+static unsigned int sus_mount_learn_head, sus_mount_learn_tail;
+static DEFINE_SPINLOCK(sus_mount_learn_lock);
+static void (*pfn_put_mnt_ns)(struct mnt_namespace *ns);
+static void sus_mount_learn_work(struct work_struct *w);
+static DECLARE_WORK(sus_mount_learn_wq, sus_mount_learn_work);
+
+/* Every call through a resolved kernel symbol sits inside a __nocfi function (kCFI checks
+ * the type hash at an indirect call site, and an out-of-tree module's hash for a kernel
+ * prototype does not match), and that function is itself called DIRECTLY so it needs no
+ * hash of its own - the work item below is called indirectly by the workqueue and so must
+ * keep its hash, which is why the put goes through here instead. */
+static __nocfi void sus_mount_put_mnt_ns(struct mnt_namespace *ns)
+{
+    pfn_put_mnt_ns(ns);
+}
+
+/* One recorded namespace, or NULL when the ring is empty. */
+static struct mnt_namespace *sus_mount_learn_pop(void)
+{
+    unsigned long flags;
+    struct mnt_namespace *ns;
+
+    spin_lock_irqsave(&sus_mount_learn_lock, flags);
+    if (sus_mount_learn_head == sus_mount_learn_tail) {
+        spin_unlock_irqrestore(&sus_mount_learn_lock, flags);
+        return NULL;
+    }
+    ns = sus_mount_learn_ring[sus_mount_learn_tail];
+    sus_mount_learn_ring[sus_mount_learn_tail] = NULL;
+    sus_mount_learn_tail = (sus_mount_learn_tail + 1) % SUS_MOUNT_LEARN_RING;
+    spin_unlock_irqrestore(&sus_mount_learn_lock, flags);
+    return ns;
+}
+
+/* The walk, in process context: namespace_sem for read, and the same protocol the marking
+ * scan uses (rcu_read_lock + the iteration bound), because a namespace that was private
+ * when it was recorded is a live one by the time this runs. */
+static int sus_mount_learn_ns_walk(struct mnt_namespace *ns)
+{
+    SUS_MOUNT_ITER_TYPE pos;
+    unsigned int seen = 0;
+    int learned = 0;
+
+    if (!sus_mount_ns_walk_begin())
+        return -ENOSYS;
+
+    rcu_read_lock();
+    SUS_MOUNT_ITER_FOR(ns, pos) {
+        struct mount *r;
+        int shown;
+
+        if (seen++ >= SUS_MOUNT_MAX_SCAN)
+            break;
+        r = SUS_MOUNT_ITER_MOUNT(pos);
+        if (SUS_MOUNT_MNT_NOT_IN_NS(r, ns))
+            continue;
+        if (!sus_mount_is_ours(r))
+            continue;
+        if (sus_mount_shown_for((int)r->mnt_id))
+            continue;
+        shown = sus_mount_shown_id_from(r);
+        if (shown > 0 && shown != (int)r->mnt_id) {
+            sus_mount_idmap_add((int)r->mnt_id, shown, r->mnt.mnt_sb->s_dev);
+            learned++;
+        }
+    }
+    rcu_read_unlock();
+    sus_mount_ns_walk_end();
+    return learned;
+}
+
+static void sus_mount_learn_work(struct work_struct *w)
+{
+    struct mnt_namespace *ns;
+
+    while ((ns = sus_mount_learn_pop()) != NULL) {
+        int learned = sus_mount_learn_ns_walk(ns);
+
+        if (learned == -ENOSYS && !atomic_xchg(&n_clone_refused_logged, 1))
+            pr_warn("sus_mount: namespace_sem could not be resolved at load time - refusing to walk a cloned namespace without the lock the kernel's own mount-table iterator holds (that namespace's ids stay unlearned)\n");
+        atomic_inc(&n_clone_walks);
+        if (learned > 0)
+            atomic_add(learned, &n_clone_learned);
+        /* After sus_mount_ns_walk_end(): see the note above about 6.18. */
+        sus_mount_put_mnt_ns(ns);
+    }
+}
+
+/* Called from the copy_mnt_ns return probe: no allocation, no sleeping. */
+static void sus_mount_defer_learn_ns(struct mnt_namespace *ns)
+{
+    unsigned int next;
+    unsigned long flags;
+
+    if (!pfn_put_mnt_ns) {
+        atomic_inc(&n_clone_dropped);
+        return;
+    }
+    get_mnt_ns(ns);
+
+    spin_lock_irqsave(&sus_mount_learn_lock, flags);
+    next = (sus_mount_learn_head + 1) % SUS_MOUNT_LEARN_RING;
+    if (next == sus_mount_learn_tail) {
+        spin_unlock_irqrestore(&sus_mount_learn_lock, flags);
+        sus_mount_put_mnt_ns(ns);
+        atomic_inc(&n_clone_dropped);
+        return;
+    }
+    sus_mount_learn_ring[sus_mount_learn_head] = ns;
+    sus_mount_learn_head = next;
+    spin_unlock_irqrestore(&sus_mount_learn_lock, flags);
+
+    atomic_inc(&n_clone_queued);
+    schedule_work(&sus_mount_learn_wq);
+}
+
+/* Unload path: the probe is unregistered first (so nothing new is queued), then the worker
+ * is waited out, then whatever is still recorded is released - the worker cannot see an
+ * entry queued after its last pop. */
+static void sus_mount_learn_stop(void)
+{
+    struct mnt_namespace *ns;
+
+    cancel_work_sync(&sus_mount_learn_wq);
+    while ((ns = sus_mount_learn_pop()) != NULL)
+        sus_mount_put_mnt_ns(ns);
+}
+#endif
 
 struct sus_mount_clone_state {
     unsigned long flags;
@@ -809,7 +960,11 @@ static int sus_mount_clone_ret(struct kretprobe_instance *ri, struct pt_regs *re
         return 0;			/* plain fork: the current namespace, not a copy */
     if (IS_ERR_OR_NULL(ns))
         return 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     sus_mount_learn_ns(ns);
+#else
+    sus_mount_defer_learn_ns(ns);
+#endif
     return 0;
 }
 
@@ -1200,6 +1355,9 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "idmap: recycled_dropped=%d dropped_dev=%d\n"
                      "sb: down=%d (probe=%d)\n"
                      "clone: walks=%d learned=%d (probe=%d)\n"
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+                     "clone_defer: queued=%d dropped=%d\n"
+#endif
                      "newmount: seen=%d recorded=%d pathfail=%d (probe=%d)\n"
                      "keep: prefixes=%d rescans=%d\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
@@ -1216,6 +1374,9 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_idmap_dropped_dev),
                      atomic_read(&n_sb_down), (int)kp_sb_down_ok,
                      atomic_read(&n_clone_walks), atomic_read(&n_clone_learned),
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+                     atomic_read(&n_clone_queued), atomic_read(&n_clone_dropped),
+#endif
                      (int)kr_clone_ns_ok,
                      atomic_read(&n_newmnt_seen), atomic_read(&n_newmnt_recorded),
                      atomic_read(&n_newmnt_pathfail), (int)kr_newmnt_ok,
@@ -1934,6 +2095,12 @@ int susfs_sus_mount_init(void)
      * CONFIG_KALLSYMS_ALL.  A NULL here turns the scan into a refusal, never into an
      * unlocked walk of a tree another task is rotating. */
     sus_mount_namespace_sem = (struct rw_semaphore *)find_kernel_symbol_exact("namespace_sem");
+    /* put_mnt_ns() releases the reference the copy_mnt_ns probe takes on the namespace it
+     * records (see the deferred walk above).  It is a global in fs/namespace.c, so
+     * KALLSYMS has it; without it nothing is queued, which is the fail-closed direction -
+     * the ids of a namespace created after the enable are then only picked up by a later
+     * scan. */
+    pfn_put_mnt_ns = (void *)find_kernel_symbol_exact("put_mnt_ns");
 #endif
 
     err = security_secctx_to_secid(param_su_ctx, strlen(param_su_ctx), &su_sid);
@@ -1976,6 +2143,8 @@ int susfs_sus_mount_init(void)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     if (!sus_mount_namespace_sem)
         pr_warn("sus_mount: namespace_sem not found - the namespace scan will refuse to walk, so KSU mounts will NOT be marked (feature does nothing)\n");
+    if (!pfn_put_mnt_ns)
+        pr_warn("sus_mount: put_mnt_ns not found - a namespace cloned after the enable is not recorded, so its mounts' ids are only learned by a later scan\n");
 #endif
 
     /* upstream defaults this OFF (static key false) so zygisk can see sus
@@ -2065,6 +2234,12 @@ void susfs_sus_mount_exit(void)
         sus_mount_keep_entry = NULL;
     }
     sus_mount_unregister();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* The probe is unregistered above, so nothing new can be recorded; wait the worker
+     * out and release whatever is still recorded, or a queued namespace reference would
+     * outlive the module. */
+    sus_mount_learn_stop();
+#endif
     /* Marked mnt_ids are deliberately NOT restored: upstream assigns an id once
      * per mount and never rewrites it, so a marked id stays for the mount's
      * lifetime (and a later enable only has to scan for new mounts).  The id
