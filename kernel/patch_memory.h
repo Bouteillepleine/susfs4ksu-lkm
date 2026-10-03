@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/*
- * patch_memory.h - arbitrary kernel text patching (ported from KernelSU/SukiSU)
- *
- * Copyright (C) 2023 bmax121. All Rights Reserved.
- */
+/* patch_memory.h - arbitrary kernel text patching (ported from KernelSU/SukiSU).
+ * Copyright (C) 2023 bmax121. All Rights Reserved. */
 
 #ifndef __SUSFS_PATCH_MEMORY_H
 #define __SUSFS_PATCH_MEMORY_H

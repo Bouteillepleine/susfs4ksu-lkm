@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * spoof_cmdline.c - spoof /proc/bootconfig (SUSFS SPOOF_CMDLINE_OR_BOOTCONFIG).
- *
- * boot_config_proc_show() (fs/proc/bootconfig.c) simply does
- *   if (saved_boot_config) seq_puts(m, saved_boot_config);
- * so rewriting the static char *saved_boot_config pointer is enough to spoof
- * the whole file.  saved_boot_config is a static BSS variable, resolved at
- * load time by ksud insmod (kallsyms relocation), like selinux_state in kstat.
- * A pointer write is atomic, so this is safe against concurrent seq reads.
- *
- * The fake string is heap-allocated (kstrdup) because the supercall ABI
- * accepts up to 8192 bytes; the insmod param bootconfig= takes precedence and
- * is also copied to the heap so a later supercall can kfree it safely.
+ * spoof_cmdline.c - spoof /proc/bootconfig (SUSFS SPOOF_CMDLINE_OR_BOOTCONFIG).  boot_config_proc_show()
+ * (fs/proc/bootconfig.c) does `if (saved_boot_config) seq_puts(m, saved_boot_config);`, so rewriting the static
+ * pointer spoofs the whole file; that variable is a static BSS pointer resolved at load time by ksud insmod
+ * (kallsyms relocation, like selinux_state in kstat) and the write is atomic, so concurrent seq reads are safe.
+ * The fake string is heap-allocated (kstrdup): the supercall ABI accepts up to 8192 bytes, and the insmod
+ * parameter is copied to the heap as well so a later supercall can free it safely.
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -23,11 +17,9 @@
 /* unexported static var; ksud insmod relocates it via kallsyms */
 extern char *saved_boot_config;
 
-/* The supercall's field is SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE (8192) wide, but
- * this insmod parameter cannot be that large: module_param_string()'s value is
- * written through a sysfs attribute, and a sysfs write is capped at one page.  So
- * the parameter tops out at 4095 bytes where the supercall accepts 8191 - a
- * difference worth knowing before setting a long bootconfig at load time. */
+/* The supercall's field is 8192 wide, but this insmod parameter cannot be: module_param_string()'s value goes through a
+ * sysfs attribute and a sysfs write is capped at one page, so the parameter tops out at 4095 bytes where the supercall
+ * accepts 8191. */
 static char param_bootconfig[4096];
 module_param_string(bootconfig, param_bootconfig, sizeof(param_bootconfig), 0644);
 
@@ -35,14 +27,10 @@ static char *orig_boot_config;
 static char *fake_boot_config;   /* heap-allocated, currently published */
 static bool spoof_active;
 
-/* Strings that saved_boot_config used to point at.
- *
- * A published string must NEVER be freed while saved_boot_config might reach
- * it: /proc/bootconfig is read via seq_puts with no lock of ours, so freeing
- * the old buffer before republishing let a reader touch freed memory.  The old
- * code also returned early when kstrdup failed, leaving saved_boot_config
- * dangling at the buffer it had just freed - and the next set() would free it
- * again.  Retiring instead costs one 8 KB string per update. */
+/* Strings that saved_boot_config used to point at.  A published string must NEVER be freed while saved_boot_config
+ * might reach it: /proc/bootconfig is read via seq_puts with no lock of ours, so freeing the old buffer before
+ * republishing let a reader touch freed memory, and a set() that then failed kstrdup left saved_boot_config dangling
+ * at the buffer it had just freed.  Retiring instead costs one 8 KB string per update. */
 struct retired_str {
 	struct list_head list;
 	char *s;
@@ -102,13 +90,8 @@ int susfs_spoof_cmdline_init(void)
 
 void susfs_spoof_cmdline_exit(void)
 {
-	/* Unpublish - and deliberately free nothing.
-	 *
-	 * /proc/bootconfig is read through seq_puts() with no lock of ours, so a
-	 * reader that already picked up the pointer can still be printing it while
-	 * this runs.  The retired list exists for exactly that reason, and unload is
-	 * not an exception: the module's own memory is going away anyway, so the
-	 * only thing a kfree() here could buy is a use-after-free. */
+	/* Unpublish - and deliberately free nothing: a reader that already picked up the pointer can still be printing
+	 * it while this runs, and unload is no exception, so a kfree() here only buys a use-after-free. */
 	if (spoof_active) {
 		saved_boot_config = orig_boot_config;
 		spoof_active = false;
@@ -125,12 +108,10 @@ void susfs_spoof_cmdline_supercall(void __user **arg)
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
-		/* The kprobe has already claimed the syscall and answered 0, so
-		 * returning silently leaves the caller's pre-seeded 126
-		 * (ERR_CMD_NOT_SUPPORTED) in place: the C tool then reports "please
-		 * enable SUSFS in kernel" for a command this kernel implements, and
-		 * ksud's err==126 check turns it into a silent success.  Upstream
-		 * writes -ENOMEM here (fs/susfs.c:707-713); this runs in task_work
+		/* The kprobe has already claimed the syscall and answered 0, so returning silently leaves the
+		 * caller's pre-seeded 126 (ERR_CMD_NOT_SUPPORTED) in place: the C tool then reports "please
+		 * enable SUSFS in kernel" for a command this kernel implements, and ksud's err==126 check turns
+		 * it into a silent success.  Upstream writes -ENOMEM here (fs/susfs.c:707-713); task_work
 		 * context, so the writeback is safe. */
 		err = -ENOMEM;
 		if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user *)*arg)->err,
@@ -145,14 +126,12 @@ void susfs_spoof_cmdline_supercall(void __user **arg)
 		goto out;
 	}
 
-	/* Empty string is rejected upstream (-EINVAL); report the real result of
-	 * the update instead of always claiming success. */
+	/* Empty string is rejected upstream (-EINVAL); report the real result instead of always claiming success. */
 	if (!info->fake_cmdline_or_bootconfig[0]) {
 		info->err = -EINVAL;
 		goto out;
 	}
-	/* spoof_set() kstrdup()s this, i.e. strlen()s it: an unterminated
-	 * fixed-size ABI field would be read past the end of the allocation. */
+	/* spoof_set() kstrdup()s this, i.e. strlen()s it: an unterminated fixed-size ABI field would be read past the end. */
 	if (!susfs_abi_path_ok(info->fake_cmdline_or_bootconfig,
 			       sizeof(info->fake_cmdline_or_bootconfig))) {
 		info->err = -ENAMETOOLONG;

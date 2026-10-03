@@ -2,27 +2,13 @@
 /*
  * sus_map.c - hide mmapped real files from /proc/<pid>/maps (SUSFS SUS_MAP).
  *
- * Upstream SUSFS sets AS_FLAGS_SUS_MAP on the inode's address_space flags and
- * makes show_map_vma() / show_smap() skip the line, the smaps_rollup() loop skip
- * the vma it is accumulating, and pagemap_read() skip the chunk that covers such
- * a vma.  An LKM cannot add a flag bit, so there are two layers here:
- *
- *   1. the listing layer - kprobes on show_map_vma() and show_smap(), where the
- *      vma is argument #2: when its backing file inode is in the rule set, skip
- *      the line by returning early (regs->pc = x30);
- *   2. the page-walk layer - one kprobe on walk_page_range(), which is what the
- *      two listings an LKM cannot reach at the listing level (smaps_rollup and
- *      pagemap) go through; see "the page-walk layer" below.
- *
- * show_map_vma(m, vma) / show_smap(m, v): vma is arg #2 (regs->regs[1]);
- * returning non-zero from the pre_handler makes the arm64 kprobe core skip
- * singlestep and continue at the modified pc (same trick kprg uses).
- *
- * smaps_rollup is deliberately NOT probed directly - see "the sentinel" below.
- *
- * The skip is gated exactly like upstream's, so only processes the gate treats
- * as apps see the line dropped and root/init keep seeing the real mapping - see
- * "the read gate" below.
+ * Upstream sets AS_FLAGS_SUS_MAP on the inode's address_space and makes
+ * show_map_vma()/show_smap() skip the line, the smaps_rollup() loop skip the vma it
+ * accumulates and pagemap_read() skip the chunk covering such a vma.  An LKM cannot add a
+ * flag bit, so: a listing layer (kprobes on show_map_vma/show_smap, vma = regs->regs[1],
+ * skip the line with regs->pc = x30) plus a page-walk layer for the two listings it cannot
+ * reach (smaps_rollup, pagemap).  smaps_rollup is deliberately NOT probed directly (see
+ * "the sentinel") and the skip is gated like upstream's, apps only (see "the read gate").
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -51,25 +37,19 @@ struct sus_map_entry {
 static struct sus_map_entry map_entries[SUS_MAP_MAX];
 static int nmap;
 
-/* Serialises rule PUBLICATION only, and the reader stays lock-free on purpose:
- * entries are append-only and never rewritten in place (unlike kstat's, which
- * are replaced wholesale, hence its reader-side snapshot under a spinlock), so
- * a release/acquire pair on nmap is enough for sus_map_lookup() to see either a
- * fully filled entry or none at all - and it is what it has to be on arm64,
- * where plain WRITE_ONCE/READ_ONCE would let the count become visible before
- * the entry it publishes.
- *
- * What the lock is really for: two concurrent supercalls - each dispatched from
- * its own task's task_work - would otherwise read the same nmap, fill the same
- * slot and silently drop one rule while both report success to userspace. */
+/* Serialises rule PUBLICATION only; the reader stays lock-free: entries are append-only
+ * (kstat's are replaced wholesale, hence its reader-side snapshot), so a release/acquire
+ * pair on nmap publishes a filled entry or none - and it has to be that on arm64, where
+ * plain WRITE_ONCE/READ_ONCE could publish the count first.  The lock itself is for two
+ * concurrent supercalls (each in its own task_work), which would otherwise fill one slot
+ * and silently drop a rule while both report success. */
 static DEFINE_SPINLOCK(map_table_lock);
 
 /* temporary interface: insmod susfs_guard_lkm.ko map_ino=<n> hides that inode */
 static unsigned long param_map_ino;
 module_param_named(map_ino, param_map_ino, ulong, 0644);
 
-/* dev==0 means "any filesystem" (only reachable through the map_ino parameter,
- * which cannot know the device).  `path` may be NULL/empty (same parameter). */
+/* dev==0 means "any filesystem": only the map_ino parameter can pick that. */
 static int sus_map_add_full(unsigned long ino, dev_t dev)
 {
     unsigned long flags;
@@ -78,7 +58,6 @@ static int sus_map_add_full(unsigned long ino, dev_t dev)
     if (!ino)
         return -EINVAL;
 
-    /* Bounds check and fill under the lock, then publish: see map_table_lock. */
     spin_lock_irqsave(&map_table_lock, flags);
     if (nmap < SUS_MAP_MAX) {
         map_entries[nmap].target_ino = ino;
@@ -113,69 +92,45 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
 
 /* ---- the read gate ----
  *
- * Upstream hides the line behind SUSFS_IS_INODE_SUS_MAP(), which ends in
- * susfs_is_current_proc_umounted_app() - i.e. app processes only, so root/init
- * still see the real mapping.  Without the gate this LKM hid the line from
- * everyone, which is a wider behaviour than upstream and a fidelity gap
- * (AUDIT_FINDINGS.md P2 #15).
- *
- * That upstream predicate is (test_thread_flag(TIF_PROC_UMOUNTED) &&
- * current_uid().val >= 10000), and TIF_PROC_UMOUNTED cannot be reproduced in
- * this LKM: KernelSU sets it only when the SUSFS integration is compiled into
- * the kernel, which this device's kernel is not (see AUDIT_FINDINGS.md, "已确认
- * 无法在 LKM 内复刻").  uid >= 10000 is the project-wide proxy, identical to
- * susfs_kstat_gate_ok() in susfs_kstat.c (commit 543b369) and to sus_path's.
- *
- * Configuration stays ungated: the supercall and the map_ino parameter are rule
- * management, not a read path. */
+ * Upstream hides behind SUSFS_IS_INODE_SUS_MAP() -> susfs_is_current_proc_umounted_app()
+ * = (test_thread_flag(TIF_PROC_UMOUNTED) && current_uid().val >= 10000): apps only, so
+ * root/init see the real mapping.  TIF_PROC_UMOUNTED cannot be reproduced in this LKM
+ * (KernelSU sets it only with the SUSFS integration compiled into the kernel, which this
+ * device's kernel is not - AUDIT_FINDINGS.md), so uid >= 10000 is the project-wide proxy,
+ * as in susfs_kstat_gate_ok() (susfs_kstat.c, commit 543b369) and sus_path.
+ * Configuration stays ungated: the supercall and map_ino are rule management. */
 static bool sus_map_gate_ok(void)
 {
     return current_uid().val >= 10000;
 }
 
-/* One handler for show_map_vma (maps) and show_smap (smaps).
- *
- * Both are seq_operations .show callbacks, i.e. they receive (struct seq_file *m,
- * struct vm_area_struct *v) and emit only what they are given - a show callback
- * returning 0 means "handled, nothing printed", NOT "end of iteration" (seq_read
- * ignores the value), which is exactly what upstream does inside those functions
- * with its SUS_MAP check.
- *
- * smaps is the one that matters most: maps was already covered, but
- * /proc/<pid>/smaps named the same files again, path and all.
+/* One handler for show_map_vma (maps) and show_smap (smaps) - both are seq_operations
+ * .show callbacks that emit only what they are given, so returning 0 means "handled,
+ * nothing printed" (seq_read ignores the value), which is upstream's SUS_MAP effect.
  *
  * ---- the sentinel ----
  *
- * smaps_rollup is the third listing upstream filters and the one this handler
- * must NOT be pointed at.  show_smaps_rollup() is reached through single_open(),
- * whose single_start() hands .show the iterator sentinel (void *)1 instead of a
- * vma, and the function ignores its v argument entirely (it walks priv->mm->mmap
- * itself).  Dereferencing that sentinel is not theoretical: with the probe
- * registered, `cat /proc/<pid>/smaps_rollup` as an app took vma->vm_file at
- * offset 0xa0 -> ldr from 0xa1 -> "Unable to handle kernel NULL pointer
- * dereference at virtual address 00000000000000a1", pc sus_map_skip_vma_pre+0x3c,
- * then a panic (last_kmsg, 41346.347).
- *
- * It also cannot be replicated from a kprobe at all: upstream skips the vma
- * *inside* the rollup loop, and smap_gather_stats() is inlined by LTO here (it is
- * absent from /proc/kallsyms), so the only call that could be intercepted is
- * walk_page_range(), which carries no vma and is used by every other page walk.
- * See TECHNICAL_NOTES.md, "sus_map 与 smaps_rollup". */
+ * smaps_rollup must NOT be pointed at this handler: show_smaps_rollup() is reached
+ * through single_open(), whose single_start() hands .show the iterator sentinel (void *)1
+ * instead of a vma, and the function ignores its v argument.  Measured with the probe
+ * registered: `cat /proc/<pid>/smaps_rollup` as an app took vma->vm_file at 0xa0 -> ldr
+ * from 0xa1 -> "Unable to handle kernel NULL pointer dereference at virtual address
+ * 00000000000000a1", pc sus_map_skip_vma_pre+0x3c, then a panic (last_kmsg 41346.347).
+ * Unreachable from a kprobe too: upstream skips the vma *inside* the rollup loop, and
+ * smap_gather_stats() is inlined by LTO here (absent from /proc/kallsyms), so only
+ * walk_page_range() could be intercepted.  TECHNICAL_NOTES.md, "sus_map 与 smaps_rollup". */
 static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vm_area_struct *vma;
     struct inode *inode;
 
-    /* Cheapest test first: for a root/init reader - the entire point of the
-     * gate - we return before touching the vma or its inode. */
     if (!sus_map_gate_ok())
         return 0;
 
     vma = (struct vm_area_struct *)regs->regs[1];
-    /* Defence in depth against the sentinel above: a vma is always a slab object
-     * in the linear map, so anything below one page is not one.  Keep this even
-     * though no armed probe passes anything else - it is what turns a future
-     * mis-registration into a lost filter instead of a panic. */
+    /* Defence in depth against the sentinel above: a vma is always a slab object in
+     * the linear map, so anything below one page is not one - this turns a future
+     * mis-registration into a lost filter, not a panic. */
     if ((unsigned long)vma < PAGE_SIZE)
         return 0;
     if (!vma->vm_file)
@@ -184,14 +139,12 @@ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!inode)
         return 0;
     if (sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
-        /* ratelimited, like sus_path's hit logs; the path is not stored in the
-         * rule, so ino/dev identify it */
+        /* ratelimited like sus_path's; the rule stores no path, so ino/dev name it */
         pr_info_ratelimited("sus_map: hid %s line (ino=%lu dev=%lu uid=%u)\n",
                             kp->symbol_name, inode->i_ino,
                             (unsigned long)inode->i_sb->s_dev,
                             current_uid().val);
         regs_set_return_value(regs, 0);
-        /* skip this vma: return early via the saved return address */
         regs->pc = regs->regs[30];
         return 1;
     }
@@ -210,43 +163,26 @@ static struct kprobe kp_map_smap = {
 
 /* ---- the page-walk layer: smaps_rollup and pagemap ----
  *
- * The two listings the listing layer cannot reach are exactly the two where
- * upstream tests a vma it already holds as a local:
+ * Both listings test a vma upstream holds as a local, so neither is reachable from a
+ * kprobe: no local at a function boundary, smap_gather_stats() inlined by LTO, and
+ * pagemap_read() only has its vma after taking mmap_lock inside.
+ *   show_smaps_rollup() -> for (vma = priv->mm->mmap; vma;) { ... skip ... }
+ *   pagemap_read()      -> vma = vma_lookup(mm, start_vaddr); ... skip chunk
+ * Both share one exported primitive, called with a caller-unique mm_walk_ops:
+ *   smap_gather_stats(): walk_page_range(vma->vm_mm, ..., smaps_walk_ops|smaps_shmem_walk_ops, mss)
+ *   pagemap_read():      walk_page_range(mm, start, end, &pagemap_ops, &pm)
+ * Those three ops have no other user and every caller holds mmap_lock for read (the walk
+ * asserts it), so skipping the call leaves upstream's result: the rollup vma adds nothing
+ * to mss, the pagemap chunk stays unfilled and `ret = walk_page_range(...)` sees 0, as
+ * upstream leaves it.  The ops are data symbols, so they come from kallsyms by name
+ * (sus_mount's mnt_id_ida mechanism); if none resolves, the probe is not registered and both
+ * listings stay unfiltered (logged).  The probe sits on a kernel-wide primitive, so it bails
+ * out in one load and three compares - ops test first.
  *
- *   show_smaps_rollup()  ->  for (vma = priv->mm->mmap; vma;) { ... skip ... }
- *   pagemap_read()       ->  vma = vma_lookup(mm, start_vaddr); ... skip chunk
- *
- * Neither test is reachable from a kprobe (the locals do not exist at any
- * function boundary, smap_gather_stats() is inlined by LTO, and pagemap_read()
- * only has the vma after it has taken mmap_lock inside the function).  What both
- * *do* share is a call to one exported primitive, with an mm_walk_ops that
- * identifies the caller uniquely:
- *
- *   smap_gather_stats():  walk_page_range(vma->vm_mm, ..., &smaps_walk_ops | &smaps_shmem_walk_ops, mss)
- *   pagemap_read():       walk_page_range(mm, start, end, &pagemap_ops, &pm)
- *
- * All three ops are used by nothing else, every one of those callers holds
- * mmap_lock for read (walk_page_range() itself asserts that), and the effect of
- * skipping the call is upstream's effect: for rollup the vma contributes nothing
- * to the accumulated mss, for pagemap the chunk is simply not filled and
- * pagemap_read() copies what it has (its `ret = walk_page_range(...)` sees 0,
- * which is what upstream leaves behind as well).
- *
- * The ops addresses are data symbols, so they come from kallsyms by name - the
- * same mechanism sus_mount uses for mnt_id_ida.  If none of them resolves, the
- * probe is not registered at all and the two listings stay unfiltered (logged).
- *
- * Cost: the probe sits on a primitive the whole kernel shares, so it must bail
- * out on everything else in one load and three compares - the ops test is first,
- * before the gate or any structure is touched.
- *
- * Which primitive the two callers actually use is not something this file gets
- * to assume: walk_page_vma() exists as a separate symbol, and with
- * CONFIG_LTO_CLANG_FULL either call site may have been inlined into its caller
- * (in which case no probe can see it - the same wall smap_gather_stats() hit).
- * So both symbols are probed, and walk_dbg=1 records every distinct ops pointer
- * that reaches them together with its call count (walk_ops), which is how the
- * real caller is identified instead of guessed. */
+ * Which of walk_page_range()/walk_page_vma() is the live call site cannot be assumed: with
+ * CONFIG_LTO_CLANG_FULL either may be inlined into its caller (invisible to any probe - the
+ * wall smap_gather_stats() hit), so both symbols are probed and walk_dbg=1 records every
+ * distinct ops pointer with its call count (walk_ops), naming the real caller. */
 static const void *sus_map_ops_smaps;
 static const void *sus_map_ops_smaps_shmem;
 static const void *sus_map_ops_pagemap;
@@ -254,24 +190,20 @@ static bool sus_map_walk_ops_done;
 static atomic_t n_walk_skip = ATOMIC_INIT(0);
 static atomic_t n_walk_seen = ATOMIC_INIT(0);		/* walk_page_range calls */
 static atomic_t n_walk_seen_vma = ATOMIC_INIT(0);	/* walk_page_vma calls  */
-/* Why a walk that reached the probe was not skipped, one counter per step of the
- * resolution - "the probe did not match" has four very different causes and only
- * the counters can tell them apart. */
+/* One counter per resolution step: "the walk was not skipped" has four different causes. */
 static atomic_t n_walk_ops_hit = ATOMIC_INIT(0);	/* ops was ours */
 static atomic_t n_walk_scan_fail = ATOMIC_INIT(0);	/* no vma for (mm,start) */
 static atomic_t n_walk_nofile = ATOMIC_INIT(0);		/* vma has no vm_file */
 static atomic_t n_walk_nomatch = ATOMIC_INIT(0);	/* inode is not a rule */
 static atomic_t n_walk_dbg_left = ATOMIC_INIT(4);
-/* map_files symlink resolutions that were turned into ENOENT. */
+/* map_files symlink resolutions that were turned into ENOENT.  n_getlink_calls vs
+ * n_getlink_skip keeps "the probe ran" apart from "the probe matched". */
 static atomic_t n_map_files_hides = ATOMIC_INIT(0);
-/* Reachability of that hook, split the way the walk probe had to be: "the probe
- * ran" and "the probe matched" are different claims. */
 static atomic_t n_getlink_calls = ATOMIC_INIT(0);
 static atomic_t n_getlink_skip = ATOMIC_INIT(0);
 static atomic_t n_getlink_nomatch = ATOMIC_INIT(0);
 
-/* walk_dbg: name every ops pointer that reaches the two primitives, once per
- * distinct value.  Off by default - it costs a linear scan per call. */
+/* walk_dbg: name every ops pointer reaching the two primitives, once per value (off by default - a linear scan per call). */
 static int walk_dbg;
 module_param_named(walk_dbg, walk_dbg, int, 0644);
 
@@ -348,8 +280,6 @@ static bool sus_map_walk_ops_ours(const void *ops)
                    ops == sus_map_ops_pagemap);
 }
 
-/* Shared tail: `vma` is the one the skipped walk would have covered.  Returns
- * true when the call was skipped. */
 static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
                                 struct vm_area_struct *vma)
 {
@@ -376,31 +306,24 @@ static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
     pr_info_ratelimited("sus_map: skipped %s walk for ino=%lu dev=%lu uid=%u\n",
                         kp->symbol_name, inode->i_ino,
                         (unsigned long)inode->i_sb->s_dev, current_uid().val);
-    /* Both primitives return int 0 for "walked, nothing wrong", and both callers
-     * expect that from a skipped walk (upstream's own skip leaves the same value
-     * behind).  Leaving x0 = mm would turn pagemap_read()'s `ret` into a kernel
-     * pointer and hand it back to read(2). */
+    /* Both primitives return int 0 for "walked, nothing wrong" and both callers expect
+     * that from a skipped walk (upstream's own skip leaves the same value).  Leaving
+     * x0 = mm would turn pagemap_read()'s `ret` into a kernel pointer handed to read(2). */
     regs_set_return_value(regs, 0);
     regs->pc = regs->regs[30];
     return true;
 }
 
-/* The VMA container changed in 6.1 and both spellings must answer the same question:
- * "the first vma whose end is past @start, walking in address order" - i.e. the vma that
- * contains @start, or the next one after a gap.  The caller compares its result against
- * vm_start exactly as before.
- *
- *   <= 6.0  struct mm_struct.mmap is the head of a doubly linked list, vma->vm_next
- *           walks it (v6.0 mm_types.h:488 `struct vm_area_struct *mmap;`).
- *   >= 6.1  that list was replaced by a maple tree: mm_struct.mm_mt (v6.1
- *           mm_types.h:514), walked with the vma iterator helpers VMA_ITERATOR() /
- *           for_each_vma() (v6.1 mm_types.h:810, mm.h:689).  This is why
- *           "no member named 'mmap' in 'struct mm_struct'" and "no member named
- *           'vm_next' in 'struct vm_area_struct'" appeared on android14-6.1 and
- *           android15-6.6.
- *
- * Both forms are header-only (macros and static inlines), so neither needs a kernel
- * symbol.  mmap_lock is held for read by every caller, as the walk itself requires. */
+/* The VMA container changed in 6.1; both spellings answer the same question - "the first
+ * vma whose end is past @start", i.e. the one containing @start or the next after a gap -
+ * and the caller still compares the result against vm_start.
+ *   <= 6.0  mm_struct.mmap heads a doubly linked list, walked with vma->vm_next
+ *   >= 6.1  that list became the mm_struct.mm_mt maple tree, walked with the vma iterator
+ *           helpers VMA_ITERATOR() / for_each_vma() (mm_types.h, mm.h) - which is why
+ *           "no member named 'mmap' in 'struct mm_struct'" and "'vm_next' in
+ *           'struct vm_area_struct'" appeared on android14-6.1 and android15-6.6.
+ * Both forms are header-only (macros and static inlines), so neither needs a kernel symbol;
+ * mmap_lock is held for read by every caller, as the walk itself requires. */
 static struct vm_area_struct *sus_map_find_vma(struct mm_struct *mm, unsigned long start)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
@@ -423,9 +346,8 @@ static struct vm_area_struct *sus_map_find_vma(struct mm_struct *mm, unsigned lo
 #endif
 }
 
-/* walk_dbg >= 2: dump the resolution of the first few walks that got past the ops
- * test, so "no vma for (mm, start)" can be told apart from "the vma is not the
- * one we expected" without guessing. */
+/* walk_dbg >= 2: dump the first few resolutions past the ops test, to tell "no vma for
+ * (mm, start)" from "the vma is not the expected one". */
 static void sus_map_walk_dbg_log(const char *what, struct mm_struct *mm,
                                  unsigned long start, struct vm_area_struct *vma)
 {
@@ -433,18 +355,15 @@ static void sus_map_walk_dbg_log(const char *what, struct mm_struct *mm,
         return;
     if (atomic_dec_if_positive(&n_walk_dbg_left) < 0)
         return;
-    /* The list head this used to print is `mm->mmap`; sus_map_find_vma(mm, 0) is that
-     * same vma (the first one, since vm_end is never 0) in either container. */
     SUSFS_LOGI("sus_map: %s mm=%px start=%lx mmap=%px vma=%px %lx-%lx file=%px\n",
             what, mm, start, mm ? sus_map_find_vma(mm, 0) : NULL, vma,
             vma ? vma->vm_start : 0UL, vma ? vma->vm_end : 0UL,
             (vma && vma->vm_file) ? vma->vm_file : NULL);
 }
 
-/* walk_page_range(mm, start, end, ops, private): the vma has to be resolved from
- * (mm, start), which is what the walk itself would have done - mmap_lock is held
- * for read by every caller of these three ops, so the container this walks (the vma
- * list before 6.1, the vma maple tree from 6.1) cannot change underneath it. */
+/* walk_page_range(mm, start, end, ops, private): the vma is resolved from (mm, start) as
+ * the walk itself would have done, under the mmap_lock every caller of these three ops
+ * holds for read - so sus_map_find_vma()'s container cannot change underneath it. */
 static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     const void *ops = (const void *)regs->regs[3];
@@ -469,7 +388,6 @@ static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
 
     vma = sus_map_find_vma(mm, start);
     if (!vma || start < vma->vm_start) {
-        /* start is in a gap: nothing to hide */
         atomic_inc(&n_walk_scan_fail);
         sus_map_walk_dbg_log("walk_page_range: no vma", mm, start, NULL);
         return 0;
@@ -510,55 +428,41 @@ static struct kprobe kp_map_walk_vma = {
 
 /* ---- /proc/<pid>/mem (and ptrace): the page-fetch primitive ----
  *
- * Upstream's fifth SUS_MAP site is __access_remote_vm() (mm/memory.c, patch:
- * 5667-5687): after taking mmap_read_lock it resolves vma = vma_lookup(mm, addr)
- * ONCE and, inside the transfer loop, breaks out when that vma's file is
- * registered - so a read (or write) that starts inside a hidden mapping
- * transfers nothing at all.
+ * Upstream's fifth SUS_MAP site is __access_remote_vm() (mm/memory.c, patch:5667-5687):
+ * after mmap_read_lock it resolves vma = vma_lookup(mm, addr) once and, inside the transfer
+ * loop, breaks out when that vma's file is registered - so a read (or write) starting
+ * inside a hidden mapping transfers nothing at all.  Its entry cannot be hooked usefully:
+ * the lock is taken INSIDE it, and resolving a vma without that lock is a use-after-free
+ * waiting for the target process to munmap.  What can be hooked is the primitive the loop
+ * calls with the lock held:
+ *   __access_remote_vm()       -> get_user_pages_remote(mm, addr, 1, ...)
+ *   process_vm_rw_single_vec() -> pin_user_pages_remote(mm, pa, ...)
+ *   (both *_remote variants require mmap_read_lock)
+ * Short-circuiting that call (x0 = 0, pc = lr) makes the caller see "no page transferred":
+ * __access_remote_vm returns the bytes it had already moved - 0 when the read starts inside
+ * the mapping, upstream's result - and process_vm_readv takes its `pinned_pages <= 0` error
+ * path.  Nothing is pinned, because the call never runs.
  *
- * The function cannot be hooked usefully at its entry: the lock is taken INSIDE
- * it (mmap_read_lock_killable), and resolving a vma without that lock is a
- * use-after-free waiting for the target process to munmap.  What can be hooked is
- * the primitive the loop calls with the lock already held:
+ * The second primitive is not needed for upstream parity (upstream patches
+ * __access_remote_vm only, and process_vm_readv does not go through it - measured from this
+ * kernel's mm/process_vm_access.c: process_vm_rw_single_vec calls pin_user_pages_remote
+ * directly); it is hooked because the same short circuit closes one more probe.
  *
- *   __access_remote_vm()          -> get_user_pages_remote(mm, addr, 1, ...)
- *   process_vm_rw_single_vec()    -> pin_user_pages_remote(mm, pa, ...)   (both
- *                                    *_remote variants require mmap_read_lock)
- *
- * Short-circuiting that call (pre_handler returns 1 after x0 = 0 and pc = lr)
- * makes the caller see "no page transferred": __access_remote_vm breaks out of
- * its loop and returns the bytes it had already moved - 0 when the read starts
- * inside the mapping, which is upstream's result - and process_vm_readv's
- * process_vm_rw_single_vec takes its `pinned_pages <= 0` error path.  Nothing is
- * pinned on the way, because the call never runs.
- *
- * The second primitive is NOT needed for upstream parity: upstream patches
- * __access_remote_vm only, and process_vm_readv does not go through it (measured
- * from this kernel's mm/process_vm_access.c: process_vm_rw_single_vec calls
- * pin_user_pages_remote directly).  It is hooked here because the same short
- * circuit closes it for one more probe, and because "the API that reads another
- * process' memory" is the loudest cross-check there is.
- *
- * Cost control: the handler runs on every *_remote page fetch in the kernel while
- * a rule exists, so the two cheapest tests come first (no rules -> one load;
- * uid < 10000 -> the gate), and find_vma() only runs for callers the gate lets
- * through. */
+ * Cost control: the handler runs on every *_remote page fetch while a rule exists, so the
+ * cheapest tests come first (no rules -> one load; uid < 10000 -> the gate) and find_vma()
+ * only runs for callers the gate lets through. */
 static atomic_t n_gup_calls = ATOMIC_INIT(0);
 static atomic_t n_gup_inner_calls = ATOMIC_INIT(0);
 static atomic_t n_vm_hides = ATOMIC_INIT(0);
 
 static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs);
 
-/* Both are thin layers of the same code, and which one a given call site reaches
- * is decided by LTO - measured: the __access_remote_vm path calls
- * get_user_pages_remote out of line (its probe fired), while process_vm_readv's
- * call to pin_user_pages_remote was inlined away.  That wrapper's probe was
- * therefore removed again after measuring zero hits in every run: it reads as
- * coverage while being unreachable, which is the trap this file keeps counters
- * for.  The innermost symbol, __get_user_pages_remote, is what both wrappers end
- * in and takes the same (mm, start) as its first two arguments, so it is armed as
- * well; a short circuit at the outer layer stops the inner one from ever being
- * reached, so no call is filtered twice. */
+/* Both are thin layers of the same code and which one a call site reaches is decided by
+ * LTO - measured: the __access_remote_vm path reaches get_user_pages_remote out of line (its
+ * probe fired), while process_vm_readv's pin_user_pages_remote was inlined away, so that
+ * wrapper's probe was removed after zero hits in every run.  __get_user_pages_remote, what
+ * both wrappers end in, takes the same (mm, start) as its first two arguments and is armed
+ * too; a short circuit at the outer layer stops the inner one from being reached. */
 static struct kprobe kp_gup_remote = {
     .symbol_name = "get_user_pages_remote",
     .pre_handler = sus_map_vm_access_pre,
@@ -585,8 +489,7 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
 
     atomic_inc(kp == &kp_gup_remote_inner ? &n_gup_inner_calls : &n_gup_calls);
 
-    /* Safe without re-taking anything: both callers hold mmap_read_lock, which is
-     * what the `*_remote` contract of this primitive means. */
+    /* both callers hold mmap_read_lock: the *_remote contract of this primitive */
     vma = find_vma(mm, addr);
     if (!vma || !vma->vm_file)
         return 0;
@@ -604,39 +507,25 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
 
 /* ---- /proc/<pid>/map_files/<start>-<end> ----
  *
- * Each of those entries is a symlink to the file mapped at that range, so `ls -l`
- * and `readlink` name a sus_map-registered file outright - measured: that is how
- * the a4 tests found the address of a mapping the maps listing had already
- * dropped, i.e. this listing undid the hiding.
+ * Each entry is a symlink to the file mapped at that range, so `ls -l` and readlink name a
+ * sus_map-registered file outright - measured: this is how the a4 tests found the address of
+ * a mapping the maps listing had already dropped, i.e. this listing undid the hiding.
+ * Upstream skips the entry in proc_map_files_readdir() (patch:1088-1095); a kprobe cannot
+ * skip one entry of a readdir (the decision is a local in the middle of that function), so
+ * the symlink still exists but resolving it answers ENOENT - what a checker gets for a file
+ * that is not there.  The residual difference (the range is still listed) is in
+ * TECHNICAL_NOTES.md.
  *
- * Upstream skips the entry in proc_map_files_readdir() (patch:1088-1095), so for
- * upstream the name never appears at all.  A kprobe cannot skip one entry of a
- * readdir - the decision is made on a local in the middle of that function - so
- * this covers the other half: the symlink still exists, but resolving it answers
- * ENOENT, the same answer a checker gets for a file that is not there.  The
- * residual difference (the range is still listed) is recorded in
- * TECHNICAL_NOTES.md; closing it would need the readdir loop itself.
- *
- * WHICH function to hook is not guessable, and the first attempt got it wrong:
- * `proc_map_files_get_link` (the i_op) registered fine and was never called.  Two
- * facts from this kernel's fs/proc/base.c explain why:
- *
- *   - do_readlinkat() calls i_op->readlink FIRST and only falls back to
- *     vfs_readlink() (-> get_link) when it is NULL.  proc_map_files uses
- *     `.readlink = proc_pid_readlink`, so readlink(2) never touches get_link;
- *     `ls -l` uses readlink(2) too.
- *   - proc_pid_readlink() ends up in the per-inode callback
- *     `ei->op.proc_get_link` = map_files_get_link(dentry, struct path *path) -
- *     which is the one place that hands over the MAPPED file's path.
- *
- * So the hook sits on map_files_get_link and judges by inode (path->dentry),
- * which is exact: no path string to compare, no spelling to get wrong.  It only
- * ever fails a call that would have succeeded - the caller checks its return
- * value and treats a negative one as "no link". */
+ * The first attempt hooked `proc_map_files_get_link` (the i_op): it registered fine and was
+ * never called.  From this kernel's fs/proc/base.c - do_readlinkat() calls i_op->readlink
+ * FIRST and only falls back to vfs_readlink() (-> get_link) when it is NULL, and
+ * proc_map_files uses `.readlink = proc_pid_readlink`, which ends in the per-inode callback
+ * `ei->op.proc_get_link` = map_files_get_link(), the one place that hands over the MAPPED
+ * file's path.  So the hook judges by inode (path->dentry), which is exact and only ever
+ * fails a call that would have succeeded: the caller treats a negative return as "no link". */
 static int sus_map_maplink_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    /* struct path *path is the output argument; it is only filled in by the time
-     * the function returns, so remember it here and read it there. */
+    /* struct path *path is an output argument, filled only at return: save it here. */
     *(unsigned long *)ri->data = regs->regs[1];
     return 0;
 }
@@ -696,13 +585,11 @@ static struct kprobe *const map_probes[] = {
 static bool map_registered;
 static bool map_probe_armed[N_MAP_PROBES];
 
-/* Reachability, not configuration: "the probe is registered" says nothing on a
- * kernel built with CONFIG_LTO_CLANG_FULL, because the call site it is supposed
- * to catch may have been inlined away (walk_page_range() is EXPORT_SYMBOL_GPL,
- * and LTO may still inline the calls inside pagemap_read()/smap_gather_stats()).
- * walk_seen counts every call the probe saw at all, walk_skipped the subset that
- * answered "hidden" - so walk_seen == 0 is the fingerprint of an inlined call
- * site, not of a rule that failed to match. */
+/* Reachability, not configuration: "the probe is registered" says nothing on a kernel built
+ * with CONFIG_LTO_CLANG_FULL, where the call site it should catch may have been inlined away
+ * (walk_page_range() is EXPORT_SYMBOL_GPL and LTO may still inline the calls inside
+ * pagemap_read()/smap_gather_stats()).  walk_seen == 0 while a rule matches fingerprints such
+ * an inlined call site, not a rule that failed to match. */
 static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
 {
     int i, armed = 0;
@@ -732,14 +619,13 @@ static const struct kernel_param_ops sus_map_stat_ops = {
 };
 module_param_cb(map_stat, &sus_map_stat_ops, NULL, 0400);
 
-/* Registers whichever of the probes are not up yet.  Called from init (when a
- * rule already exists) and from the supercall that adds the first rule, so both
- * paths arm exactly the same set. */
+/* Registers whichever of the probes are not up yet.  Called from init (when a rule
+ * already exists) and from the supercall that adds the first rule, so both paths arm
+ * exactly the same set. */
 static int sus_map_register_probes(void)
 {
     int i, n = 0, first_err = 0;
 
-    /* The walk probe is the only one that needs something resolved first. */
     sus_map_resolve_walk_ops();
 
     for (i = 0; i < (int)N_MAP_PROBES; i++) {
@@ -767,8 +653,7 @@ static int sus_map_register_probes(void)
                 n, (int)N_MAP_PROBES, nmap);
 
     /* The map_files hook is a kretprobe, so it lives outside map_probes[] (which
-     * holds struct kprobe *) and is tracked on its own.  Optional like the rest:
-     * without it the maps/smaps listings are still filtered. */
+     * holds struct kprobe *) and is tracked on its own; optional like the rest. */
     if (!kr_map_files_ok) {
         int rc = register_kretprobe(&kr_map_files);
 
@@ -794,8 +679,8 @@ int susfs_sus_map_init(void)
         return 0;
     }
 
-    /* Every probe is optional on its own: without show_smap the maps listing is
-     * still filtered, so one missing symbol must not take the rest down. */
+    /* Every probe is optional on its own: without show_smap the maps listing is still
+     * filtered, so one missing symbol must not take the rest down. */
     rc = sus_map_register_probes();
     if (rc)
         return rc;
@@ -833,8 +718,7 @@ void susfs_sus_map_supercall(void __user **arg)
         goto out;
     }
 
-    /* char[256] field that need not be NUL-terminated: reject it before
-     * kern_path() can read off the end of our stack copy of the struct. */
+    /* char[256] field that need not be NUL-terminated: reject it before kern_path() can read off the end of our stack copy. */
     if (!susfs_abi_path_ok(info.target_pathname, sizeof(info.target_pathname))) {
         info.err = -ENAMETOOLONG;
         goto out;
@@ -857,10 +741,9 @@ void susfs_sus_map_supercall(void __user **arg)
         info.err = -ENOSPC;
         goto out;
     }
-    /* One call fills both fields.  The old two-step form called sus_map_add(),
-     * which returns early when ino==0, and then wrote map_entries[nmap-1]
-     * unconditionally - indexing -1 at worst, or corrupting the previous rule's
-     * device at best. */
+    /* One call fills both fields: the old two-step form let sus_map_add() return early on
+     * ino==0 and then wrote map_entries[nmap-1] regardless - indexing -1 at worst,
+     * corrupting the previous rule's device at best. */
     rc = sus_map_add_full(inode->i_ino, inode->i_sb->s_dev);
     if (rc) {
         path_put(&p);
@@ -871,7 +754,6 @@ void susfs_sus_map_supercall(void __user **arg)
             info.target_pathname, inode->i_ino);
     path_put(&p);
 
-    /* lazy-register the hooks if this was the first rule */
     if (!map_registered) {
         rc = sus_map_register_probes();
         if (rc) {

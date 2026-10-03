@@ -2,35 +2,23 @@
 /*
  * susfs_kstat.c - spoof kstat fields (SUSFS SUS_KSTAT feature), LKM port.
  *
- * Interface mirrors the original SUSFS userspace commands, exposed through
- * /proc/susfs_kstat (one command per write):
+ * Interface mirrors the original SUSFS userspace commands, one command per write to
+ * /proc/susfs_kstat:
+ *   add_sus_kstat <path> - store the CURRENT stat of <path> as the spoof target
+ *       (ino/dev/times/blocks/blksize), flags = KSTAT_AUTO_SPOOF; use it BEFORE the path is
+ *       bind-mounted/overlayed, then call update_sus_kstat.
+ *   add_sus_kstat_statically <path> <ino> <dev> <nlink> <size> <atime> <atime_nsec> <mtime>
+ *       <mtime_nsec> <ctime> <ctime_nsec> <blocks> <blksize> - set each field explicitly;
+ *       "default" keeps the current value and does NOT spoof that field, and only non-default
+ *       fields get their KSTAT_SPOOF_* flag set.
+ *   update_sus_kstat <path> / update_sus_kstat_full_clone <path> - re-resolve <path> (after it was
+ *       bind-mounted/overlayed) and update target_ino/target_dev only, spoofed values staying as
+ *       previously added; the _full_clone form also raises KSTAT_SPOOF_NLINK|KSTAT_SPOOF_SIZE.
+ *   del <path> - remove one rule by its target pathname;   clear - remove all rules.
  *
- *   add_sus_kstat <path>
- *       Store the CURRENT stat of <path> as the spoof target (ino/dev/times/
- *       blocks/blksize), flags = KSTAT_AUTO_SPOOF.  Use this BEFORE the path
- *       is bind-mounted / overlayed, then call update_sus_kstat afterwards.
- *
- *   add_sus_kstat_statically <path> <ino> <dev> <nlink> <size> <atime>
- *       <atime_nsec> <mtime> <mtime_nsec> <ctime> <ctime_nsec> <blocks>
- *       <blksize>
- *       Set each field explicitly; pass "default" to keep the current value
- *       (and NOT spoof that field).  Only non-default fields get their
- *       KSTAT_SPOOF_* flag set.
- *
- *   update_sus_kstat <path>
- *       Re-resolve <path> (after it was bind-mounted / overlayed) and update
- *       target_ino/target_dev only; spoofed values stay as previously added.
- *
- *   update_sus_kstat_full_clone <path>
- *       Same, plus KSTAT_SPOOF_NLINK|KSTAT_SPOOF_SIZE.
- *
- *   del <path>      remove one rule by its target pathname
- *   clear           remove all rules
- *
- * Hook strategy (LTO on this GKI inlines the newfstatat chain
- * vfs_fstatat -> vfs_statx -> vfs_getattr -> cp_new_stat, so VFS-layer
- * kprobes miss): the reliable hook is the return of __arm64_sys_newfstatat,
- * where the user statbuf is fully written.  Rewrite the requested fields
+ * Hook strategy (LTO on this GKI inlines the newfstatat chain vfs_fstatat -> vfs_statx ->
+ * vfs_getattr -> cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the return of
+ * __arm64_sys_newfstatat, where the user statbuf is fully written.  Rewrite the requested fields
  * there via copy_to_user.  Field offsets are arm64 asm-generic struct stat.
  */
 #include <linux/module.h>
@@ -55,10 +43,8 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 
-/* KSTAT_SPOOF_* bits now live in susfs_abi.h (upstream declares them in
- * susfs.h next to struct st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are
- * local convenience masks for the /proc interface, not part of the supercall
- * ABI. */
+/* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
+ * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
 #define KSTAT_AUTO_SPOOF (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV | \
 	KSTAT_SPOOF_ATIME_TV_SEC | KSTAT_SPOOF_ATIME_TV_NSEC | \
 	KSTAT_SPOOF_MTIME_TV_SEC | KSTAT_SPOOF_MTIME_TV_NSEC | \
@@ -68,15 +54,13 @@
 	KSTAT_SPOOF_NLINK | KSTAT_SPOOF_SIZE)
 
 #define SUS_KSTAT_MAX 32
-/* Upstream's st_susfs_sus_kstat.target_pathname is char[256]; match it, or a
- * legal long path is either truncated (wrong rule) or rejected (fidelity gap). */
+/* Upstream's target_pathname is char[256]: a shorter buffer truncates a legal long path into a wrong rule. */
 #define KSTAT_PATH_MAX 256
 
 struct sus_kstat_entry {
 	char target_pathname[KSTAT_PATH_MAX];
 	unsigned long target_ino;
-	/* dev stored ENCODED (new_encode_dev) so it matches the user statbuf
-	 * st_dev field 1:1 on the tracepoint hot path. */
+	/* dev stored ENCODED (new_encode_dev) so it matches the user statbuf st_dev field 1:1 on the tracepoint hot path. */
 	dev_t target_dev;
 	unsigned long spoofed_ino;
 	unsigned long spoofed_dev;
@@ -97,20 +81,13 @@ static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
 static int nkstat;
 static DEFINE_MUTEX(kstat_lock);
 
-/* Table locking, in two tiers.
- *
- * kstat_lock (mutex) serialises WRITERS and the /proc read, because writers
- * resolve paths and that sleeps.
- *
- * kstat_table_lock (spinlock) guards the table itself for the READERS, which
- * run on hot paths - the sys_exit tracepoint and the vfs_getattr kretprobe -
- * where sleeping is impossible and kstat_lock therefore cannot be taken.  A
- * reader holds it only long enough to copy the matching entry out; it must
- * never copy_to_user under it.
- *
- * Rule: resolve first (sleeping, outside), then swap (non-sleeping, inside).
- * Publishing a slot before it is fully filled is a bug - an empty slot used to
- * be visible as soon as nkstat was bumped, before kern_path() had even run. */
+/* Table locking, in two tiers.  kstat_lock (mutex) serialises WRITERS and the /proc read, because
+ * writers resolve paths and that sleeps.  kstat_table_lock (spinlock) guards the table for the
+ * READERS - the sys_exit tracepoint and the vfs_getattr kretprobe, hot paths where kstat_lock
+ * cannot be taken; a reader holds it only long enough to copy the matching entry out and must never
+ * copy_to_user under it.  Rule: resolve first (sleeping, outside), then swap (non-sleeping, inside) -
+ * publishing a slot before it is filled is a bug (an empty slot used to be visible as soon as nkstat
+ * was bumped, before kern_path() had even run). */
 static DEFINE_SPINLOCK(kstat_table_lock);
 
 /* The part of an entry a reader needs, copied out under kstat_table_lock. */
@@ -162,10 +139,9 @@ static void kstat_snapshot(const struct sus_kstat_entry *e,
 #define ST_CTIME_OFF        104
 #define ST_CTIME_NSEC_OFF   112
 
-/* The numbers above are a uapi contract, so they can be checked at build time
- * instead of trusted: arm64 uses the generic layout (__ARCH_WANT_NEW_STAT), and
- * a DDK header change that moved a member would otherwise corrupt the caller's
- * stat buffer instead of failing this build. */
+/* The numbers above are a uapi contract, checked at build time instead of trusted: arm64 uses the
+ * generic layout (__ARCH_WANT_NEW_STAT), and a DDK header change that moved a member would
+ * otherwise corrupt the caller's stat buffer instead of failing this build. */
 static_assert(offsetof(struct stat, st_dev) == ST_DEV_OFF, "stat.st_dev");
 static_assert(offsetof(struct stat, st_ino) == ST_INO_OFF, "stat.st_ino");
 static_assert(offsetof(struct stat, st_nlink) == ST_NLINK_OFF, "stat.st_nlink");
@@ -178,50 +154,35 @@ static_assert(offsetof(struct stat, st_ctime) == ST_CTIME_OFF, "stat.st_ctime");
 
 /* ---- the read gate ----
  *
- * Upstream gates every sus_kstat read on susfs_is_current_proc_umounted_app(),
- * which is exactly (TIF_PROC_UMOUNTED && current_uid().val >= 10000).  The flag
- * is set by KernelSU's setuid_hook only when SUSFS integration is compiled into
- * the kernel; this device's kernel has none (zero susfs symbols in kallsyms), so
- * it never sets and uid >= 10000 is the available proxy - the same one sus_path
- * already uses.
- *
- * Without this gate the spoofing is visible to every process including root,
- * which is a wider behaviour than upstream and a fidelity gap.
- *
- * Writers (the supercall and /proc interface) are configuration and stay
- * ungated. */
+ * Upstream gates every sus_kstat read on susfs_is_current_proc_umounted_app(), exactly
+ * (TIF_PROC_UMOUNTED && current_uid().val >= 10000).  KernelSU's setuid_hook sets that flag only
+ * when SUSFS integration is compiled into the kernel, and this device's kernel has none (zero susfs
+ * symbols in kallsyms) - so uid >= 10000 is the available proxy, the same one sus_path uses.
+ * Without it the spoofing is visible to root too, wider than upstream.  Writers (supercall, /proc)
+ * are configuration and stay ungated. */
 static bool susfs_kstat_gate_ok(void)
 {
 	return current_uid().val >= 10000;
 }
 
 /* ---- table access ----
- *
- * The *_table_* helpers below are the ONLY places that modify kstat_entries or
- * nkstat, and each one does it under kstat_table_lock.  Their callers hold
- * kstat_lock, which is what makes the index they pass in stable.
- */
+ * The *_table_* helpers are the ONLY places that modify kstat_entries or nkstat, each under
+ * kstat_table_lock; their callers hold kstat_lock, making the index they pass stable. */
 
-/* Cheapest possible gate for the READ paths: with nothing registered, no lookup
- * can match, so there is no reason to touch user memory at all.  On the sys_exit
- * tracepoint that saves the two copy_from_user() reads the spoofers do before
- * matching; on the show_map_vma kprobe (still armed after a `clear`) and the
- * vfs_getattr kretprobe it saves an uncontended spinlock per VMA / per lookup.
- *
- * READ_ONCE is enough.  nkstat is published only AFTER the entry it counts has
- * been written, under kstat_table_lock (kstat_table_append stores the entry,
- * then bumps the count), so a stale non-zero value only means we do the work we
- * used to do; a stale zero can cost at most the single read that races the very
- * first add.  The authoritative test remains the locked lookup below.
- * sus_path uses the same idiom (READ_ONCE(sus_path_count) in
- * sus_path_match_path) - this is the kstat equivalent. */
+/* Cheapest possible gate for the READ paths: with nothing registered no lookup can match, which on
+ * the sys_exit tracepoint saves the two copy_from_user() reads the spoofers do before matching, and
+ * on the show_map_vma kprobe (still armed after a `clear`) and the vfs_getattr kretprobe saves an
+ * uncontended spinlock per VMA / per lookup.  READ_ONCE is enough: nkstat is published only AFTER
+ * the entry it counts has been written, under kstat_table_lock (kstat_table_append stores the entry,
+ * then bumps the count), so a stale non-zero value only means work we used to do and a stale zero can
+ * cost at most the single read racing the very first add; the authoritative test is the locked lookup.
+ * sus_path uses the same idiom (READ_ONCE(sus_path_count)). */
 static bool susfs_kstat_table_empty(void)
 {
 	return READ_ONCE(nkstat) == 0;
 }
 
-/* Hot-path lookup: match on (ino, dev) and copy the entry out atomically with
- * respect to the writers.  Returns true and fills *out on a match. */
+/* Hot-path lookup: match (ino, dev) and copy the entry out atomically w.r.t. the writers. */
 static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
 			       struct sus_kstat_snapshot *out)
 {
@@ -242,8 +203,7 @@ static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
 	return found;
 }
 
-/* Writer-side lookup by path.  Safe without the spinlock: every caller holds
- * kstat_lock, and kstat_lock is what serialises all writers. */
+/* Writer-side lookup by path: safe without the spinlock, since every caller holds kstat_lock. */
 static struct sus_kstat_entry *susfs_kstat_find_by_path(const char *path)
 {
 	int i;
@@ -270,8 +230,7 @@ static int kstat_table_append(const struct sus_kstat_entry *src)
 	return idx;
 }
 
-/* Replace a live entry wholesale (update: the reader sees old or new, never a
- * mix of the two). */
+/* Replace a live entry wholesale: the reader sees old or new, never a mix of the two. */
 static void kstat_table_put(int idx, const struct sus_kstat_entry *src)
 {
 	unsigned long flags;
@@ -297,8 +256,7 @@ static void kstat_table_retarget(int idx, unsigned long ino, dev_t dev,
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 }
 
-/* Remove by index: move the last entry into the hole.  The reader must not be
- * able to observe that move half-done, hence the lock. */
+/* Remove by index: move the last entry into the hole, under the lock so a reader never sees that move half-done. */
 static void kstat_table_del(int idx)
 {
 	unsigned long flags;
@@ -323,36 +281,24 @@ static void kstat_table_clear(void)
 
 /* ---- /proc/<pid>/maps coverage ----
  *
- * Upstream's susfs_sus_kstat_spoof_show_map_vma() rewrites the dev/ino on the
- * line from inside show_map_vma(), where dev and ino are still local variables.
- * An LKM cannot reach those locals, and re-printing the line would mean
- * reproducing the kernel's column padding (seq_setwidth()/seq_pad() are not
- * exported, m->pad_until is private state) - a line padded differently from its
- * neighbours is itself a tell.
+ * Upstream's susfs_sus_kstat_spoof_show_map_vma() rewrites dev/ino inside show_map_vma(), where
+ * both are still locals, i.e. unreachable from an LKM - and re-printing the line would mean
+ * reproducing the kernel's column padding (seq_setwidth()/seq_pad() are not exported, m->pad_until
+ * is private state), while a line padded differently from its neighbours is itself a tell.  So the
+ * already-formatted line is edited at the return of the function that printed it: the "maj:min ino"
+ * run is located by rendering the REAL values the way fs/proc/task_mmu.c does (seq_put_hex_ll for
+ * major/minor - lowercase, minimum width 2 - and seq_put_decimal_ull for the ino) and replaced by
+ * the spoofed ones.  An earlier version DROPPED the whole line: that closed the stat-vs-maps
+ * contradiction but changed the line count (a mapping listed for every process except this one is
+ * its own signal) and left smaps unfiltered anyway, its header coming from another call site.
  *
- * So the already-formatted line is edited instead, at the return of the function
- * that printed it: the "maj:min ino" run is located by rendering the REAL values
- * exactly the way fs/proc/task_mmu.c renders them (seq_put_hex_ll for major/minor,
- * lowercase, minimum width 2; seq_put_decimal_ull for the ino) and is replaced by
- * the spoofed ones.
- *
- * This replaces an earlier version that DROPPED the whole line.  Dropping closed
- * the stat-vs-maps contradiction, but it changed the line count - a mapping that
- * is listed for every process on the device except this one is its own signal,
- * and the file's own /proc/<pid>/smaps stayed unfiltered anyway because the
- * smaps header comes from a different call site.  Rewriting has neither problem.
- *
- * The spoofed dev is stored the way userspace sees st_dev (new_encode_dev), so it
- * has to be decoded back to major/minor - new_decode_dev, i.e. the kernel's own
- * inverse - before it can be printed in the maj:min column.  Upstream substitutes
- * its target_dev into the RAW dev local instead, which prints "0:fe4b" for a file
- * whose stat() says 254:75; this decodes, so the two agree.
- *
- * Armed on the first rule that spoofs ino or dev, not before. */
+ * The spoofed dev is stored as userspace sees st_dev (new_encode_dev), so it is decoded with
+ * new_decode_dev(), the kernel's own inverse, before being printed in the maj:min column; upstream
+ * substitutes target_dev into the RAW dev local instead, printing "0:fe4b" for a file whose stat()
+ * says 254:75.  Armed on the first rule that spoofs ino or dev. */
 
-/* Same buffer edit as the maps name/numbers rewrite in susfs_open_redirect.c:
- * replace the first occurrence of old[] with new[], growing only when the buffer
- * has room (no room -> leave the line alone rather than truncate it). */
+/* Same buffer edit as the maps name/numbers rewrite in susfs_open_redirect.c: replace the first
+ * occurrence of old[] with new[], growing only when the buffer has room. */
 static bool kstat_buf_replace(struct seq_file *m, const char *old, size_t old_len,
 			      const char *new, size_t new_len)
 {
@@ -433,8 +379,7 @@ static int kstat_map_vma_ret(struct kretprobe_instance *ri, struct pt_regs *regs
 	if (snap.flags & KSTAT_SPOOF_DEV) {
 		unsigned int enc = (unsigned int)snap.spoofed_dev;
 
-		/* new_decode_dev(): the inverse of what cp_new_stat() encoded, so a
-		 * file whose stat() says 254:75 prints "fe:4b" here as well. */
+		/* new_decode_dev(): the inverse of what cp_new_stat() encoded, so a file whose stat() says 254:75 prints "fe:4b" here too. */
 		major = (enc & 0xfff00u) >> 8;
 		minor = (enc & 0xffu) | ((enc >> 12) & 0xfff00u);
 	} else {
@@ -446,12 +391,9 @@ static int kstat_map_vma_ret(struct kretprobe_instance *ri, struct pt_regs *regs
 				    ? snap.spoofed_ino
 				    : (unsigned long)inode->i_ino);
 
-	/* Keep the column width.  The kernel padded the name out to a fixed column,
-	 * so a SHORTER run would pull the name left by the difference - and a line
-	 * whose name does not line up with its neighbours is visible on its own.
-	 * Space-padding the run keeps the name exactly where the kernel put it; a
-	 * LONGER run does shift it, which is the rare case (a spoofed ino with more
-	 * digits than the real one) and still leaves the line self-consistent. */
+	/* Keep the column width, space-padding the run: a SHORTER run would pull the name left by the
+	 * difference and a line whose name does not line up with its neighbours is visible on its own.
+	 * A LONGER run does shift it - the rare case (a spoofed ino with more digits than the real one). */
 	while (new_len < old_len && new_len < (int)sizeof(new) - 1)
 		new[new_len++] = ' ';
 
@@ -471,8 +413,7 @@ static struct kretprobe krp_kstat_map_vma = {
 
 static bool kstat_maps_registered;
 
-/* Registering sleeps, so this runs from the rule-management paths (kstat_lock
- * held, process context), never from the hot paths. */
+/* Registering sleeps, so this runs from the rule-management paths (kstat_lock held, process context). */
 static void kstat_maps_arm(void)
 {
 	int rc;
@@ -500,9 +441,8 @@ static void kstat_maps_disarm(void)
 /* rewrite the requested fields of the native user statbuf */
 static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 {
-	/* Snapshot, not a pointer into the table: the lookup hands out a private
-	 * copy so a concurrent writer cannot retarget the entry between the match
-	 * and the copy_to_user below (which must not run under a spinlock). */
+	/* Snapshot, not a pointer into the table: a concurrent writer must not be able to retarget the
+	 * entry between the match and the copy_to_user below, which must not run under a spinlock. */
 	struct sus_kstat_snapshot snap;
 	const struct sus_kstat_snapshot *e = &snap;
 	unsigned long ino = 0, dev = 0;
@@ -586,39 +526,26 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 	}
 }
 
-/* AArch32 (compat) statbuf layouts.
+/* AArch32 (compat) statbuf layouts.  There are TWO, and which one a syscall fills is decided by
+ * its NUMBER, not by the caller being 32-bit:
+ *   __NR_fstatat64 327, __NR_fstat64 197 -> struct stat64 (arch/arm64/include/asm/stat.h), filled
+ *       by cp_new_stat64() via SYSCALL_DEFINE4(fstatat64,...) (fs/stat.c, __ARCH_WANT_COMPAT_STAT64);
+ *       this struct is NOT struct compat_stat.
+ *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108 -> struct compat_stat
+ *       (arch/arm64/include/asm/compat.h) via cp_compat_stat(); this tree's unistd32.h maps none of
+ *       them, so nothing reaches them here.  They are listed so nobody concludes "compat =
+ *       compat_stat" and wires the wrong offsets - which is what this code used to do: st_ino was
+ *       read at +4, the HIGH half of st_dev in stat64 and always 0, so the lookup could never match
+ *       (a match would have written into st_dev/st_rdev).
  *
- * There are TWO of them, and which one a syscall fills is decided by its number,
- * not by the fact that the caller is 32-bit:
- *
- *   __NR_fstatat64 327, __NR_fstat64 197
- *       -> struct stat64, arch/arm64/include/asm/stat.h:19-48, filled by
- *          cp_new_stat64() (fs/stat.c:486) through SYSCALL_DEFINE4(fstatat64,...)
- *          (fs/stat.c:556, enabled by __ARCH_WANT_COMPAT_STAT64).  This struct is
- *          NOT struct compat_stat, and it is not laid out the way the 4-byte
- *          INT_MAX... see the alignment note below.
- *
- *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108
- *       -> struct compat_stat (arch/arm64/include/asm/compat.h:38-67), filled by
- *          cp_compat_stat().  This kernel tree's unistd32.h has no mapping for
- *          those numbers, so nothing reaches them here; they are listed so the
- *          next reader does not conclude that "compat = compat_stat" and wire the
- *          wrong offsets (which is exactly what this code used to do: it read
- *          st_ino at +4, i.e. the HIGH half of st_dev in stat64 - always 0 - so
- *          the lookup could never match and 32-bit callers got no spoofing at
- *          all, while a match would have written into st_dev/st_rdev).
- *
- * ALIGNMENT, and how these numbers were established (twice corrected):
- *   compat_u64/compat_s64 are `__attribute__((aligned(4)))` only when
- *   CONFIG_COMPAT_FOR_U64_ALIGNMENT is set (include/asm-generic/compat.h).  That
- *   option is selected by the 32-bit arm architecture only, so on this arm64
- *   kernel the plain `typedef s64 compat_s64;` applies and the u64 members keep
- *   their natural 8-byte alignment: st_size is at +48, not +44, and st_ino at
- *   +96, not +88.  Reading a 4-byte-aligned layout is not a silent near-miss - it
- *   was measured on device with tools/susfs_compat_stat: a 6-byte file reported
- *   size=25769803776 = 6 << 32, i.e. the low half of the field came from the
- *   padding and the high half from the value.  The offsets below are the ones
- *   that client and the kernel agree on. */
+ * ALIGNMENT (these numbers were established twice): compat_u64/compat_s64 are
+ * __attribute__((aligned(4))) only when CONFIG_COMPAT_FOR_U64_ALIGNMENT is set
+ * (include/asm-generic/compat.h), and only the 32-bit arm architecture selects it - so on this
+ * arm64 kernel the plain `typedef s64 compat_s64;` applies, u64 members keep natural 8-byte
+ * alignment, and st_size is at +48 (not +44), st_ino at +96 (not +88).  A 4-byte-aligned read is
+ * not a silent near-miss - measured on device with tools/susfs_compat_stat, a 6-byte file reported
+ * size=25769803776 = 6 << 32 (low half from padding, high half from the value).  The offsets below
+ * are what that client and the kernel agree on. */
 #define STAT64_ST_DEV_OFF       0	/* compat_u64 */
 #define STAT64_ST_BROKEN_INO_OFF 12	/* compat_ulong_t __st_ino (what is filled) */
 #define STAT64_ST_NLINK_OFF     20	/* compat_uint_t */
@@ -638,8 +565,7 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 #define COMPAT_FSTATAT64_NR	327	/* fstatat64(dfd, path, statbuf, flag) */
 #define COMPAT_FSTAT64_NR	197	/* fstat64(fd, statbuf) */
 
-/* compat (32-bit) statbuf: struct stat64 (see above) - one of the two layouts,
- * and the one both handled syscalls actually use. */
+/* compat (32-bit) statbuf: struct stat64 (see above) - the layout both handled syscalls use. */
 static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 {
 	struct sus_kstat_snapshot snap;
@@ -654,14 +580,12 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	if (!susfs_kstat_gate_ok())
 		return;
 
-	/* Key lookup on what the kernel ACTUALLY filled: __st_ino at +12.
-	 *
-	 * stat64 carries the STAT64_HAS_BROKEN_ST_INO marker (arch/arm64/include/asm/
-	 * stat.h), so cp_new_stat64() writes __st_ino and leaves st_ino (+96) alone -
-	 * reading the key from +96 would therefore compare against whatever the
-	 * caller's buffer happened to contain and never match.  Both fields are
-	 * written when spoofing, so a libc that synthesises st_ino from __st_ino and
-	 * one that reads st_ino directly both see the spoofed value. */
+	/* Key lookup on what the kernel ACTUALLY filled: __st_ino at +12.  stat64 carries the
+	 * STAT64_HAS_BROKEN_ST_INO marker (arch/arm64/include/asm/stat.h), so cp_new_stat64() writes
+	 * __st_ino and leaves st_ino (+96) alone - reading the key from +96 would compare against
+	 * whatever the caller's buffer held and never match.  Both fields are written when spoofing, so
+	 * a libc that synthesises st_ino from __st_ino and one that reads st_ino directly both see the
+	 * spoofed value. */
 	if (copy_from_user(&ino, (void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), sizeof(ino)))
 		return;
 	if (copy_from_user(&dev, (void __user *)(statbuf + STAT64_ST_DEV_OFF), sizeof(dev)))
@@ -734,9 +658,8 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	}
 }
 
-/* sys_exit tracepoint: the user statbuf is fully written by now, and
- * syscall_get_arguments() still returns the original args (verified: args[2]
- * == statbuf), so no per-cpu state is needed. */
+/* sys_exit tracepoint: the user statbuf is fully written by now, and syscall_get_arguments()
+ * still returns the original args (verified: args[2] == statbuf), so no per-cpu state is needed. */
 static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 {
 	unsigned long args[6];
@@ -747,13 +670,10 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	syscall_get_arguments(current, regs, args);
 	nr = syscall_get_nr(current, regs);
 
-	/* The statbuf argument is NOT the same one for every syscall, so the NULL
-	 * check has to live inside each branch: fstat64(fd, statbuf) keeps it in
-	 * args[1], and checking args[2] first (as this did) made every 32-bit
-	 * fstat64() return early - the rule was applied to fstatat64 and silently
-	 * not to fstat64. */
+	/* The statbuf argument is NOT the same one for every syscall, so the NULL check has to live
+	 * inside each branch: fstat64(fd, statbuf) keeps it in args[1], and checking args[2] first
+	 * made every 32-bit fstat64() return early - the rule applied to fstatat64, not to fstat64. */
 	if (is_compat_task()) {
-		/* Both of these fill struct stat64. */
 		if (nr == COMPAT_FSTATAT64_NR)
 			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[2]));
 		else if (nr == COMPAT_FSTAT64_NR)
@@ -767,8 +687,8 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	}
 }
 
-/* fallback: some paths (vfs_fstat, statx, direct callers) still reach the
- * exported vfs_getattr copy; rewrite the kernel kstat there too. */
+/* fallback: some paths (vfs_fstat, statx, direct callers) still reach the exported vfs_getattr
+ * copy; rewrite the kernel kstat there too. */
 struct vfs_getattr_args {
 	const struct path *path;
 	struct kstat *stat;
@@ -823,12 +743,11 @@ static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
 		stat->ctime.tv_nsec = e->spoofed_ctime_tv_nsec;
 }
 
-/* Counters, because "registered" and "reached" are different claims everywhere in
- * this module: the sys_exit rewrite handles newfstatat, and this fallback is what
- * covers the paths that never go through that wrapper (fstat(2), statx(2), any
- * caller of the exported vfs_getattr).  If these stay at 0 through a run that
- * calls fstat/statx, the probe is dead weight and has to go - the same test the
- * maps hook, __d_path and pin_user_pages_remote failed. */
+/* Counters, because "registered" and "reached" are different claims everywhere in this module:
+ * the sys_exit rewrite handles newfstatat, and this fallback covers the paths that never go
+ * through that wrapper (fstat(2), statx(2), any caller of the exported vfs_getattr).  If these
+ * stay at 0 through a run that calls fstat/statx, the probe is dead weight and has to go - the
+ * same test the maps hook, __d_path and pin_user_pages_remote failed. */
 static atomic_t n_gattr_hits = ATOMIC_INIT(0);
 static atomic_t n_gattr_spoofs = ATOMIC_INIT(0);
 
@@ -864,8 +783,7 @@ static struct kretprobe krp_vfs_getattr = {
 
 /* ---- path resolution + rule management (original SUSFS semantics) ---- */
 
-/* resolve <path> to its CURRENT (ino, encoded dev).  Sleeps - never call this
- * with kstat_table_lock held (writers hold only kstat_lock here). */
+/* resolve <path> to its CURRENT (ino, encoded dev).  Sleeps - never call it with kstat_table_lock held. */
 static int susfs_kstat_resolve(const char *path, unsigned long *ino, dev_t *dev)
 {
 	struct path p;
@@ -886,37 +804,31 @@ static int susfs_kstat_resolve(const char *path, unsigned long *ino, dev_t *dev)
 	return 0;
 }
 
-/* resolve <path> and fill the spoofed_* fields with its CURRENT stat
- * (generic_fillattr mapping from the inode fields).
- *
- * Fills a DETACHED entry only.  Callers build here, then commit through one of
- * the kstat_table_* helpers; nothing half-built is ever visible to a reader. */
+/* resolve <path> and fill the spoofed_* fields with its CURRENT stat (the generic_fillattr
+ * mapping).  Fills a DETACHED entry only: callers build here, then commit through one of the
+ * kstat_table_* helpers, so nothing half-built is ever visible to a reader. */
 static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *path)
 {
 	struct path p;
 	struct inode *inode;
 	int err;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-	/* 6.6 renamed the inode field to __i_ctime and marked it private ("use
-	 * inode_*_ctime accessors!"), so reading it stopped compiling:
-	 * "no member named 'i_ctime' in 'struct inode'".  inode_get_ctime() returns the
-	 * very same struct timespec64 by value.  i_atime/i_mtime were NOT renamed in
-	 * 6.6, so those two keep being read directly. */
+	/* 6.6 renamed the inode field to __i_ctime and marked it private ("use inode_*_ctime
+	 * accessors!"), so reading it stopped compiling: "no member named 'i_ctime' in 'struct inode'".
+	 * inode_get_ctime() returns the very same struct timespec64 by value; i_atime/i_mtime were NOT
+	 * renamed in 6.6, so those two keep being read directly. */
 	struct timespec64 ctime;
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	/* Same story for atime/mtime, one move later: v6.11 replaced the
-	 * `struct timespec64 i_atime/i_mtime` fields of struct inode with the split
-	 * `time64_t i_atime_sec/i_mtime_sec` + `u32 i_atime_nsec/i_mtime_nsec` (in the
-	 * trees built here: android16-6.12 include/linux/fs.h:669-674, android15-6.6
-	 * still has the old `struct timespec64 i_atime` at :664), so those two stopped
-	 * compiling the same way.  inode_get_atime()/inode_get_mtime() reassemble the
-	 * very same struct timespec64 by value (fs.h:1616-1622 and :1651-1657), which is
-	 * what the < 6.12 branch below reads directly.
-	 *
-	 * The gate is on 6.12 rather than on 6.11 because 6.11 is not a GKI kernel: the
-	 * trees this module is built for are 6.6 (old fields) and 6.12/6.18 (accessors),
-	 * and an untested 6.7-6.11 kernel is not something this branch claims. */
+	/* Same story for atime/mtime, one move later: v6.11 replaced the `struct timespec64
+	 * i_atime/i_mtime` fields of struct inode with the split `time64_t i_atime_sec/i_mtime_sec` +
+	 * `u32 i_atime_nsec/i_mtime_nsec` (in the trees built here: android16-6.12
+	 * include/linux/fs.h:669-674; android15-6.6 still has the old `struct timespec64 i_atime` at
+	 * :664), so those two stopped compiling the same way.  inode_get_atime()/inode_get_mtime()
+	 * reassemble the very same struct timespec64 by value (fs.h:1616-1622, :1651-1657), which is
+	 * what the < 6.12 branch below reads directly.  The gate is on 6.12 rather than on 6.11
+	 * because 6.11 is not a GKI kernel: the trees this module is built for are 6.6 (old fields)
+	 * and 6.12/6.18 (accessors), and an untested 6.7-6.11 kernel is not something this claims. */
 	struct timespec64 atime, mtime;
 #endif
 
@@ -968,9 +880,9 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	return 0;
 }
 
-/* re-resolve only target_ino/target_dev; spoofed values stay untouched.
- * Resolves first (sleeping), then re-targets under the lock: a reader sees the
- * old pair or the new pair, never ino-of-B with dev-of-A. */
+/* re-resolve only target_ino/target_dev; spoofed values stay untouched.  Resolve first (sleeping),
+ * then re-target under the lock: a reader sees the old pair or the new pair, never ino-of-B with
+ * dev-of-A. */
 static int susfs_kstat_update(const char *path, bool full_clone)
 {
 	struct sus_kstat_entry *e;
@@ -1037,8 +949,7 @@ static int parse_override(const char *tok, bool *is_default, long long *val)
 	return kstrtoll(tok, 10, val);
 }
 
-/* add_sus_kstat_statically: 12 fields follow the path, each number or
- * "default". */
+/* add_sus_kstat_statically: 12 fields follow the path, each a number or "default". */
 static int susfs_kstat_add_statically(char **argv, int argc)
 {
 	struct sus_kstat_entry tmp;
@@ -1103,8 +1014,8 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 	return idx < 0 ? -ENOSPC : 0;
 }
 
-/* statically-add from the supercall ABI struct (is_statically=1): copy the
- * caller's 12 spoofed fields + flags verbatim; resolve target ino/dev here. */
+/* statically-add from the supercall ABI struct (is_statically=1): copy the caller's 12 spoofed
+ * fields + flags verbatim; resolve target ino/dev here. */
 static int susfs_kstat_add_statically_abi(struct st_susfs_sus_kstat *info)
 {
 	struct sus_kstat_entry tmp;
@@ -1152,9 +1063,8 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
 		goto out;
 	}
 
-	/* All three commands key on target_pathname, and a caller may fill all 256
-	 * bytes of that field - reject an unterminated one before any strlen() or
-	 * kern_path() can walk off our stack copy of the struct. */
+	/* All three commands key on target_pathname, and a caller may fill all 256 bytes of that field -
+	 * reject an unterminated one before any strlen() or kern_path() can walk off our stack copy. */
 	if (!susfs_abi_path_ok(info.target_pathname, sizeof(info.target_pathname))) {
 		info.err = -ENAMETOOLONG;
 		goto out;
@@ -1174,16 +1084,14 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
 	}
 	mutex_unlock(&kstat_lock);
 	info.err = err;
-	/* Armed outside the lock and only after a rule actually landed: a hook
-	 * that can never fire is worse than no hook. */
+	/* Armed outside the lock and only after a rule actually landed: a hook that can never fire is worse than no hook. */
 	if (!err)
 		kstat_maps_arm();
 out:
-	/* Upstream (fs/susfs.c susfs_add_sus_kstat) writes back ONLY the err
-	 * field for this input-type command, never the whole struct.  Copying
-	 * the full struct back would overrun a caller whose own struct is
-	 * smaller/differently laid out (the prebuilt ksu_susfs tool), corrupting
-	 * its stack — match upstream exactly. */
+	/* Upstream (fs/susfs.c susfs_add_sus_kstat) writes back ONLY the err field for this
+	 * input-type command, never the whole struct: copying the full struct back would overrun a
+	 * caller whose own struct is smaller/differently laid out (the prebuilt ksu_susfs tool) and
+	 * corrupt its stack - match upstream exactly. */
 	if (copy_to_user(&((struct st_susfs_sus_kstat __user *)*arg)->err,
 			 &info.err, sizeof(info.err)))
 		pr_warn("kstat supercall copy_to_user failed\n");
@@ -1212,11 +1120,10 @@ int susfs_kstat_init(void)
 {
 	int rc;
 
-	/* The hooks are armed UNCONDITIONALLY, and that is not cosmetic: the
-	 * supercall interface (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no
-	 * /proc node at all, so skipping registration when expose_proc=0 silently
-	 * turned the whole feature into a no-op - rules accepted, never applied.
-	 * expose_proc decides whether the node exists, nothing else. */
+	/* The hooks are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
+	 * (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no /proc node at all, so skipping
+	 * registration when expose_proc=0 silently turned the whole feature into a no-op - rules
+	 * accepted, never applied.  expose_proc decides whether the node exists, nothing else. */
 	rc = register_trace_sys_exit(kstat_sys_exit, NULL);
 	if (rc)
 		pr_warn("register_trace_sys_exit failed %d\n", rc);
@@ -1229,15 +1136,12 @@ int susfs_kstat_init(void)
 	else
 		kstat_krp_registered = true;
 
-	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC
-	 * check BEFORE security_inode_permission(), so a node the app cannot open
-	 * hands it EACCES - "this exists, you may not read it" - instead of the
-	 * ENOENT sus_path is supposed to produce.  0777 lets DAC pass and leaves
-	 * the answer to sus_path's LSM layer.
-	 *
-	 * That makes the LSM layer the ONLY thing between an app and a
-	 * world-writable control node, so without it we do not create the node -
-	 * see susfs_control_node_allowed(). */
+	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC check BEFORE
+	 * security_inode_permission(), so a node the app cannot open hands it EACCES - "this exists,
+	 * you may not read it" - instead of the ENOENT sus_path is supposed to produce.  0777 lets DAC
+	 * pass and leaves the answer to sus_path's LSM layer, which then becomes the ONLY thing
+	 * between an app and a world-writable control node - so without that layer the node is not
+	 * created at all, see susfs_control_node_allowed(). */
 	if (susfs_control_node_allowed()) {
 		kstat_proc_entry = proc_create("susfs_kstat", 0777, NULL,
 					       &kstat_proc_ops);
@@ -1300,9 +1204,8 @@ static int kstat_proc_show(struct seq_file *m, void *v)
 		}
 	}
 	mutex_unlock(&kstat_lock);
-	/* "armed" is not "fired": the maps hook has to be readable the same way the
-	 * other feature hooks are, or a rewrite that never happens looks identical to
-	 * one that works. */
+	/* "armed" is not "fired": the maps hook has to be readable the same way the other feature
+	 * hooks are, or a rewrite that never happens looks identical to one that works. */
 	seq_printf(m, "maps: armed=%d hits=%d rewrites=%d\n",
 		   kstat_maps_registered, atomic_read(&n_kstat_map_hits),
 		   atomic_read(&n_kstat_map_rewrites));
@@ -1313,10 +1216,7 @@ static int kstat_proc_show(struct seq_file *m, void *v)
 
 static int kstat_proc_open(struct inode *inode, struct file *file)
 {
-	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set,
-	 * not from the mode), so refuse non-root callers here too - see the note in
-	 * susfs_enable_log.c's log_proc_open().  This node enumerates every hidden
-	 * path and spoofed value, which is exactly what a detector would want. */
+	/* root-only, like kstat_proc_open() above - 0777 is deliberate (see susfs_kstat_init()) */
 	if (current_uid().val != 0)
 		return -ENOENT;
 	return single_open(file, kstat_proc_show, NULL);
@@ -1348,9 +1248,8 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 	char *argv[16];
 	int argc, err;
 
-	/* Same gate as kstat_proc_open(): the node must not exist for anyone else.
-	 * open() alone is not enough - an fd opened by root and handed on would keep
-	 * working, which is why the sibling files check both. */
+	/* Same gate as kstat_proc_open(): open() alone is not enough - an fd opened by root and
+	 * handed on would keep working, which is why the sibling files check both. */
 	if (current_uid().val != 0)
 		return -ENOENT;
 
@@ -1390,9 +1289,9 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 
 	if (err) {
 		pr_warn("kstat proc write '%s' -> err %d\n", argv[0], err);
-		/* Reported to the writer: a command that did not take effect must not look
-		 * like a successful full write.  Success still returns len, so callers that
-		 * expect a complete write keep working. */
+		/* Reported to the writer: a command that did not take effect must not look like a
+		 * successful full write.  Success still returns len, so callers that expect a complete
+		 * write keep working. */
 		return err;
 	}
 	return len;

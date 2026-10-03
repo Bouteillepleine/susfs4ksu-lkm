@@ -1,13 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/*
- * patch_memory.c - arbitrary kernel address modification (ported from
- * KernelSU/SukiSU hook/arm64/patch_memory.c).
- *
+/* patch_memory.c - arbitrary kernel address modification (ported from KernelSU/SukiSU hook/arm64/patch_memory.c).
  * Copyright (C) 2023 bmax121. All Rights Reserved.
- *
- * Rewrites read-only kernel memory (STRICT_KERNEL_RWX) via phys_from_virt +
- * fixmap + stop_machine, handling 2MB section mappings (leaf pmd/pud/p4d).
- */
+ * Rewrites read-only kernel memory (STRICT_KERNEL_RWX) via phys_from_virt + fixmap + stop_machine, handling 2MB
+ * section mappings (leaf pmd/pud/p4d); each store goes through copy_to_kernel_nofault(), so a mapping the walk
+ * got wrong returns an error instead of faulting, and stop_machine parks every online CPU during the write. */
 
 #ifdef __aarch64__
 
@@ -20,9 +16,8 @@
 #include <asm/cacheflush.h>
 #include <asm-generic/fixmap.h>
 
-/* Translate a kernel virtual address to a physical address by walking the
- * init_mm page tables.  Handles section (leaf) mappings at p4d/pud/pmd.
- * Returns the physical address on success, or 0 and sets *err on failure. */
+/* Translate a kernel virtual address to a physical address by walking the init_mm page tables (section/leaf
+ * mappings at p4d/pud/pmd included).  Returns the physical address, or 0 and sets *err on failure. */
 unsigned long phys_from_virt(unsigned long addr, int *err)
 {
     struct mm_struct *mm = &init_mm;
@@ -151,8 +146,7 @@ int ksu_patch_text(void *dst, void *src, size_t len, int flags)
     return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);
 }
 
-/* Scan [start, start+size) for a BL whose target equals `target`.  Returns the
- * address of the first matching instruction, or NULL. */
+/* Scan [start, start+size) for a BL whose target equals `target`; returns the first match, or NULL. */
 void *scan_call_to(void *start, size_t size, void *target)
 {
     const uint32_t *insn = (const uint32_t *)start;

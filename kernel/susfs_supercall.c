@@ -2,26 +2,17 @@
 /*
  * susfs_supercall.c - SUSFS supercall dispatcher (reboot(2) ABI).
  *
- * The ksu_susfs tool (and SukiSU ksud) reach SUSFS through:
- *   syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id, &mut payload)
- * The kernel handler writes payload.err back (0 = ok, errno-style otherwise).
- *
- * Upstream SUSFS patches kernel/reboot.c SYSCALL_DEFINE4 to branch into
- * ksu_handle_sys_reboot().  An LKM cannot patch that, so we kprobe
- * __arm64_sys_reboot and match the magic values ourselves.
- *
- * Two hard constraints:
- *  - arm64 syscall-wrapper quirk: __arm64_sys_reboot's kprobe sees
- *    regs->regs[0] == struct pt_regs * (the wrapper's __regs argument); the
- *    real user args live in real_regs->regs[0..3].  See SukiSU's
+ * ksu_susfs (and SukiSU ksud) call syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id,
+ * &payload) and the handler writes payload.err back.  Upstream SUSFS patches
+ * kernel/reboot.c SYSCALL_DEFINE4 to branch into ksu_handle_sys_reboot(); an LKM cannot
+ * patch that, so we kprobe __arm64_sys_reboot and match the magics ourselves.
+ *  - arm64 syscall-wrapper quirk: the kprobe sees regs->regs[0] == struct pt_regs * (the
+ *    wrapper's __regs argument); the real user args are in real_regs->regs[0..3] - SukiSU's
  *    PT_REAL_REGS() / arch.h.
- *  - kprobe pre_handler runs in interrupt context and must not copy_from_user.
- *    We defer the actual command to task_work (TWA_RESUME), which runs in
- *    process context before returning to userspace — same trick SukiSU uses.
- *
- * The handler functions have upstream's signature `void xxx(void __user **arg)`
- * where *arg points at the userspace payload struct; each reads it, acts, and
- * writes back payload.err.
+ *  - a pre_handler runs in interrupt context and must not copy_from_user, so the command is
+ *    deferred to task_work (TWA_RESUME), i.e. process context - the same trick SukiSU uses.
+ * The handlers keep upstream's signature `void xxx(void __user **arg)`, *arg pointing at
+ * the userspace payload struct.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -35,14 +26,12 @@
 #include "susfs_log.h"
 #include "susfs.h"
 
-/* per-command deferred work */
 struct susfs_tw {
 	struct callback_head cb;
 	unsigned int cmd;
 	void __user *payload;   /* points at the userspace payload struct */
 };
 
-/* ---- feature handlers (upstream signature) ---- */
 static void susfs_show_version(void __user **arg)
 {
 	struct st_susfs_version info = {0};
@@ -73,12 +62,10 @@ out:
 		pr_warn("susfs show_variant copy_to_user failed\n");
 }
 
-/* List every feature this LKM implements, using upstream CONFIG macro names.
- *
- * Entries with an `active` callback are only reported while the feature is
- * really installed.  Advertising a feature whose registration failed produces
- * the exact inconsistency a detector probes for, so failing ones are omitted
- * (and logged by their init). */
+/* List every feature this LKM implements, using upstream CONFIG macro names.  Entries with
+ * an `active` callback are reported only while the feature is really installed:
+ * advertising a feature whose registration failed is the exact inconsistency a detector
+ * probes for, so failing ones are omitted (and logged by their init). */
 struct feature_entry {
 	const char *name;
 	bool (*active)(void);	/* NULL = always present */
@@ -94,25 +81,15 @@ static const struct feature_entry enabled_features[] = {
 	{ "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n", NULL },
 	{ "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",	NULL },
 	{ "CONFIG_KSU_SUSFS_SUS_MAP\n",		NULL },
-	/* Not an upstream config: a built-in SUSFS has no module entry to hide, so
-	 * "filter module names out of /proc/modules" only exists in this port (see
-	 * hide_modules in susfs_hide_syms.c).  Named so nobody reads it as upstream.
-	 * Only root can ask for this list in the first place. */
+	/* Not an upstream config: a built-in SUSFS has no module entry to hide, so this
+	 * port-only feature is named accordingly (see hide_modules in susfs_hide_syms.c). */
 	{ "SUSFS_GUARD_LKM_HIDE_MODULES\n",	susfs_hide_modules_active },
 };
 
-/* The -ENOMEM answer for CMD_SUSFS_SHOW_ENABLED_FEATURES is the whole ABI struct - the
- * 8192-byte feature string plus err - and it is copied to userspace in one piece.
- *
- * It used to be a local, and that is what broke the 6.1/6.6 builds:
- *   "error: stack frame size (8320) exceeds limit (2048) in 'susfs_tw_func'
- *    [-Werror,-Wframe-larger-than]"
- * (-Wframe-larger-than is an error in those GKI builds.)  susfs_tw_func() is the only
- * caller and its switch inlines this path, so the 8 KiB landed in the dispatcher's own
- * frame - and the dispatcher is reached from task_work, on a kernel stack that must not
- * carry 8 KiB of spare.  The struct is a static instead: its content is the same for
- * every caller (payload zeroed by BSS, err = -ENOMEM), and err is written with one
- * constant, so sharing it is harmless. */
+/* The -ENOMEM answer for CMD_SUSFS_SHOW_ENABLED_FEATURES is the whole ABI struct (8192-byte
+ * string + err), copied in one piece.  As a local it broke the 6.1/6.6 builds: "stack frame
+ * size (8320) exceeds limit (2048) in 'susfs_tw_func' [-Wframe-larger-than]", an error
+ * there.  As a static it is harmless - BSS-zeroed, err = -ENOMEM, same for every caller. */
 static struct st_susfs_enabled_features susfs_enabled_features_nomem;
 
 static void susfs_show_enabled_features(void __user **arg)
@@ -123,11 +100,8 @@ static void susfs_show_enabled_features(void __user **arg)
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
-		/* A struct-returning command that answers nothing at all leaves
-		 * whatever the caller had in the buffer - for the shipped clients that
-		 * is a zeroed struct, so userspace cannot tell "no memory" from "the
-		 * kernel said nothing".  Report it in the only field the ABI reserves
-		 * for it; task_work context, so the copy is allowed to sleep. */
+		/* Answering nothing would leave the caller unable to tell "no memory" from
+		 * "the kernel said nothing": report it in the ABI's err field. */
 		susfs_enabled_features_nomem.err = -ENOMEM;
 		if (copy_to_user((void __user *)*arg, &susfs_enabled_features_nomem,
 				 sizeof(susfs_enabled_features_nomem)))
@@ -154,7 +128,6 @@ static void susfs_show_enabled_features(void __user **arg)
 	kfree(info);
 }
 
-/* ---- dispatcher ---- */
 static void susfs_tw_func(struct callback_head *cb)
 {
 	struct susfs_tw *tw = container_of(cb, struct susfs_tw, cb);
@@ -172,8 +145,7 @@ static void susfs_tw_func(struct callback_head *cb)
 		break;
 	case CMD_SUSFS_ADD_SUS_PATH:
 	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
-		/* The two commands answer a missing path differently upstream, so the
-		 * handler has to know which one it is. */
+		/* The two commands answer a missing path differently upstream. */
 		sus_path_supercall(tw->cmd, &arg);
 		break;
 	case CMD_SUSFS_ADD_SUS_MAP:
@@ -203,13 +175,8 @@ static void susfs_tw_func(struct callback_head *cb)
 		susfs_sus_mount_supercall(&arg);
 		break;
 	default:
-		/* Unreachable: reboot_pre() only defers a command that
-		 * susfs_cmd_handled() accepted.  Kept as a net in case the two
-		 * lists ever drift apart. */
-		/* Cannot write `err` here: this branch has no payload type, so there is no
-		 * field to write it into.  pr_warn, not SUSFS_LOGI, because unlike every other
-		 * line around it this one means the two command lists have drifted apart - and
-		 * the deferred work has already swallowed the syscall. */
+		/* Unreachable: reboot_pre() only defers a command susfs_cmd_handled()
+		 * accepted.  Kept as a net in case the two lists drift apart. */
 		pr_warn("susfs_guard_lkm: supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
 			tw->cmd);
 		break;
@@ -219,22 +186,15 @@ static void susfs_tw_func(struct callback_head *cb)
 
 /* Commands susfs_tw_func() above actually dispatches - keep the two in sync.
  *
- * The kprobe consults this BEFORE it commits to swallowing the syscall, because
- * upstream answers an unrecognised command with `return -EINVAL` from
- * ksu_handle_sys_reboot() (KernelSU/10_enable_susfs_for_ksu.patch:2925-2926);
- * reboot.c's `if (ret) goto orig_flow;` then falls through to the real reboot
- * path, whose magic check rejects 0xDEADBEEF/0xFAFAFAFA with -EINVAL - i.e.
- * userspace gets -EINVAL out of reboot(2).  Upstream writes NOTHING to
- * payload.err in that case, and that is the whole kernel-side contract: 126
- * (ERR_CMD_NOT_SUPPORTED) is a USERSPACE sentinel - the ksu_susfs C tool
- * pre-seeds err with it and treats "still 126 after the syscall" as "the kernel
- * never handled this command" (ksu_susfs/jni/features/sus_map.c:51-53,
- * ksu_susfs/jni/includes/susfs_defs.h:16-18).
- *
- * So an unknown command must NOT be hijacked: leave the regs alone, let
- * reboot(2) return -EINVAL, leave err untouched.  Every command listed here
- * still short-circuits to 0 exactly as before, which is what the already
- * verified command paths depend on. */
+ * The kprobe consults this BEFORE swallowing the syscall: upstream answers an unrecognised
+ * command with `return -EINVAL` from ksu_handle_sys_reboot()
+ * (KernelSU/10_enable_susfs_for_ksu.patch:2925-2926), and reboot.c's `if (ret) goto
+ * orig_flow;` falls through to the real reboot path, whose magic check rejects
+ * 0xDEADBEEF/0xFAFAFAFA with -EINVAL.  Upstream writes NOTHING to payload.err then, and 126
+ * (ERR_CMD_NOT_SUPPORTED) is a USERSPACE sentinel the ksu_susfs C tool pre-seeds and reads
+ * back as "the kernel never handled this command" (ksu_susfs/jni/features/sus_map.c:51-53,
+ * ksu_susfs/jni/includes/susfs_defs.h:16-18).  So an unknown command must NOT be hijacked:
+ * leave the regs and err alone, while every command listed here still short-circuits to 0. */
 static bool susfs_cmd_handled(unsigned int cmd)
 {
 	switch (cmd) {
@@ -267,10 +227,8 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 	void __user *payload;
 	struct susfs_tw *tw;
 
-	/* A prober runs before the callee, so an argument the callee would have
-	 * checked is still raw here - see the filename_lookup lesson in
-	 * sus_path.c.  The syscall ABI does guarantee this one, but a NULL check
-	 * costs nothing and this is the path that accepts commands. */
+	/* A prober runs before the callee, so an argument the callee would have checked is
+	 * still raw here (see the filename_lookup lesson in sus_path.c). */
 	if (!real_regs)
 		return 0;
 
@@ -286,10 +244,8 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (current_uid().val != 0)
 		return 0;
 
-	/* Not ours to answer: leave the syscall alone so reboot(2) reports the
-	 * -EINVAL upstream reports, and payload.err keeps whatever the caller put
-	 * there (that is how the C tool detects "command not supported").  See
-	 * susfs_cmd_handled(). */
+	/* Not ours to answer: leave the syscall alone so reboot(2) reports the -EINVAL
+	 * upstream reports and payload.err keeps the caller's value. */
 	if (!susfs_cmd_handled(cmd)) {
 		SUSFS_LOGI("susfs supercall: unsupported cmd 0x%x\n", cmd);
 		return 0;
@@ -308,18 +264,14 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	}
 
-	/* Upstream SUSFS patches kernel/reboot.c so that a handled supercall does
-	 * `return ret` (0) instead of falling through to the real reboot path:
-	 *
-	 *     ret = ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+	/* Upstream's reboot.c patch makes a handled supercall return 0 instead of falling
+	 * through to the real reboot path:
 	 *     if (ret) goto orig_flow;
-	 *     return ret;            <- syscall returns 0 on success
-	 *
+	 *     return ret;
 	 * We cannot patch reboot.c, so mirror it from the kprobe: skip the rest of
-	 * __arm64_sys_reboot and return 0.  Callers (the prebuilt ksu_susfs tool)
-	 * check the syscall result, and with the magic values being invalid
-	 * otherwise reboot would return -EINVAL.  The command itself still runs
-	 * from task_work before we return to userspace. */
+	 * __arm64_sys_reboot and return 0 - with these magic values reboot would otherwise
+	 * return -EINVAL, and the prebuilt ksu_susfs tool checks the syscall result.  The
+	 * command itself still runs from task_work before we return to userspace. */
 	regs->pc = regs->regs[30];
 	regs->regs[0] = 0;
 	return 1;
@@ -333,19 +285,12 @@ static struct kprobe reboot_kp = {
 static bool sc_registered;
 
 /* ---- ABI layout assertions ----
- *
- * The sizes and `err` offsets below ARE the userspace contract: ksu_susfs, ksud
- * and tools/susfs_sc are compiled against these exact numbers, and a drift shows
- * up as "the command returned 0 and userspace printed garbage" rather than as a
- * build error.  The repository's own layout harness (abi_layout_check/) is not
- * wired into any build step, so the cheap insurance is here: a compile-time trip
- * wire for every struct that crosses the boundary.
- *
- * Values are aarch64 LP64, the only ABI any shipped client uses (upstream's
- * structs have the same shapes: kernel_patches/include/linux/susfs.h).  If a
- * struct is ever deliberately changed, this is the function that has to be
- * updated together with the clients - which is exactly the reminder it exists
- * to be. */
+ * These sizes and `err` offsets ARE the userspace contract (ksu_susfs, ksud and
+ * tools/susfs_sc compile against these numbers); a drift shows up as "the command returned
+ * 0 and userspace printed garbage", not as a build error, and the repository's own
+ * abi_layout_check/ harness is not wired into any build step - hence the trip wire here.
+ * Values are aarch64 LP64, the only ABI shipped clients use, and match upstream's structs
+ * (kernel_patches/include/linux/susfs.h). */
 static void __init susfs_abi_layout_check(void)
 {
 	BUILD_BUG_ON(sizeof(struct st_susfs_sus_path) != 260);

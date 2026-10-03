@@ -5,23 +5,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  # One .ko per GKI (kernel version × Android release) combination that exists.
-  #
-  # A module is NOT portable across these: vermagic/KMI differ, and so do the LSM hook
-  # prototypes this module hooks by offset.  Every combination the DDK publishes gets its
-  # own build and its own artifact, so a device always has a file that matches it.
-  #
-  #   5.10 → android12-5.10, android13-5.10
-  #   5.15 → android13-5.15, android14-5.15
-  #   6.1  → android14-6.1                      (kCFI starts here)
-  #   6.6  → android15-6.6
-  #   6.12 → android16-6.12                     (LSM dispatch becomes static calls)
-  #   6.18 → android17-6.18                     (same static-call machine as 6.12)
-  #
-  # There is no android14-6.6: Android 14 is 5.15/6.1, Android 15 is 6.6
-  # (https://source.android.com/docs/core/architecture/kernel/android-common), and no
-  # DDK image exists for that pairing either.  The image tag is pinned to a date on
-  # purpose: the same commit rebuilt later must produce the same module.
+  # One .ko per GKI (kernel version × Android release) combination that exists: a module is NOT portable across these
+  # (vermagic/KMI differ, and so do the LSM hook prototypes this module hooks by offset), so every combination the DDK
+  # publishes gets its own build and its own artifact.
+  #   5.10 → android12-5.10, android13-5.10   6.1  → android14-6.1 (kCFI starts here)   6.12 → android16-6.12 (static calls)
+  #   5.15 → android13-5.15, android14-5.15   6.6  → android15-6.6                    6.18 → android17-6.18 (same as 6.12)
+  # There is no android14-6.6: Android 14 is 5.15/6.1 and Android 15 is 6.6.  The image tag is pinned to a date on
+  # purpose, so the same commit rebuilt later produces the same module.
   module:
     runs-on: ubuntu-latest
     strategy:
@@ -34,22 +24,13 @@ jobs:
           - android14-5.15
           - android14-6.1
           - android15-6.6
-          # 6.12 (Android 16) is where LSM dispatch became per-hook static calls
-          # (static_calls_table) and security_hook_list lost its hlist node, so the
-          # < 6.12 head-insertion path cannot work there.  It is in the matrix so that
-          # the >= 6.12 code path is compiled at all - it had never been built before.
-          # Kept non-blocking while the rest of the 6.12 port lands (see the
-          # "experimental" flag below); nothing is published for it either way.
+          # 6.12 (Android 16) is where LSM dispatch became per-hook static calls (static_calls_table) and
+          # security_hook_list lost its hlist node, so the < 6.12 head-insertion path cannot work there.  In the matrix
+          # so the >= 6.12 code path is compiled at all; non-blocking (see "experimental") and never published.
           - android16-6.12
-          # 6.18 (Android 17) has the SAME static-call machinery as 6.12 -
-          # struct lsm_static_call / lsm_static_calls_table / security_hook_list and the
-          # lsm_static_call_init() dispatch are field-for-field identical, and so are the
-          # 13 hook prototypes this module installs - so one `>= 6.12` implementation
-          # serves both.  It is a separate entry rather than 6.12's build being reused
-          # because the two DDK trees are still different trees: any drift that does
-          # exist (a header, a symbol, the generated config) has to show up as its own
-          # job.  Same treatment as android16-6.12: non-blocking until it has been on
-          # hardware, and its artifact is not published either way.
+          # 6.18 (Android 17) has the SAME static-call machinery as 6.12 (struct lsm_static_call /
+          # lsm_static_calls_table / security_hook_list and the 13 hook prototypes are field-for-field identical), so one
+          # `>= 6.12` implementation serves both; a separate entry only because the two DDK trees can drift.  Non-blocking.
           - android17-6.18
         include:
           - variant: android16-6.12
@@ -58,9 +39,8 @@ jobs:
             experimental: true
     continue-on-error: ${{ matrix.experimental == true }}
     container:
-      # DDK-min image with the GKI kernel headers (modules_prepare done), Module.symvers
-      # and the matching Clang toolchain.  KMI freezing guarantees symbol CRCs match the
-      # GKI kernel of that release.
+      # DDK-min image with the GKI kernel headers (modules_prepare done), Module.symvers and the matching Clang toolchain:
+      # KMI freezing guarantees symbol CRCs match the GKI kernel of that release.
       image: ghcr.io/ylarod/ddk-min:${{ matrix.variant }}-20260828
       options: --privileged
 
@@ -73,14 +53,9 @@ jobs:
           echo "KERNEL_SRC=$KERNEL_SRC"
           echo "CLANG_PATH=$CLANG_PATH"
           clang --version | head -1
-          # The build below runs `make -C "$KDIR"`; an image that ships no build tree at
-          # that path must say so here rather than fail inside make.  What KDIR has to be
-          # is the OBJTREE (a prepared output tree with its Makefile and generated
-          # headers) - the sources live in a separate tree on these images, e.g.
-          # KDIR=/opt/ddk/kdir/<variant> against KERNEL_SRC... which is where
-          # include/linux/lsm_hooks.h actually is.  Checking for the header HERE was the
-          # first version of this guard and it failed all eight variants at once; the
-          # Makefile is the precondition `make -C` itself needs.
+          # `make -C "$KDIR"` below needs the OBJTREE (a prepared output tree with its Makefile and generated headers); the
+          # sources live in a separate tree (KERNEL_SRC, where include/linux/lsm_hooks.h actually is).  Checking for the
+          # header HERE was the first version of this guard and it failed all eight variants at once.
           if [ -z "$KDIR" ] || [ ! -f "$KDIR/Makefile" ]; then
             echo "::error::KDIR ('$KDIR') is not a prepared kernel build tree (no Makefile) for variant ${{ matrix.variant }}"
             exit 1
@@ -95,11 +70,9 @@ jobs:
       - name: Checkout module
         uses: actions/checkout@v4
 
-      # kCFI/CFI checks the callee's type at every indirect call site, and the LSM
-      # dispatch calls our replacements indirectly - so a replacement MUST match the hook
-      # type EXACTLY (and must not be __nocfi).  Print the authoritative declarations of
-      # this tree instead of assuming they match the 5.15 ones: this step is how a hook
-      # that changed or disappeared between releases is caught, per variant.
+      # kCFI/CFI checks the callee's type at every indirect call site and the LSM dispatch calls our replacements
+      # indirectly, so a replacement MUST match the hook type EXACTLY and must not be __nocfi.  Printing this tree's
+      # authoritative declarations is how a hook that changed or disappeared between releases is caught, per variant.
       - name: Show authoritative LSM hook signatures
         run: |
           set -e
@@ -117,9 +90,8 @@ jobs:
           [ -f "$DEFS" ] || DEFS="$H/include/linux/lsm_hooks.h"
           echo "=== hook declarations: $DEFS ==="
 
-          # Exactly the hooks this module installs (kernel/sus_path.c).  A missing one is
-          # a hard error: the module would not compile against this tree, and a silently
-          # dropped hook would read as coverage in the counters.
+          # Exactly the hooks this module installs (kernel/sus_path.c).  A missing one is a hard error: the module would
+          # not compile against this tree, and a silently dropped hook would read as coverage in the counters.
           HOOKS="inode_permission inode_getattr inode_unlink inode_rmdir inode_rename \
                  inode_link sb_statfs inode_setattr inode_getxattr inode_listxattr \
                  inode_setxattr inode_removexattr path_notify"
@@ -157,9 +129,8 @@ jobs:
           done
           echo "=== kernel tree: $T ==="
           echo "--- the version this build's LINUX_VERSION_CODE gates are evaluated against ---"
-          # The kdir (objtree) is where a prepared tree keeps its generated headers; the
-          # src tree may not have them.  version.h is what LINUX_VERSION_CODE expands
-          # from, utsrelease.h is the human-readable release.
+          # The kdir (objtree) holds the generated headers the src tree may lack: version.h is what LINUX_VERSION_CODE
+          # expands from, utsrelease.h is the human-readable release.
           G="${KDIR:-$T}/include/generated"
           cat "$G/uapi/linux/version.h" 2>/dev/null || true
           cat "$G/utsrelease.h" 2>/dev/null || cat "$T/include/generated/utsrelease.h" 2>/dev/null || true
@@ -176,12 +147,9 @@ jobs:
           grep -nE 'void \*kvmalloc\(|void kvfree\(' "$T/include/linux/mm.h" "$T/include/linux/slab.h" || true
 
           echo "--- CFI scheme, RANDSTRUCT and the LSM set as THIS tree was configured ---"
-          # Read from the tree's own generated config, not assumed: the >= 6.12 LSM
-          # takeover depends on all of these.  6.12 spells kCFI CONFIG_CFI_CLANG and
-          # 6.18 spells the same option CONFIG_CFI (renamed upstream), __randomize_layout
-          # is only a no-op while RANDSTRUCT is off, and MAX_LSM_COUNT follows from the
-          # SECURITY_* set.  A missing entry prints "(absent here)" rather than nothing,
-          # so "the gate did not apply" is visible instead of implied.
+          # Read from the tree's own generated config, not assumed: 6.12 spells kCFI CONFIG_CFI_CLANG and 6.18 spells the
+          # same option CONFIG_CFI, __randomize_layout is only a no-op while RANDSTRUCT is off, and MAX_LSM_COUNT follows
+          # from the SECURITY_* set.  A missing entry prints "(absent here)", so a gate that did not apply stays visible.
           A="$G/autoconf.h"
           cfg() {
             _v=""
@@ -205,17 +173,9 @@ jobs:
       - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
           set -e
-          # One line on purpose: trailing backslashes followed by a blank line ended the
-          # shell continuation, so this used to run `make -C $KDIR M=.../kernel` with no
-          # ARCH/CC/LLVM and no `modules` target (the flags line became a no-op assignment
-          # and `modules` was "command not found", masked by the pipe into tail).  It only
-          # worked because the image exports ARCH/LLVM - i.e. the build silently depended
-          # on the image.
-          #
-          # -k (keep going) because one broken object used to hide every later one: with
-          # plain `make`, the first failure in a parallel wave ends the build, so a variant
-          # reported its errors one CI round at a time.  -k still exits nonzero when
-          # anything failed - it only changes how much of the failure is reported.
+          # One line on purpose: trailing backslashes followed by a blank line ended the shell continuation, so this used to
+          # run `make -C $KDIR M=.../kernel` with no ARCH/CC/LLVM and no `modules` target, silently depending on the image's
+          # exported ARCH/LLVM.  -k (keep going) so one broken object does not hide every later one; it still exits nonzero.
           make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
           ls -la kernel/susfs_guard_lkm.ko
           file kernel/susfs_guard_lkm.ko
@@ -228,21 +188,17 @@ jobs:
           echo "--- vermagic ---"
           modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
           echo "--- CFI scheme of this tree ---"
-          # 5.10/5.15 use LLVM CFI (__cfi_check + shadow + .cfi_jt jump tables); 6.1/6.6
-          # use kCFI (a type hash right before the function, checked inline by the caller).
-          # The module's symbol resolution differs between the two, so record which one
-          # this artifact was built against.
+          # 5.10/5.15 use LLVM CFI (__cfi_check + shadow + .cfi_jt); 6.1/6.6 use kCFI (a type hash right before the
+          # function, checked inline by the caller).  The module's symbol resolution differs between the two, so record which.
           grep -cE '\.cfi_jt$' /proc/kallsyms 2>/dev/null | sed 's/^/  .cfi_jt symbols in the build container: /' || true
           echo "--- mount-hook symbols this module probes by name ---"
           for s in show_vfsstat show_mountinfo show_vfsmnt; do
             printf '  %-16s %s\n' "$s" "$(grep -cE " $s\$" /proc/kallsyms 2>/dev/null || echo '?')"
           done
           echo "--- KMI version-check state ---"
-          # modpost emits CRCs (and srcversion, and a module_layout dependency) only when
-          # Module.symvers carries them.  This DDK tree's __versions is empty, so the
-          # kernel's check_version() finds no entry for ANY imported symbol and load-time
-          # symbol version checking does not happen - i.e. "it loads" is not evidence that
-          # the KMI matches.  Fail loudly here rather than let that pass as a green build.
+          # modpost emits CRCs (and srcversion, module_layout) only when Module.symvers carries them, and this DDK tree's
+          # __versions is empty - so check_version() finds no entry for ANY imported symbol and load-time version checking
+          # does not happen: "it loads" is not evidence that the KMI matches.  Warns rather than fails for exactly that reason.
           vs=$(readelf -SW "$f" | awk '/\] __versions/ {print $6}')
           sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=' || true)
           ml=$(nm -u "$f" | grep -c 'module_layout' || true)
@@ -252,29 +208,19 @@ jobs:
           fi
 
           echo "--- symbol namespace imports ---"
-          # kern_path / ihold / override_creds / revert_creds are EXPORT_SYMBOL_NS(..,
-          # ANDROID_GKI_VFS_EXPORT_ONLY), which each tree's Makefile rewrites to the long
-          # namespace string before the compiler stringifies it.  A module that does not
-          # import the RESULTING string is refused by the kernel's loader with
-          #   "module uses symbol (kern_path) from namespace VFS_internal_... but does not
-          #    import it" -> "Unknown symbol kern_path (err -22)"
-          # so the import must actually be present in this artifact.  It is a build-system
-          # fact that is invisible in the source, which is why it is asserted here rather
-          # than trusted: an imported-but-unused namespace is harmless, a missing one is
-          # load-fatal.
+          # kern_path / ihold / override_creds / revert_creds are EXPORT_SYMBOL_NS(.., ANDROID_GKI_VFS_EXPORT_ONLY), which
+          # each tree's Makefile rewrites to the long namespace string; a module that does not import the RESULTING string is
+          # refused by the loader ("Unknown symbol kern_path (err -22)"), i.e. a missing import_ns is load-fatal while an
+          # imported-but-unused namespace is harmless - asserted on the artifact because it is invisible in the source.
           readelf -p .modinfo "$f" 2>/dev/null | grep 'import_ns' || {
             echo "::error::no import_ns entry in $f - kern_path/ihold/override_creds/revert_creds will be refused with -EINVAL on the variants that namespace them (see MODULE_IMPORT_NS in kernel/susfs_main.c)"
             exit 1
           }
 
           echo "--- no kallsyms_* link-time dependency (regression gate) ---"
-          # These five are resolved at RUNTIME by name (kprobe bootstrap, see
-          # kernel/symbol_resolver.c) and must never appear in this artifact's undefined
-          # list.  Measured reason: on a 6.1 device whose KernelSU is a module, all five are
-          # provided by kernelsu.ko, so an import makes this module refuse to load on a
-          # device without KernelSU - the exact opposite of why it ships its own loader
-          # (tools/susfs_insmod.c).  Asserted on the ARTIFACT rather than trusted from the
-          # source, because that is where a regressed import would actually appear.
+          # These five are resolved at RUNTIME by name (kprobe bootstrap, kernel/symbol_resolver.c) and must never appear in
+          # the artifact's undefined list: measured on a 6.1 device whose KernelSU is a module, all five are provided by
+          # kernelsu.ko, so an import would make this module refuse to load without KernelSU.  Asserted on the ARTIFACT.
           nm -u "$f" | wc -l | sed 's/^/  undefined symbols total: /'
           ks=$(nm -u "$f" | grep -cE '(^| )(kallsyms_lookup_name|kallsyms_lookup|kallsyms_lookup_size_offset|kallsyms_on_each_symbol|kallsyms_on_each_match_symbol)$' || true)
           echo "  undefined kallsyms-ish symbols: $ks (must be 0)"
