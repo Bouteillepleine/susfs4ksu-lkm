@@ -1,48 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * susfs_open_redirect.c - redirect open of a target path to another path (SUSFS
- * OPEN_REDIRECT feature), LKM port.
- *
- * Upstream hooks path_openat() and swaps the filename once the target inode is resolved.
- * path_openat / do_sys_openat2 / do_filp_open are all LTO-inlined into the syscall entry, so none
- * of them can be kprobed; a layer-by-layer probe showed the only out-of-line symbol on the
- * user-open path is vfs_open(path, file) (123/123 hits for `cat`), so we hook that.  vfs_open is
- * the inode layer: path->dentry->d_inode is already resolved, so rules match by (target_ino,
- * target_dev) exactly like upstream.
- *
- * Handlers run in interrupt context (preempt disabled) and must not sleep, so both paths are
- * resolved at RULE-ADD time (proc write or supercall, process context) with kern_path() and
- * cached in the entry - the redirected one for the forward direction, the target one for the
- * reverse.  A handler only matches (ino, dev) and swaps the path pointer.  No kretprobe needed:
- * the cached references pin the files for the entry's lifetime (like upstream's re-walk).
- *
- * uid_scheme - enum UID_SCHEME (upstream susfs.h:28-34), all five values with upstream's
- * predicates (susfs.c:941-964); two of the five need state an LKM cannot read here - see
- * or_uid_matches() and or_in_su_domain().
- *
- * Reverse disguise: upstream registers TWO hash entries per rule (susfs.c:844-863), the second
- * with reversed_lookup_only = true and the two pathnames swapped, and every "where did this file
- * come from" reporter answers from it:
- *   vfs_readlink()     patch:510-548    readlink() of a flagged inode
- *   do_proc_readlink() patch:1062-1083  /proc/<pid>/fd/N, exe, cwd, root
- *   fdinfo seq_show()  patch:1145-1217  /proc/<pid>/fdinfo/N mnt_id + ino
- *   show_map_vma()     patch:1257-1288  /proc/<pid>/maps dev:ino + name
- *   vfs_statfs()       patch:2038-2056  statfs() / fstatfs()
- * All are gated upstream on SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = the inode flag
- * *and* susfs_is_current_proc_umounted_app(), never on the rule's uid_scheme - so even a scheme-0
- * rule is disguised for app processes (or_reverse_visible() keeps that gate with uid >= 10000).
- *
- * None of those five is reachable from an LKM on this kernel: the first two and seq_show() are
- * static, and the maps/fdinfo numbers are printed from locals a kprobe cannot see.  Reachable are
- * helpers they share - point the caller at the *target's* path (d_path(), vfs_statfs()) - plus,
- * where no shared helper exists, a rewrite of the line the function has already formatted, from a
- * kretprobe on its return: show_map_vma()'s line carries "maj:min ino" AND the name, both taken
- * from the redirected file, and the name is not reachable by pointing a primitive at the target
- * (seq_file_path() -> seq_path() -> __d_path(), and __d_path is LTO-inlined here: a probe on it
- * registers and never fires - measured).  All are best effort and never silent: registration
- * outcome and hit counts are logged and shown by /proc/susfs_open_redirect, because registering
- * successfully only proves the symbol exists - this feature alone has hit that wall twice
- * (show_vma_header_prefix, then __d_path: both registered, both stayed at 0).
+ * susfs_open_redirect.c - redirect open of a target path to another path (SUSFS OPEN_REDIRECT feature), LKM port.
+ * Hook: path_openat / do_sys_openat2 / do_filp_open are LTO-inlined into the syscall entry, so none can be kprobed; the
+ * only out-of-line symbol on the user-open path is vfs_open(path, file) (measured: 123/123 hits for `cat`).  vfs_open is
+ * the inode layer - d_inode is resolved - so rules match by (target_ino, target_dev) exactly like upstream.
+ * Interrupt context: handlers must not sleep, so both paths are kern_path()'d at RULE-ADD time (proc write or
+ * supercall, process context) and cached in the entry; a handler only matches (ino, dev) and swaps the pointer.  No
+ * kretprobe needed - the cached references pin the files for the entry's lifetime, as upstream's re-walk does.
+ * uid_scheme: enum UID_SCHEME (susfs.h:28-34), all five values with upstream's predicates (susfs.c:941-964); two of
+ * the five need state an LKM cannot read - see or_uid_matches() / or_in_su_domain().
+ * Reverse disguise: upstream registers TWO hash entries per rule (susfs.c:844-863), the second with
+ * reversed_lookup_only = true and the two pathnames swapped, and every "where did this file come from" reporter answers
+ * from it - vfs_readlink() patch:510-548, do_proc_readlink() (/proc/<pid>/fd/N, exe, cwd, root) patch:1062-1083, fdinfo
+ * seq_show() (mnt_id + ino) patch:1145-1217, show_map_vma() (maps dev:ino + name) patch:1257-1288, vfs_statfs()
+ * (statfs/fstatfs) patch:2038-2056.  Gate: SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = inode flag *and*
+ * susfs_is_current_proc_umounted_app(), never the rule's uid_scheme - so even a scheme-0 rule is disguised for app
+ * processes (or_reverse_visible() keeps that gate with uid >= 10000).
+ * Reachability: none of those five is reachable from an LKM here (the first two and seq_show() are static; the
+ * maps/fdinfo numbers are locals a kprobe cannot see).  Covered instead: point the caller at the *target's* path
+ * (d_path(), vfs_statfs()), and where no shared helper exists rewrite the line the function already formatted, from a
+ * kretprobe on its return - show_map_vma()'s line carries "maj:min ino" AND the name, both from the redirected file,
+ * and the name cannot be reached that way (seq_file_path() -> seq_path() -> __d_path() is LTO-inlined: a probe on it
+ * registers and never fires - measured).
+ * Never silent: registration outcome and hit counts are logged and shown by /proc/susfs_open_redirect, because
+ * registering only proves the symbol exists - this feature has hit that wall twice (show_vma_header_prefix, then
+ * __d_path: both registered, both stayed at 0).
  *
  * /proc/susfs_open_redirect: add_open_redirect <target> <redirected> <uid_scheme> | del <target> | clear
  */
@@ -67,33 +49,28 @@
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
 
 #define SUS_OR_MAX 64
-/* The ABI fields are char[256]; matching them stops a legal long path from being truncated
- * into a rule for a different path. */
+/* The ABI fields are char[256]; matching that width stops a legal long path from being truncated into a rule for a
+ * different path. */
 #define OR_PATH_MAX 256
 
-/* UID_SCHEME lives in susfs_abi.h, mirroring upstream susfs.h where the enum sits next to the
- * ABI structs. */
+/* UID_SCHEME lives in susfs_abi.h, mirroring upstream susfs.h, where the enum sits next to the ABI structs. */
 
-/* FUSE is the one filesystem upstream refuses outright (susfs.c:824-829): the daemon resolves the
- * name itself, so a kernel-side swap either does nothing or makes the request happen twice.
- * Upstream carries the constant in susfs_def.h:49-51 for the same reason we do - neither
- * <linux/magic.h> (absent from this tree) nor <uapi/linux/magic.h> defines it; the fs defines it
- * privately in fs/fuse/fuse_i.h. */
+/* FUSE is the one filesystem upstream refuses outright (susfs.c:824-829): the daemon resolves the name itself, so a
+ * kernel-side swap does nothing or makes the request happen twice.  susfs_def.h:49-51 carries the constant for the same
+ * reason: neither <linux/magic.h> (absent from this tree) nor <uapi/linux/magic.h> defines it; fs/fuse/fuse_i.h does. */
 #ifndef FUSE_SUPER_MAGIC
 #define FUSE_SUPER_MAGIC 0x65735546
 #endif
 
-/* Upstream's app threshold: susfs_is_current_proc_umounted_app() is
- * (TIF_PROC_UMOUNTED && current_uid().val >= 10000) (susfs_def.h:122-125), and the uid half is
- * the part this kernel can answer. */
+/* Upstream's app threshold: susfs_is_current_proc_umounted_app() is (TIF_PROC_UMOUNTED && current_uid().val >= 10000)
+ * (susfs_def.h:122-125); the uid half is the part this kernel can answer. */
 #define OR_APP_UID_MIN 10000
 
-/* SELinux context of the su/ksu domain, resolved to a sid at init.  Upstream gets the sid from
- * KernelSU itself (susfs_set_sid(KERNEL_SU_CONTEXT, &susfs_ksu_sid), 10_enable_susfs_for_ksu.patch:
- * 2496); an LKM has to resolve the string.  "u:r:ksu:s0" is the SukiSU variant this device runs
- * (KERNEL_SU_DOMAIN "ksu"); stock KernelSU uses "u:r:su:s0" - override with susfs_guard_lkm.or_su_ctx.
- * Deliberately separate from sus_mount's su_ctx / avc_spoof's avc_su_ctx: module parameters are per
- * name, and defaulting to the wrong domain must not silently change another feature's gating. */
+/* SELinux context of the su/ksu domain, resolved to a sid at init.  Upstream gets the sid from KernelSU itself
+ * (susfs_set_sid(KERNEL_SU_CONTEXT, &susfs_ksu_sid), 10_enable_susfs_for_ksu.patch:2496); an LKM has to resolve the
+ * string.  "u:r:ksu:s0" is the SukiSU variant this device runs (KERNEL_SU_DOMAIN "ksu"), stock KernelSU uses
+ * "u:r:su:s0" - override with susfs_guard_lkm.or_su_ctx.  Kept separate from sus_mount's su_ctx and avc_spoof's
+ * avc_su_ctx: parameters are per name, and defaulting to the wrong domain must not change other features' gating. */
 static char or_su_ctx[128] = "u:r:ksu:s0";
 module_param_string(or_su_ctx, or_su_ctx, sizeof(or_su_ctx), 0644);
 
@@ -109,14 +86,12 @@ struct sus_or_entry {
 	char redirected_pathname[OR_PATH_MAX];
 	unsigned long target_ino;
 	dev_t target_dev;
-	/* Reverse direction: the redirected inode is the lookup key, and target_path is what the
-	 * reporters above are made to show instead. */
+	/* Reverse direction: the redirected inode is the lookup key, and target_path is what the reporters above show instead. */
 	unsigned long redirected_ino;
 	dev_t redirected_dev;
-	/* Reverse direction, second number: fdinfo also prints mnt_id, and for the redirected file that
-	 * is the mount the redirection really opened - which can differ from the target's (e.g.
-	 * /system/etc/hosts vs /data/local/tmp/hosts).  Cached at add time: the reporter has only
-	 * numbers to work with. */
+	/* Reverse direction, second number: fdinfo also prints mnt_id, and for the redirected file that is the mount the
+	 * redirection really opened - which can differ from the target's (e.g. /system/etc/hosts vs
+	 * /data/local/tmp/hosts).  Cached at add time: the reporter has only numbers to work with. */
 	unsigned long target_mnt_id;
 	/* Cached at add time, base references held for the entry's lifetime. */
 	struct path target_path;
@@ -131,22 +106,18 @@ static struct sus_or_entry or_entries[SUS_OR_MAX];
 static int nor;
 static DEFINE_MUTEX(or_lock);
 
-/* Reverse-disguise bookkeeping.  The counters are the only way to tell a hook that never fires
- * from one that fires and matches nothing: a kprobe registers against a symbol's out-of-line copy,
- * which GKI's full LTO may leave with no live call sites (AUDIT_FINDINGS.md: five probes
- * registered, zero hits). */
+/* Reverse-disguise bookkeeping.  The counters are the only way to tell a hook that never fires from one that fires and
+ * matches nothing: a kprobe registers against a symbol's out-of-line copy, which GKI's full LTO may leave with no live
+ * call sites (AUDIT_FINDINGS.md: five probes registered, zero hits). */
 static atomic_t or_rev_dpath_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_statfs_hits = ATOMIC_INIT(0);
 
-/* Cached paths are per-entry and released once, at unload.
- *
- * The handlers run in interrupt context with no lock and hand &e->redirected_path (or
- * &e->target_path) straight to vfs_open()/d_path()/vfs_statfs(), which read or path_get() it, so
- * freeing an old path on replace/delete raced a concurrent open into a use-after-free (upstream
- * avoids this with SRCU plus a re-walk, so it never holds a cached path at all).  There used to be
- * a side list of "retired" paths for that, but it duplicated the struct path - one reference, two
- * owners - so unload released it twice and the device died on rmmod.  A deleted rule simply keeps
- * its paths now: dead entries are never reused, stay out of every lookup, and are released by exit. */
+/* Cached paths are per-entry, released once at unload (file-level note on the rule array).  The handlers run in interrupt
+ * context with no lock and hand &e->redirected_path / &e->target_path straight to vfs_open()/d_path()/vfs_statfs(), which
+ * read or path_get() it, so freeing an old path on replace/delete raced a concurrent open into a use-after-free (upstream
+ * avoids that with SRCU plus a re-walk).  A "retired paths" side list was tried and removed: it duplicated the struct
+ * path - one reference, two owners - so unload released it twice and the device died on rmmod.  A deleted rule keeps its
+ * paths: dead entries are never reused, stay out of every lookup, and exit releases them. */
 static void or_resolve_su_sid(void)
 {
 	int err;
@@ -166,16 +137,14 @@ static void or_resolve_su_sid(void)
 		or_su_ctx, or_su_sid);
 }
 
-/* Upstream susfs_is_current_ksu_domain() = (current_sid() == susfs_ksu_sid)
- * (10_enable_susfs_for_ksu.patch:2484-2486); current_sid() lives in SELinux's private objsec.h, so
- * the LSM-agnostic security_cred_getsecid() is used instead - same sid, public interface. */
+/* Upstream susfs_is_current_ksu_domain() = (current_sid() == susfs_ksu_sid) (10_enable_susfs_for_ksu.patch:2484-2486);
+ * current_sid() lives in SELinux's private objsec.h, so the LSM-agnostic security_cred_getsecid() is used instead. */
 static __nocfi bool or_in_su_domain(void)
 {
 	u32 sid = 0;
 
-	/* Unresolved symbol or unresolvable context: "not su" would be a guess, and for schemes 1/2
-	 * that guess redirects the very process the rule exists to spare.  or_add() refuses those
-	 * schemes instead. */
+	/* Unresolved symbol or unresolvable context: "not su" would be a guess, and for schemes 1/2 that guess redirects
+	 * the very process the rule exists to spare.  or_add() refuses those schemes instead. */
 	if (!or_cred_getsecid || !or_su_sid)
 		return false;
 	/* interrupt context: reading current->cred and walking the (static) LSM hook list never sleeps. */
@@ -183,18 +152,15 @@ static __nocfi bool or_in_su_domain(void)
 	return sid == or_su_sid;
 }
 
-/* Upstream's reverse-disguise gate, verbatim in shape: SUSFS_IS_INODE_OPEN_REDIRECT
- * (susfs_def.h:148-151) = flag bit AND susfs_is_current_proc_umounted_app().  TIF_PROC_UMOUNTED is
- * never set on this kernel (no SUSFS integration in it, and nothing calls ksu_handle_setresuid -
- * AUDIT_FINDINGS.md, "设备环境事实"), so uid >= 10000 is the proxy, as in sus_path.c and
- * susfs_kstat_gate_ok(). */
+/* Upstream's reverse-disguise gate, verbatim in shape: SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = flag bit AND
+ * susfs_is_current_proc_umounted_app().  TIF_PROC_UMOUNTED is never set on this kernel (no SUSFS integration in it, and
+ * nothing calls ksu_handle_setresuid - AUDIT_FINDINGS.md), so uid >= 10000 is the proxy, as in sus_path / sus_kstat. */
 static bool or_reverse_visible(void)
 {
 	return current_uid().val >= OR_APP_UID_MIN;
 }
 
-/* uid_scheme decision, mirroring upstream's switch in susfs_open_redirect_spoof_do_sys_openat()
- * (susfs.c:941-964) case for case. */
+/* uid_scheme decision, mirroring upstream's switch in susfs_open_redirect_spoof_do_sys_openat() (susfs.c:941-964). */
 static bool or_uid_matches(int scheme)
 {
 	switch (scheme) {
@@ -206,10 +172,9 @@ static bool or_uid_matches(int scheme)
 		return !or_in_su_domain();
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
 	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
-		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant]
-		 * (susfs_def.h:98-125).  This kernel never sets that flag, so uid >= 10000 stands in for
-		 * it, which makes schemes 3 and 4 degenerate into the same predicate here - a strictly
-		 * narrower gate than scheme 2, and the same substitute sus_path / sus_kstat use. */
+		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant] (susfs_def.h:98-125).  This
+		 * kernel never sets that flag, so uid >= 10000 stands in - schemes 3 and 4 degenerate into the same predicate
+		 * here, a strictly narrower gate than scheme 2, and the substitute sus_path / sus_kstat also use. */
 		return current_uid().val >= OR_APP_UID_MIN;
 	default:				/* susfs.c:962-963 */
 		return false;
@@ -262,11 +227,9 @@ static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t
 	return NULL;
 }
 
-/* Reverse direction for the one caller that has only numbers: /proc/<pid>/fdinfo/N prints
- * "mnt_id:\t<i>" and "ino:\t<j>" for the file an fd points at and no device, so this lookup is by
- * ino alone; when two rules share that ino it refuses to answer - a missed disguise is better than
- * disguising an unrelated file.  On success it hands back the target's ino and the target's mount
- * id (0 when unknown). */
+/* Reverse direction for the one caller that has only numbers: /proc/<pid>/fdinfo/N prints "mnt_id:\t<i>" and "ino:\t<j>"
+ * for the file an fd points at and no device, so this lookup is by ino alone; two rules sharing that ino refuses to
+ * answer (a missed disguise beats disguising an unrelated file).  On success: the target's ino and mount id (0 unknown). */
 bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 				   unsigned long *out_mnt_id)
 {
@@ -293,9 +256,8 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 	return true;
 }
 
-/* Is `target` another rule's redirected path?  Upstream refuses to touch such a name (susfs.c:
- * 867-881): that name belongs to the reverse entry of an existing rule, and replacing it would
- * silently break that rule's disguise. */
+/* Is `target` another rule's redirected path?  Upstream refuses to touch such a name (susfs.c:867-881): that name
+ * belongs to the reverse entry of an existing rule, and replacing it would silently break that rule's disguise. */
 static bool or_is_redirected_path(const char *target)
 {
 	int i;
@@ -310,14 +272,11 @@ static bool or_is_redirected_path(const char *target)
 }
 
 /* ---- forward: vfs_open(path, file) - swap the path on match ----
- * Runs in interrupt context: no sleeping, no kern_path here.
- *
- * Upstream leaves the lookup loop entirely when the inode matches but the scheme does not (goto
- * out_srcu_read_unlock, susfs.c:945/949/953/957/961), so a non-matching entry with the same inode
- * suppresses the remaining same-inode entries as well; here the first live (ino, dev) match is the
- * only candidate anyway - the same outcome for distinct inodes, while two rules sharing one inode
- * (hard links) differ only in which entry wins (upstream: newest hash_add_rcu first, here: slot
- * order). */
+ * Runs in interrupt context: no sleeping, no kern_path here.  Upstream leaves the lookup loop entirely when the inode
+ * matches but the scheme does not (goto out_srcu_read_unlock, susfs.c:945/949/953/957/961), so there a non-matching
+ * entry also suppresses the remaining same-inode entries; here the first live (ino, dev) match is the only candidate -
+ * the same outcome for distinct inodes, while rules sharing one inode (hard links) differ only in which entry wins
+ * (upstream: newest hash_add_rcu first, here: slot order). */
 static int or_vfs_open_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
@@ -344,21 +303,14 @@ static int or_vfs_open_pre(struct kprobe *kp, struct pt_regs *regs)
 }
 
 /* ---- reverse: d_path(path, buf, buflen) ----
- *
- * Covers readlink("/proc/<pid>/fd/N"): proc_pid_readlink() -> do_proc_readlink() ->
- * d_path(&path, tmp, PAGE_SIZE) (fs/proc/base.c, upstream: patch:1062-1083).
- *
- * The /proc/<pid>/maps NAME column is NOT here: show_map_vma() prints it with seq_file_path() ->
- * seq_path(), and seq_path() calls __d_path() directly, never d_path() (fs/seq_file.c) - a probe on
- * __d_path registers cleanly and never fires on this kernel (full LTO inlines the primitive into
- * its callers; measured dpath_seq=0 while the maps line still named the redirected file), so that
- * name is rewritten out of the already-printed line instead - see or_maps_ret().
- *
- * The path handed to d_path() points at the redirected file, so replacing it with the target's
- * cached path makes d_path render the target name.  Divergence to know about: upstream returns the
- * literal string it was given at add time, while d_path() renders the canonical name of the cached
- * target path in the *reader's* namespace, so a rule registered through a symlink (or from another
- * mount namespace) can read back differently.  The literal string is in the entry (target_pathname). */
+ * Covers readlink("/proc/<pid>/fd/N"): proc_pid_readlink() -> do_proc_readlink() -> d_path(&path, tmp, PAGE_SIZE)
+ * (fs/proc/base.c, upstream: patch:1062-1083).  Divergence: upstream replays the literal string given at add time, while
+ * d_path() renders the canonical name of the cached target path in the *reader's* namespace - a rule registered through a
+ * symlink (or another mount namespace) can read back differently.
+ * The /proc/<pid>/maps NAME column is NOT here: show_map_vma() prints it with seq_file_path() -> seq_path(), which calls
+ * __d_path() directly, never d_path() (fs/seq_file.c); a probe on __d_path registers cleanly and never fires here (full
+ * LTO inlines the primitive; measured dpath_seq=0 while the maps line still named the redirected file), so the name is
+ * rewritten out of the already-printed line - see or_maps_ret(). */
 static bool or_dpath_swap(struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
@@ -389,9 +341,8 @@ static int or_dpath_pre(struct kprobe *kp, struct pt_regs *regs)
 }
 
 /* ---- reverse: vfs_statfs(path, buf) ----
- * Upstream answers statfs()/fstatfs() of the redirected file with the target's kstatfs snapshot
- * (susfs.c:1029-1046, taken with vfs_statfs() at add time, susfs.c:851).  Swapping in the cached
- * target path makes the kernel compute exactly that from the live target instead of a snapshot. */
+ * Upstream answers statfs()/fstatfs() of the redirected file with the target's kstatfs snapshot (susfs.c:1029-1046, taken
+ * with vfs_statfs() at add time, susfs.c:851); swapping in the cached target path computes the same from the live target. */
 static int or_vfs_statfs_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
@@ -432,19 +383,14 @@ static struct kprobe kp_or_vfs_statfs = {
 };
 
 /* ---- reverse face 3: the dev:ino columns of /proc/<pid>/maps (and smaps) ----
- *
- * The first attempt put this on show_vma_header_prefix() - args 6 and 7 of that call ARE the two
- * columns - and it registered fine and never fired once: with clang's full LTO it has no out-of-line
- * copy in this kernel (measured: the vma_hdr counter stayed 0 over every run).  So the
- * already-formatted line is rewritten instead, at the exit of the function that prints it:
- *     "<start>-<end> <rwxp> <pgoff> <maj>:<min> <ino> <name>"
- * one line per buffer, and the two numbers come from vma->vm_file, i.e. from the REDIRECTED inode.
- * Replacing the "<maj>:<min> <ino>" run with the target's makes the line consistent with the name
- * face 1 (d_path) already disguises: without it a detector reads the target's name next to the
- * redirected file's device, which no file on this system can produce.  The run is rendered exactly
- * the way fs/proc/task_mmu.c renders it (seq_put_hex_ll for major/minor: lowercase, minimum width 2;
- * seq_put_decimal_ull for the ino) and both surrounding spaces are part of the match, so neither the
- * pgoff nor the name can be caught by it. */
+ * The first attempt put this on show_vma_header_prefix() - args 6 and 7 of that call ARE the two columns - and it
+ * registered and never fired once (measured: the vma_hdr counter stayed 0 over every run; clang's full LTO leaves no
+ * out-of-line copy).  So the already-formatted line is rewritten instead: its two numbers come from vma->vm_file, i.e.
+ * from the REDIRECTED inode, and replacing the "<maj>:<min> <ino>" run with the target's keeps the line consistent with
+ * the name face 1 (d_path) already disguises - without it a detector reads the target's name next to the redirected
+ * file's device, which no file on this system can produce.  The run is rendered as fs/proc/task_mmu.c does it
+ * (seq_put_hex_ll for major/minor: lowercase, min width 2; seq_put_decimal_ull for the ino), both surrounding spaces
+ * included, so pgoff and name stay safe. */
 static atomic_t or_rev_maps_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_maps_rewrites = ATOMIC_INIT(0);	/* the maj:min ino run */
 static atomic_t or_rev_maps_names = ATOMIC_INIT(0);	/* the name column */
@@ -463,9 +409,8 @@ static int or_maps_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-/* Replace the first occurrence of old[0..old_len) in the seq_file buffer with new[0..new_len).
- * Growing is allowed as long as the buffer has room; without room the line is left alone rather
- * than truncated. */
+/* Replace the first occurrence of old[0..old_len) in the seq_file buffer with new[0..new_len); growing is allowed as
+ * long as the buffer has room, and without room the line is left alone rather than truncated. */
 static bool or_buf_replace(struct seq_file *m, const char *old, size_t old_len,
 			   const char *new, size_t new_len)
 {
@@ -524,20 +469,17 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 			    (unsigned int)MAJOR(e->target_dev),
 			    (unsigned int)MINOR(e->target_dev),
 			    (unsigned long)e->target_ino);
-	/* Keep the column width: the kernel padded the name out to a fixed column, so a shorter run would
-	 * pull the name left and a line that does not line up with its neighbours is visible on its own. */
+	/* Keep the column width: the kernel padded the name out to a fixed column, so a shorter run would pull the name
+	 * left - a line that does not line up with its neighbours is visible on its own. */
 	while (new_len < old_len && new_len < (int)sizeof(new) - 1)
 		new[new_len++] = ' ';
 	if (old_len > 0 && new_len > 0 &&
 	    or_buf_replace(m, old, (size_t)old_len, new, (size_t)new_len))
 		atomic_inc(&or_rev_maps_rewrites);
 
-	/* The name column as well - the honest way, measured: show_map_vma() prints it with
-	 * seq_file_path() -> seq_path() -> __d_path(), and a probe on __d_path registers fine and never
-	 * fires here (full LTO inlines that primitive; the counter stayed 0 while the line still read
-	 * "/data/local/tmp/.../redirected" next to the target's device and inode).  The rendered name is
-	 * searched for as the REGISTERED redirected path, so a rule registered through a symlink or read
-	 * from another mount namespace misses instead of mislabelling a different file. */
+	/* The name column as well: show_map_vma() prints it via seq_file_path()/seq_path()/__d_path(), and (see the d_path
+	 * block above) a probe on that primitive never fires here - so the rendered name is matched as the REGISTERED
+	 * redirected path, and a rule through a symlink or another mount namespace misses instead of mislabelling a file. */
 	if (e->redirected_pathname[0] && e->target_pathname[0]) {
 		size_t rlen = strlen(e->redirected_pathname);
 		size_t tlen = strlen(e->target_pathname);
@@ -559,20 +501,14 @@ static struct kretprobe kr_or_maps = {
 static bool or_maps_registered;
 
 /* ---- reverse face 4: /proc/<pid>/fdinfo/N ----
- *
- * fdinfo prints "ino:\t<i>" for the file an fd points at - for a rule, the REDIRECTED one - so a
- * detector holding an fd on the target is handed the inode of the file the redirection really
- * opened.  Upstream rewrites it in the same function it rewrites mnt_id in
- * (susfs_open_redirect_spoof_seq_show, patch:1171-1200).
- *
- * It belongs to THIS feature, not to sus_mount's: it has to fire as soon as one rule exists, whether
- * or not the mount-hiding switch is on.  Measured with the first version (a sus_mount seq_show
- * kretprobe, registered only when that feature is enabled): with a rule present and hide off, fdinfo
- * kept naming the redirected inode and the probe had entry=0.
- *
- * fdinfo has no device column, so the lookup is by ino alone and refuses when two rules share a
- * redirected ino.  State is per-instance (ri->data) because seq_show() may sleep inside
- * seq_printf() and the task can migrate CPUs there. */
+ * fdinfo prints "ino:\t<i>" for the file an fd points at - for a rule, the REDIRECTED one - so a detector holding an fd
+ * on the target is handed the inode of the file the redirection really opened.  Upstream rewrites it in the same function
+ * it rewrites mnt_id in (susfs_open_redirect_spoof_seq_show, patch:1171-1200).
+ * It belongs to THIS feature, not to sus_mount's: it has to fire as soon as one rule exists, whether or not the
+ * mount-hiding switch is on.  Measured with the first version (a sus_mount seq_show kretprobe, registered only when that
+ * feature is enabled): with a rule present and hide off, fdinfo kept naming the redirected inode and the probe had
+ * entry=0.  fdinfo has no device column, so the lookup is by ino alone and refuses when two rules share a redirected ino;
+ * state is per-instance (ri->data) because seq_show() may sleep in seq_printf() and the task can migrate CPUs. */
 static atomic_t or_rev_fdinfo_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_fdinfo_rewrites = ATOMIC_INIT(0);
 
@@ -614,10 +550,9 @@ static bool or_fdinfo_find_dec(struct seq_file *m, const char *label, size_t lab
 	return true;
 }
 
-/* Write new_val over the len digits at pos, growing or shrinking as needed.  The replacement can be
- * LONGER (measured: 926498 -> 10166500 was refused by an earlier shrink-only version, so the hook
- * reported hits with zero rewrites), and growing needs room in the seq_file buffer; without room the
- * line is left alone rather than truncated. */
+/* Write new_val over the len digits at pos, growing or shrinking as needed.  The replacement can be LONGER (measured:
+ * 926498 -> 10166500 was refused by an earlier shrink-only version, so the hook reported hits with zero rewrites);
+ * growing needs room in the seq_file buffer, and without room the line is left alone rather than truncated. */
 static bool or_fdinfo_write_dec(struct seq_file *m, size_t pos, size_t len,
 				unsigned long new_val)
 {
@@ -662,19 +597,16 @@ static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	atomic_inc(&or_rev_fdinfo_hits);
 
-	/* The ino is the rule's key and the same rule knows the target's mount id, so one lookup answers
-	 * both lines.  ino first: it sits after mnt_id in the line, so shrinking or growing it cannot
-	 * move that one. */
+	/* The ino is the rule's key and the same rule knows the target's mount id, so one lookup answers both lines.  ino
+	 * first: it sits after mnt_id in the line, so shrinking or growing it cannot move that one. */
 	if (or_fdinfo_find_dec(m, "ino:\t", 5, &pos, &len, &old) &&
 	    old && susfs_open_redirect_spoof_ids(old, &new_ino, &new_mnt) &&
 	    new_ino != old && or_fdinfo_write_dec(m, pos, len, new_ino))
 		rewrites++;
 
-	/* mnt_id, when a rule matched.  sus_mount rewrites this same label for the ids in ITS table and
-	 * both probes are on the same function, so when an fd is both "inside a hidden mount" and "the
-	 * redirected file" the order of the two return handlers decides which id wins - a cosmetic race
-	 * (both answers are ids the caller could have been shown), written down because it is invisible
-	 * in either module alone. */
+	/* mnt_id, when a rule matched.  sus_mount rewrites this same label from ITS table and both probes are on the same
+	 * function, so for an fd that is both "inside a hidden mount" and "the redirected file" the two return handlers race
+	 * for which id wins - cosmetic (both are ids the caller could have been shown), and invisible in either module alone. */
 	if (new_mnt && or_fdinfo_find_dec(m, "mnt_id:\t", 8, &pos, &len, &old) &&
 	    old != new_mnt && or_fdinfo_write_dec(m, pos, len, new_mnt))
 		rewrites++;
@@ -713,12 +645,10 @@ static int or_register(void)
 	return 0;
 }
 
-/* Reverse-disguise hooks: best effort.  The forward redirect is already live and each of these only
- * closes one report path, so a failure must not reject the rule - but it must never be silent
- * either: registering successfully proves the symbol exists, not that the kernel's call sites reach
- * it (GKI's full LTO inlines across translation units), which is why every hit is counted and the
- * counters are readable from /proc/susfs_open_redirect.  Called from the rule-management paths
- * (process context, may sleep). */
+/* Reverse-disguise hooks: best effort.  The forward redirect is already live and each of these only closes one report
+ * path, so a failure must not reject the rule - but never silent either: registering proves the symbol exists, not that
+ * the kernel's call sites reach it (GKI's full LTO inlines across translation units), hence the hit counters read back
+ * from /proc/susfs_open_redirect.  Called from the rule-management paths (process context, may sleep). */
 static void or_register_reverse(void)
 {
 	int rc;
@@ -816,10 +746,9 @@ int susfs_open_redirect_init(void)
 		pr_warn("open_redirect: security_cred_getsecid not found - schemes 1/2 will be refused\n");
 	or_resolve_su_sid();
 
-	/* Only the /proc node is optional.  The vfs_open hook is registered by or_add() - i.e. by the
-	 * supercall as well - so this gate must never return early and skip other work.  0777 so DAC
-	 * passes and sus_path's LSM layer answers ENOENT; without that layer the node would be
-	 * world-writable, so it is not created at all (see susfs_kstat_init()). */
+	/* Only the /proc node is optional.  The vfs_open hook is registered by or_add() - i.e. by the supercall as well - so
+	 * this gate must never return early and skip other work.  0777 so DAC passes and sus_path's LSM layer answers ENOENT;
+	 * without that layer the node would be world-writable, so it is not created at all (see susfs_kstat_init()). */
 	if (susfs_control_node_allowed()) {
 		or_proc_entry = proc_create("susfs_open_redirect", 0777, NULL,
 					    &or_proc_ops);
@@ -845,9 +774,8 @@ void susfs_open_redirect_exit(void)
 		or_proc_entry = NULL;
 	}
 
-	/* Nothing can reach these any more: the kprobes are already gone.  Every
-	 * entry is released exactly once here - dead ones included, which is what
-	 * makes "a deleted rule keeps its paths" safe. */
+	/* Nothing can reach these any more: the kprobes are already gone.  Every entry is released exactly once here - dead
+	 * ones included, which is what makes "a deleted rule keeps its paths" safe. */
 	for (i = 0; i < nor; i++) {
 		path_put(&or_entries[i].redirected_path);
 		or_entries[i].redirected_path.dentry = NULL;
@@ -882,18 +810,9 @@ static int or_proc_show(struct seq_file *m, void *v)
 				   (unsigned long)or_entries[i].redirected_dev);
 		}
 	}
-	/* Remember what the previous round learned the hard way: "registered" is
-	 * not "reached".  A hook whose counter stays 0 across a real read means
-	 * GKI inlined its call sites and that surface is NOT disguised.
-	 *
-	 * /proc/<pid>/fdinfo/N (upstream: patch:1145-1217, susfs.c:1048-1064) used
-	 * to be the one surface with no reachable hook here: its mnt_id/ino are
-	 * values passed straight to seq_printf() from fs/proc/fd.c's static
-	 * seq_show().  It is covered now by rewriting the already-printed line from a
-	 * kretprobe on that function (see or_fdinfo_ret) - so the counters below
-	 * matter twice over: fdinfo=<registered> and the fdinfo hit/rewrite pair.
-	 * mnt_id is NOT rewritten here: that id belongs to sus_mount's table, and the
-	 * fdinfo line for a mount is only ever wrong when that feature is hidden. */
+	/* "registered" is not "reached": a hook whose counter stays 0 across a real read means GKI inlined its call sites
+	 * and that surface is NOT disguised - hence the counters below (fdinfo's surface and provenance are in the face-4
+	 * block above).  mnt_id is NOT rewritten here: that id belongs to sus_mount's table. */
 	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d statfs=%d maps=%d/%d/%d fdinfo=%d/%d | su_sid=%u\n",
 		   or_registered, or_dpath_registered, or_statfs_registered,
 		   or_maps_registered, or_fdinfo_registered,
@@ -911,9 +830,8 @@ static int or_proc_show(struct seq_file *m, void *v)
 
 static int or_proc_open(struct inode *inode, struct file *file)
 {
-	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set,
-	 * not from the mode), so refuse non-root callers here too - see the note in
-	 * susfs_enable_log.c's log_proc_open(). */
+	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set, not from the mode), so refuse non-root
+	 * callers here too - see the note in susfs_enable_log.c's log_proc_open(). */
 	if (current_uid().val != 0)
 		return -ENOENT;
 	return single_open(file, or_proc_show, NULL);
@@ -949,15 +867,12 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	if (scheme < UID_NON_APP_PROC || scheme > UID_UMOUNTED_PROC)
 		return -EINVAL;
 
-	/* Both come from char[256] ABI fields (supercall) or a NUL-terminated
-	 * command buffer (proc write); reject the unterminated case instead of
-	 * letting strcmp()/kern_path() read past the struct or truncate a path
-	 * into a rule for some other file. */
+	/* Both come from char[256] ABI fields (supercall) or a NUL-terminated command buffer (proc write); reject the
+	 * unterminated case instead of letting strcmp()/kern_path() read past the struct or truncate a path into a rule. */
 	if (!susfs_abi_path_ok(target, OR_PATH_MAX) ||
 	    !susfs_abi_path_ok(redirected, OR_PATH_MAX))
 		return -ENAMETOOLONG;
 
-	/* resolve target for ino/dev (released immediately) */
 	rc = kern_path(target, LOOKUP_FOLLOW, &tp);
 	if (rc)
 		return rc;
@@ -980,10 +895,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -ENOENT;
 	}
 
-	/* upstream susfs.c:824-829 - FUSE is refused outright, on either side.
-	 * Rejecting is the whole handling: no silent rewrite, no partial rule.
-	 * (d_sb is the dentry's superblock, i.e. the same scene the upstream
-	 * check reads through inode->i_sb.) */
+	/* upstream susfs.c:824-829 - FUSE is refused outright, on either side, and rejecting is the whole handling: no
+	 * silent rewrite, no partial rule.  (d_sb is the dentry's superblock: what upstream reads through inode->i_sb.) */
 	if (tp.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC ||
 	    rp.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC) {
 		pr_warn("open_redirect: FUSE fs is not supported for open_redirect feature\n");
@@ -992,11 +905,9 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -EINVAL;
 	}
 
-	/* Schemes 1 and 2 are decisions about the KernelSU su domain.  Upstream
-	 * always has that sid (KernelSU hands it over at setuid-hook setup), an
-	 * LKM resolves the context itself - and if it does not resolve, "not in
-	 * su domain" is true for the su process too, i.e. the one process the
-	 * rule exists to spare would be redirected.  Refuse loudly instead. */
+	/* Schemes 1 and 2 are decisions about the KernelSU su domain.  Upstream always has that sid (KernelSU hands it
+	 * over at setuid-hook setup), an LKM resolves the context itself - and if it does not resolve, "not in su domain"
+	 * is true for the su process too, i.e. the one process the rule exists to spare would be redirected.  Refuse. */
 	if (scheme == UID_ROOT_PROC_EXCEPT_SU_PROC ||
 	    scheme == UID_NON_SU_PROC) {
 		or_resolve_su_sid();
@@ -1009,9 +920,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		}
 	}
 
-	/* Register the hooks BEFORE touching any entry: a rule that is listed but
-	 * cannot fire (because the hook is missing) silently does nothing while
-	 * looking configured - worse than no rule at all. */
+	/* Register the hooks BEFORE touching any entry: a rule that is listed but cannot fire (hook missing) silently does
+	 * nothing while looking configured - worse than no rule at all. */
 	rc = or_register();
 	if (rc) {
 		path_put(&rp);
@@ -1021,9 +931,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	}
 	or_register_reverse();
 
-	/* upstream susfs.c:867-881: a name that another rule already uses as its
-	 * redirected path belongs to that rule's reverse entry and must not be
-	 * taken over. */
+	/* upstream susfs.c:867-881: a name that another rule already uses as its redirected path belongs to that rule's
+	 * reverse entry and must not be taken over. */
 	e = or_find_by_path(target);
 	if (!e && or_is_redirected_path(target)) {
 		pr_warn("open_redirect: '%s' cannot be added because it is used for reversed lookup only\n",
@@ -1034,23 +943,16 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	}
 
 	if (e) {
-		/* Rewriting a rule: mark the old entry dead and leave its paths alone.
-		 *
-		 * They stay as they are for the rest of the module's life, and unload
-		 * releases each entry exactly once.  Nothing is retired to a side list
-		 * any more: or_retire_path() duplicated the struct path, which meant the
-		 * same single reference was released twice on unload, and clearing the
-		 * fields (the older behaviour) pulled the path out from under a reader
-		 * that had already passed its dead check and was on its way into
-		 * vfs_open()/d_path()/vfs_statfs() with that very pointer. */
+		/* Rewriting a rule: mark the old entry dead and leave its paths alone - they stay for the module's life and
+		 * unload releases each entry exactly once.  or_del() says why those fields must not be cleared while a reader
+		 * may hold them; the entry-array note above covers the retired-list double-free measured on rmmod. */
 		WRITE_ONCE(e->dead, true);
 		smp_wmb();
 		e = NULL;
 	}
 
-	/* A retired slot is never reused either: reuse would overwrite path fields a
-	 * reader may still be holding, and would discard the reference the dead entry
-	 * still owns.  Rules are configuration, so the array growing is fine. */
+	/* A retired slot is never reused either: reuse would overwrite path fields a reader may still hold and discard the
+	 * reference the dead entry owns.  Rules are configuration, so the array growing is fine. */
 	if (nor >= SUS_OR_MAX) {
 		path_put(&rp);
 		path_put(&tp);
@@ -1084,16 +986,10 @@ static void or_del(const char *target)
 	if (!e)
 		return;
 
-	/* Dead, and that is all.
-	 *
-	 * A reader that has already passed its `dead` check still holds a pointer to
-	 * these fields and hands them to vfs_open()/d_path()/vfs_statfs(), which
-	 * dereference path->dentry immediately (fs/open.c:1032, fs/d_path.c:282,
-	 * fs/statfs.c:90).  Clearing them here while such a reader is on its way is a
-	 * straight NULL-dereference oops, reachable from any app because the control
-	 * node is 0777 (or_uid_matches() is consulted later, inside the probe).  So
-	 * the paths stay exactly as they are, pinned until unload, and released once
-	 * - by exit, which walks every entry including the dead ones. */
+	/* Dead, and that is all.  A reader that has already passed its `dead` check still holds a pointer to these fields and
+	 * hands them to vfs_open()/d_path()/vfs_statfs(), which dereference path->dentry at once (fs/open.c:1033,
+	 * fs/d_path.c:282, fs/statfs.c:90) - clearing them is a NULL-dereference oops any app can reach, since the control
+	 * node is 0777 (or_uid_matches() is consulted later, in the probe).  So they stay, pinned until unload. */
 	WRITE_ONCE(e->dead, true);
 	smp_wmb();
 
@@ -1101,11 +997,9 @@ static void or_del(const char *target)
 	e->redirected_pathname[0] = '\0';
 }
 
-/* Slots are never compacted (that array move was itself part of the race).
- * The kprobes stay registered for the module's whole lifetime: repeatedly
- * unregistering and re-registering them was observed to leave the hook silently
- * gone after a burst of add/del cycles, while an empty rule table already makes
- * the lookups miss - so staying registered costs nothing. */
+/* Slots are never compacted (that array move was itself part of the race).  The kprobes stay registered for the whole
+ * module lifetime: unregistering and re-registering them was observed to leave the hook silently gone after a burst of
+ * add/del cycles, while an empty rule table already makes the lookups miss - so staying registered costs nothing. */
 
 static ssize_t or_proc_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *off)
@@ -1115,8 +1009,7 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 	int argc, err;
 	long scheme;
 
-	/* Same gate as or_proc_open() - see the note there: an fd opened before the
-	 * opener dropped privileges must not become a way in. */
+	/* Same gate as or_proc_open(): an fd opened before the opener dropped privileges must not become a way in. */
 	if (current_uid().val != 0)
 		return -ENOENT;
 
