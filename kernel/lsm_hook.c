@@ -230,6 +230,10 @@ typedef void (*ksu_static_call_update_t)(struct static_call_key *key, void *tram
 
 static int ksu_lsm_hook_update_scall(struct lsm_static_call *scall, void *value)
 {
+    /* The generic arm of __static_call_update() is `WRITE_ONCE(key->func, func)` and cannot
+     * fail - which is the arm these builds compile (the .ko imports neither __static_call_update
+     * nor arch_static_call_transform), so the int return exists only for a tree whose config
+     * selects the inline/arch arm, where the call can reject. Callers check it either way. */
     __static_call_update(scall->key, scall->trampoline, value);
     smp_wmb();
     return 0;
@@ -490,7 +494,6 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     static unsigned long scalls_addr = 0;
     struct lsm_static_call *scalls = NULL;
     static size_t scalls_count = 0;
-    static u32 lsm_max_cnt = 5;
     struct security_hook_list *selected_entry = NULL;
     struct lsm_static_call *selected_scall = NULL;
     void **selected_slot = NULL;
@@ -583,24 +586,23 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
          * a plain `insmod` (unknown symbol) - it is the fifth name the "Verify sections" CI step
          * refuses in the .ko's undefined list - and the number is the same either way. */
         unsigned long sym_size = sizeof(struct lsm_static_calls_table);
-        u32 lsm_active_cnt = 5;
         unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");
-        if (!addr) {
-            pr_err("failed to get lsm_active_cnt\n");
-        } else {
-            lsm_active_cnt = *(u32 *)addr;
+
+        /* The STRIDE is the compile-time MAX_LSM_COUNT the table is dimensioned with, NOT the
+         * runtime number of active LSMs: lsm_active_cnt counts enabled SECURITY_*/BPF_LSM/...
+         * options and says nothing about how many slots each hook has.  Using it as the stride
+         * picked the wrong struct lsm_static_call whenever the two differ, i.e. patched a
+         * function pointer into another hook's slot (kCFI panic at the next call). */
+        if (addr)
+            SUSFS_LOGI("lsm_active_cnt = %d (only informational; the table stride is %d)\n",
+                    (int)*(u32 *)addr, (int)KSU_LSM_SLOTS_PER_HOOK);
+
+        if (sym_size % (KSU_LSM_SLOTS_PER_HOOK * sizeof(struct lsm_static_call)) != 0) {
+            pr_warn("lsm_hook: static_calls_table is %lu bytes, not a whole number of %d-slot hooks\n",
+                    sym_size, (int)KSU_LSM_SLOTS_PER_HOOK);
         }
-        SUSFS_LOGI("lsm_active_cnt = %d\n", lsm_active_cnt);
-        if (lsm_active_cnt == 0 || lsm_active_cnt > 20) {
-            pr_err("invalid lsm_active_cnt\n");
-        } else {
-            lsm_max_cnt = lsm_active_cnt;
-            if (sym_size % (lsm_active_cnt * sizeof(struct lsm_static_call)) != 0) {
-                pr_warn("invalid struct size\n");
-            }
-            scalls_count = sym_size / sizeof(struct lsm_static_call);
-            SUSFS_LOGI("scalls_count = %zu\n", scalls_count);
-        }
+        scalls_count = sym_size / sizeof(struct lsm_static_call);
+        SUSFS_LOGI("scalls_count = %zu\n", scalls_count);
     }
 
     if (scalls_count == 0) {
@@ -647,7 +649,7 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
             selected_slot = slot;
             selected_origin = current_origin;
         } else {
-            size_t hook_idx = (i / lsm_max_cnt + hook->offset) * lsm_max_cnt;
+            size_t hook_idx = (i / KSU_LSM_SLOTS_PER_HOOK + hook->offset) * KSU_LSM_SLOTS_PER_HOOK;
             if (hook_idx >= scalls_count) {
                 pr_err("last lsm hook reached\n");
                 ret = -EINVAL;
@@ -693,7 +695,22 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
         goto out_untrack;
     }
 
+    /* Publish BEFORE the switch, exactly like the insert path: the replacement reads
+     * hook->original on its pass-through path, so a call arriving between the static-call
+     * update and this store would see NULL and fall through to `return 0` - dropping
+     * SELinux's decision (fail-open).  smp_wmb() pairs with the smp_rmb() in
+     * SUS_LSM_PASS_ORIG(). */
+    hook->entry = selected_entry;
+    hook->scall = selected_scall;
+    hook->original = selected_origin;
+    smp_wmb();
+
     if (ksu_lsm_hook_update_scall(selected_scall, hook->replacement)) {
+        /* Undo the publication as well: the replacement must not look armed, or a later
+         * unhook would try to restore a static call that was never switched. */
+        hook->entry = NULL;
+        hook->scall = NULL;
+        hook->original = NULL;
         if (ksu_lsm_hook_patch_slot(selected_slot, selected_origin)) {
             pr_err("lsm_hook: failed to roll back %s after static call update failure\n", hook->head_name ?: "unknown");
         }
@@ -704,9 +721,6 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     if (!selected_origin)
         static_branch_enable(selected_scall->active);
 
-    hook->entry = selected_entry;
-    hook->scall = selected_scall;
-    hook->original = selected_origin;
     SUSFS_LOGI("lsm_hook: patched %s hook slot %px from %px to %px\n", hook->head_name ?: "unknown", selected_slot,
             selected_origin, hook->replacement);
 #else

@@ -746,7 +746,14 @@ static void sus_mount_ns_walk_end(void)
 #define SUS_MOUNT_ITER_TYPE		struct rb_node *
 #define SUS_MOUNT_ITER_FOR(ns, it)	for ((it) = rb_first(&(ns)->mounts); (it); (it) = rb_next(it))
 #define SUS_MOUNT_ITER_MOUNT(it)	rb_entry((it), struct mount, mnt_node)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 #define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns) || !mnt_ns_attached(r))
+#else
+/* 6.12 has the rb-tree (and MNT_ONRB) but not the helper: mnt_ns_attached() arrived in 6.13,
+ * where its body is exactly this test.  Using it unguarded made a plain 6.12 tree an implicit
+ * declaration, so the first 6.12 build either failed or linked against nothing. */
+#define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns) || RB_EMPTY_NODE(&(r)->mnt_node))
+#endif
 #else
 static bool sus_mount_ns_walk_begin(void)
 {

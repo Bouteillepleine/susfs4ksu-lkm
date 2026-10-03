@@ -122,12 +122,18 @@ static u64 out_len;
 
 static int verbose;
 
+/* Defined below.  o_flush() must go through it instead of calling SYS_exit directly: a failed
+ * stdout write (EPIPE - `susfs_insmod x.ko | head`, a reader that went away, a closed fd)
+ * would otherwise leave /proc/sys/kernel/kptr_restrict at the 0 this tool wrote, i.e. kernel
+ * addresses readable by every process on the device until the next reboot. */
+static void finish(int code);
+
 static void o_flush(void)
 {
 	if (!out_len)
 		return;
 	if (sys6(SYS_write, 1, (sysarg)out_buf, (sysarg)out_len, 0, 0, 0) < 0)
-		sys6(SYS_exit, 9, 0, 0, 0, 0, 0);	/* EBADF: nowhere to talk to */
+		finish(9);		/* EBADF: nowhere to talk to - restore, then exit */
 	out_len = 0;
 }
 

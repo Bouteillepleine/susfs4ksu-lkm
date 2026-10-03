@@ -1,7 +1,16 @@
 name: build-lkm-ddk
 
 on:
+  # Every push to dev/main (and any other buildable branch) builds all eight variants in
+  # privileged containers; the legacy branch has no DDK image for its pre-5.10 range and must
+  # not be built at all.  A documentation-only push has nothing to compile - the four comment
+  # passes this branch needed each burned a full matrix before this filter existed.  (Same
+  # trigger the legacy branch already carries; kept in sync deliberately.)
   push:
+    branches-ignore:
+      - legacy
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 jobs:

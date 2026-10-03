@@ -41,7 +41,11 @@ static const size_t cfi_suffix_len = sizeof(cfi_suffix) - 1;
 #define ALWAYS_HAVE_ON_EACH_SYMBOL 0
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+/* kallsyms_on_each_match_symbol() is NOT in 6.1 (measured against upstream: absent in v6.1,
+ * present from v6.5, so 6.6/6.12/6.18 have it).  Gating at 6.1 only bought a spurious
+ * "cannot bootstrap" warning on the android14-6.1 variant and then fell back to the
+ * kallsyms_lookup_name() path that every other build uses anyway. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 #define HAVE_ON_EACH_MATCH_SYMBOL 1
 #else
 #define HAVE_ON_EACH_MATCH_SYMBOL 0
