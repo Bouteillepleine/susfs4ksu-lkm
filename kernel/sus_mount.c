@@ -120,6 +120,9 @@
 #include <linux/limits.h>   /* PATH_MAX, INT_MAX (via vdso/limits.h) */
 #include <linux/security.h> /* security_secctx_to_secid() */
 #include <linux/proc_fs.h>  /* proc_create() for /proc/susfs_hide_mounts */
+#include <linux/version.h>  /* LINUX_VERSION_CODE / KERNEL_VERSION: nothing else here
+                             * pulled version.h in, and -Werror=undef turned the
+                             * version gates below into hard errors when it was missing */
 #include <linux/rbtree.h>   /* >= 6.12: ns->mounts is an rb-tree, not a list */
 #include <linux/rwsem.h>    /* >= 6.12: namespace_sem is a struct rw_semaphore */
 #include "mount.h"      /* fs/mount.h: struct mount + struct mnt_namespace + real_mount() */
