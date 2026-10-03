@@ -407,6 +407,15 @@ jobs:
             if [ "$n" = "0" ]; then
               echo "::warning::$s is not in $S (variant $V) - the feature that resolves it by name cannot arm on this kernel"
             fi
+            # More than one match is a hazard in itself, not just for the callers that use
+            # .symbol_name: print the neighbours of each match so the log says WHO else is
+            # called that (measured: `seq_show` is four symbols from 6.1 on, one on 5.10/5.15).
+            if [ "$n" -gt 1 ] && [ -f "$S/System.map" ]; then
+              grep -nE "(^|[[:space:]])${s}$" "$S/System.map" | cut -d: -f1 | while read -r _l; do
+                echo "      match at System.map:$_l and its neighbours:"
+                sed -n "$(( _l > 1 ? _l - 1 : 1 )),$(( _l + 1 ))p" "$S/System.map" | sed 's/^/        /'
+              done
+            fi
           done
           [ "$hardmiss" = "0" ] || exit 1
           echo "the three mount show callbacks are present in $S"

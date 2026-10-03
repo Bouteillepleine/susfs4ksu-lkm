@@ -134,6 +134,40 @@ static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, u
     return 1;	/* stop the walk */
 }
 
+/* Same shape, but it keeps every match (see ksu_find_symbol_all()). */
+struct ksu_all_names_ctx {
+    const char *symbol_name;
+    unsigned long *addrs;
+    int max;
+    int n;
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
+#else
+static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
+#endif
+{
+    struct ksu_all_names_ctx *ctx = data;
+    int i;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+    if (mod)
+        return 0;
+#endif
+
+    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
+        return 0;
+
+    for (i = 0; i < ctx->n; i++)
+        if (ctx->addrs[i] == addr)
+            return 0;			/* the walk can report a symbol twice (aliases) */
+
+    if (ctx->n < ctx->max)
+        ctx->addrs[ctx->n++] = addr;
+    return 0;				/* keep walking: uniqueness is not assumed */
+}
+
 unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
 {
     unsigned long addr = 0;
@@ -193,6 +227,46 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
      * be verified. */
     pr_warn("ignore symbol %s: its owner cannot be checked on this kernel\n", symbol_name);
     return 0;
+}
+
+/* Collect EVERY vmlinux symbol with this exact name, not just the first one.
+ *
+ * find_kernel_symbol_exact() returns one address, which is all most callers need; but a
+ * name is not always unique in kallsyms, and register_kprobe(.symbol_name=...) takes
+ * whichever match kallsyms lists first - measured: `seq_show` is one symbol on 5.10/5.15
+ * and FOUR on android14-6.1 / android15-6.6 / android16-6.12 / android17-6.18 (fs/proc/fd.c's
+ * is only one of them).  A caller that must hook a specific function therefore has to hook
+ * all of them and decide at run time; this is the enumeration it needs.
+ *
+ * Module-owned symbols are dropped (they are not the kernel's function of that name), which
+ * is the same ownership rule find_kernel_symbol_exact() applies.  Returns the number of
+ * addresses written (0 = unknown/not found); the walker paths are bounded by @max. */
+int ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
+{
+    int n = 0;
+
+    if (!name || !name[0] || !addrs || max <= 0)
+        return 0;
+
+    if (kallsyms_on_each_symbol_fn) {
+        struct ksu_all_names_ctx ctx = { .symbol_name = name, .addrs = addrs, .max = max, .n = 0 };
+
+        kallsyms_on_each_symbol_fn(ksu_all_names_cb, &ctx);
+        n = ctx.n;
+    }
+
+    if (n == 0) {
+        /* No walker (pre-5.19) or no match: the single-address lookup is the fallback, and
+         * on the kernels where a name is ambiguous the walker exists. */
+        unsigned long one = find_kernel_symbol_exact(name);
+
+        if (one) {
+            addrs[0] = one;
+            n = 1;
+        }
+    }
+
+    return n;
 }
 
 static inline bool ksu_symbol_has_suffix(const char *name, size_t name_len, const char *suffix, size_t suffix_len)
