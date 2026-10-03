@@ -73,14 +73,24 @@ jobs:
           echo "KERNEL_SRC=$KERNEL_SRC"
           echo "CLANG_PATH=$CLANG_PATH"
           clang --version | head -1
-          # The build below runs `make -C "$KDIR"`; an image that ships its tree somewhere
-          # else (or not at all) must say so here rather than fail inside make.  Every
-          # variant in this matrix passes today, so this guard can only fire on a NEW
-          # image tag - which is exactly when a clear message is worth having.
-          if [ -z "$KDIR" ] || [ ! -f "$KDIR/include/linux/lsm_hooks.h" ]; then
-            echo "::error::KDIR ('$KDIR') does not hold a prepared kernel tree with include/linux/lsm_hooks.h (variant ${{ matrix.variant }})"
+          # The build below runs `make -C "$KDIR"`; an image that ships no build tree at
+          # that path must say so here rather than fail inside make.  What KDIR has to be
+          # is the OBJTREE (a prepared output tree with its Makefile and generated
+          # headers) - the sources live in a separate tree on these images, e.g.
+          # KDIR=/opt/ddk/kdir/<variant> against KERNEL_SRC... which is where
+          # include/linux/lsm_hooks.h actually is.  Checking for the header HERE was the
+          # first version of this guard and it failed all eight variants at once; the
+          # Makefile is the precondition `make -C` itself needs.
+          if [ -z "$KDIR" ] || [ ! -f "$KDIR/Makefile" ]; then
+            echo "::error::KDIR ('$KDIR') is not a prepared kernel build tree (no Makefile) for variant ${{ matrix.variant }}"
             exit 1
           fi
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" "/opt/ddk/src/${{ matrix.variant }}" /opt/ddk/src/*; do
+            if [ -n "$d" ] && [ -f "$d/include/linux/lsm_hooks.h" ]; then
+              echo "source tree = $d"
+              break
+            fi
+          done
 
       - name: Checkout module
         uses: actions/checkout@v4
