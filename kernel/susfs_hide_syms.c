@@ -8,6 +8,7 @@
  * like upstream (a build-time CONFIG there, no runtime toggle).
  */
 #include <linux/module.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE: the kallsym_iter mirror below is version-gated */
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
 #include <linux/kallsyms.h>
