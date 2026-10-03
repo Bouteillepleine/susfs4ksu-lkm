@@ -59,6 +59,16 @@ adb shell "su -c 'mkdir -p /data/adb/loader && cp /data/local/tmp/susfs_guard_lk
 adb shell "su -c 'sh /data/local/tmp/verify-gki.sh'"
 ```
 
+## 发布
+
+所有 GitHub release(**含 pre-release**)的描述一律用**英文**书写(自 `v2.3.0-r10` 起的规定)。
+资产固定为各 GKI 变体的 `susfs_guard_lkm-<variant>.ko` 加 `susfs_insmod`(工具只发这一个);
+预发布用 tag `v2.3.0-r<N>-dev<M>`,标题里写明是预览以及这一版修了什么。
+
+> Every GitHub release -- stable **and** pre-release -- carries an **English** description
+> (rule in force since `v2.3.0-r10`).  The assets are the per-variant
+> `susfs_guard_lkm-<variant>.ko` files plus `susfs_insmod` only.
+
 ## License
 
 GPL-2.0，见 [LICENSE](LICENSE)。移植来源：[susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu)（功能逻辑与 hook 点）、
