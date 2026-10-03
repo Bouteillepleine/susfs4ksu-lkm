@@ -1,6 +1,10 @@
 name: build-lkm-ddk
 
 on:
+  # legacy is the pre-5.10 porting branch: no image exists for that range, so it is
+  # never built and must never produce artifacts.
+  branches-ignore:
+    - legacy
   push:
   workflow_dispatch:
 
