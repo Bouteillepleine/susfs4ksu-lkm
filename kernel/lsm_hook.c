@@ -320,16 +320,31 @@ static int ksu_lsm_hook_update_scall(struct lsm_static_call *scall, void *value)
  *
  * The only symbol it needs is static_calls_table itself (resolved by name, like every
  * other symbol here) plus the slot's own key/trampoline, which lsm_static_call_init()
- * already filled.  __static_call_update() is EXPORT_SYMBOL_GPL in
- * kernel/static_call_inline.c on both 6.12 and 6.18, so no kprobe or text patching is
- * involved: the kernel patches its own trampoline.
+ * already filled.  The write itself goes through __static_call_update(), i.e. the kernel
+ * own primitive: x86-64 builds (CONFIG_HAVE_STATIC_CALL_INLINE) import it from
+ * kernel/static_call_inline.c, while arm64 takes linux/static_call.h's inline flavour -
+ * measured, not assumed: the android16-6.12 and android17-6.18 .ko files import neither
+ * __static_call_update nor cpus_read_lock() nor arch_static_call_transform(), which is
+ * what the HAVE_STATIC_CALL/HAVE_STATIC_CALL_INLINE branches of that header would have
+ * pulled in.  Nothing here patches text by hand, which is the point: whatever flavour
+ * the tree uses, the same call the kernel's own lsm_static_call_init() makes is the call
+ * this code makes.
  *
  * NOTHING IS WRITTEN until every offset has been validated against the LIVE table,
  * because the failure this must not have is a jump target that is wrong rather than
  * absent.  The validations, in order (all reads go through copy_from_kernel_nofault(),
  * so a bogus pointer cannot fault the check that exists to catch a bogus pointer):
  *
- *   1. the slot's key/trampoline/hl are non-NULL kernel addresses;
+ *   1. the slot's key/hl are non-NULL kernel addresses, and its trampoline is either
+ *      NULL or a kernel address.  NULL is NOT a layout problem: security.c's
+ *      LSM_HOOK_TRAMP() is NULL whenever the tree is built without
+ *      CONFIG_HAVE_STATIC_CALL, and lsm_static_call_init() hands that same NULL to
+ *      __static_call_update() at boot - measured on both DDK trees this branch targets,
+ *      whose modules import neither cpus_read_lock() nor arch_static_call_transform()
+ *      and therefore took linux/static_call.h's generic implementation, where
+ *      __static_call_update() is a plain WRITE_ONCE(key->func, func) and static_call()
+ *      is an indirect call THROUGH key->func.  Either flavour ends at key->func, which
+ *      is why key->func is what this code reads, saves and replaces in both;
  *   2. hl->scalls == &static_calls_table.<member>[0], i.e. the entry we found is
  *      registered for THIS hook.  This is what validates head_offset against the
  *      kernel's real layout: a RANDSTRUCT kernel (or any table whose member order
@@ -458,8 +473,8 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
         if (!hl)
             continue;	/* empty slot: no LSM implements this hook there */
 
-        if (!key || !tramp || !ksu_lsm_kptr_plausible(key) ||
-            !ksu_lsm_kptr_plausible(tramp) || !ksu_lsm_kptr_plausible(hl)) {
+        if (!key || !ksu_lsm_kptr_plausible(key) || !ksu_lsm_kptr_plausible(hl) ||
+            (tramp && !ksu_lsm_kptr_plausible(tramp))) {
             pr_err("lsm_hook: insert: %s: slot %d has implausible key/trampoline/hl (%px/%px/%px) - struct lsm_static_call layout mismatch, refusing\n",
                     hook->head_name, i, key, tramp, hl);
             return -EINVAL;
@@ -545,8 +560,9 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
     hook->original = chosen_orig;
     ksu_lsm_hook_update_scall(chosen, hook->replacement);
 
-    SUSFS_LOGI("lsm_hook: insert via static call slot (selinux, slot %d) %s: %px -> %px\n",
-            (int)(chosen - slots), hook->head_name, chosen_orig, hook->replacement);
+    SUSFS_LOGI("lsm_hook: insert via static call slot (selinux, slot %d, %s static call) %s: %px -> %px\n",
+            (int)(chosen - slots), chosen->trampoline ? "trampolined" : "key->func",
+            hook->head_name, chosen_orig, hook->replacement);
     return 0;
 }
 #endif
