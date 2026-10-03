@@ -15,15 +15,13 @@ jobs:
   #   5.15 → android13-5.15, android14-5.15
   #   6.1  → android14-6.1                      (kCFI starts here)
   #   6.6  → android15-6.6
+  #   6.12 → android16-6.12                     (LSM dispatch becomes static calls)
+  #   6.18 → android17-6.18                     (same static-call machine as 6.12)
   #
   # There is no android14-6.6: Android 14 is 5.15/6.1, Android 15 is 6.6
   # (https://source.android.com/docs/core/architecture/kernel/android-common), and no
-  # DDK image exists for that pairing either.  6.12 (Android 16) is deliberately out of
-  # scope: `android16-6.12` exists in ACK but no domestic OEM ships it to users yet, and
-  # its LSM dispatch (static calls) is a different mechanism.
-  #
-  # The image tag is pinned to a date on purpose: the same commit rebuilt later must
-  # produce the same module.
+  # DDK image exists for that pairing either.  The image tag is pinned to a date on
+  # purpose: the same commit rebuilt later must produce the same module.
   module:
     runs-on: ubuntu-latest
     strategy:
@@ -43,8 +41,20 @@ jobs:
           # Kept non-blocking while the rest of the 6.12 port lands (see the
           # "experimental" flag below); nothing is published for it either way.
           - android16-6.12
+          # 6.18 (Android 17) has the SAME static-call machinery as 6.12 -
+          # struct lsm_static_call / lsm_static_calls_table / security_hook_list and the
+          # lsm_static_call_init() dispatch are field-for-field identical, and so are the
+          # 13 hook prototypes this module installs - so one `>= 6.12` implementation
+          # serves both.  It is a separate entry rather than 6.12's build being reused
+          # because the two DDK trees are still different trees: any drift that does
+          # exist (a header, a symbol, the generated config) has to show up as its own
+          # job.  Same treatment as android16-6.12: non-blocking until it has been on
+          # hardware, and its artifact is not published either way.
+          - android17-6.18
         include:
           - variant: android16-6.12
+            experimental: true
+          - variant: android17-6.18
             experimental: true
     continue-on-error: ${{ matrix.experimental == true }}
     container:
@@ -57,11 +67,20 @@ jobs:
     steps:
       - name: Inspect DDK environment
         run: |
+          set -e
           echo "variant  = ${{ matrix.variant }}"
           echo "KDIR=$KDIR"
           echo "KERNEL_SRC=$KERNEL_SRC"
           echo "CLANG_PATH=$CLANG_PATH"
           clang --version | head -1
+          # The build below runs `make -C "$KDIR"`; an image that ships its tree somewhere
+          # else (or not at all) must say so here rather than fail inside make.  Every
+          # variant in this matrix passes today, so this guard can only fire on a NEW
+          # image tag - which is exactly when a clear message is worth having.
+          if [ -z "$KDIR" ] || [ ! -f "$KDIR/include/linux/lsm_hooks.h" ]; then
+            echo "::error::KDIR ('$KDIR') does not hold a prepared kernel tree with include/linux/lsm_hooks.h (variant ${{ matrix.variant }})"
+            exit 1
+          fi
 
       - name: Checkout module
         uses: actions/checkout@v4
@@ -145,6 +164,32 @@ jobs:
           grep -nE 'TWA_RESUME|task_work_add' "$T/include/linux/task_work.h" || true
           echo "--- kvmalloc()/kvfree() ---"
           grep -nE 'void \*kvmalloc\(|void kvfree\(' "$T/include/linux/mm.h" "$T/include/linux/slab.h" || true
+
+          echo "--- CFI scheme, RANDSTRUCT and the LSM set as THIS tree was configured ---"
+          # Read from the tree's own generated config, not assumed: the >= 6.12 LSM
+          # takeover depends on all of these.  6.12 spells kCFI CONFIG_CFI_CLANG and
+          # 6.18 spells the same option CONFIG_CFI (renamed upstream), __randomize_layout
+          # is only a no-op while RANDSTRUCT is off, and MAX_LSM_COUNT follows from the
+          # SECURITY_* set.  A missing entry prints "(absent here)" rather than nothing,
+          # so "the gate did not apply" is visible instead of implied.
+          A="$G/autoconf.h"
+          cfg() {
+            _v=""
+            if [ -f "$A" ]; then
+              _v=$(grep -hE "^(#define $1 |/\* #undef $1 \*/)" "$A" | head -1)
+            fi
+            if [ -z "$_v" ] && [ -f "$KDIR/.config" ]; then
+              _v=$(grep -hE "^(# )?$1[= ]" "$KDIR/.config" | head -1)
+            fi
+            echo "${_v:-(absent here)}"
+          }
+          for k in CONFIG_SECURITY CONFIG_CFI_CLANG CONFIG_CFI CONFIG_RANDSTRUCT \
+                   CONFIG_GCC_PLUGIN_RANDSTRUCT CONFIG_ARM64_BTI_KERNEL CONFIG_LTO_CLANG \
+                   CONFIG_LTO_CLANG_FULL CONFIG_KALLSYMS_ALL CONFIG_MODULES \
+                   CONFIG_SECURITY_SELINUX CONFIG_SECURITY_SAFESETID CONFIG_SECURITY_LANDLOCK \
+                   CONFIG_BPF_LSM CONFIG_ARM64_VA_BITS_48; do
+            printf '  %-30s %s\n' "$k" "$(cfg "$k")"
+          done
 
       - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
