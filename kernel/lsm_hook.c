@@ -590,10 +590,10 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
         unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");
 
         /* The STRIDE is the compile-time MAX_LSM_COUNT the table is dimensioned with, NOT the
-         * runtime number of active LSMs: lsm_active_cnt counts enabled SECURITY_*/BPF_LSM/...
-         * options and says nothing about how many slots each hook has.  Using it as the stride
-         * picked the wrong struct lsm_static_call whenever the two differ, i.e. patched a
-         * function pointer into another hook's slot (kCFI panic at the next call). */
+         * runtime number of active LSMs: lsm_active_cnt counts the enabled SECURITY_ options
+         * (plus BPF_LSM etc.) and says nothing about how many slots each hook has.  Using it as
+         * the stride picked the wrong struct lsm_static_call whenever the two differ, i.e.
+         * patched a function pointer into another hook's slot (kCFI panic at the next call). */
         if (addr)
             SUSFS_LOGI("lsm_active_cnt = %d (only informational; the table stride is %d)\n",
                     (int)*(u32 *)addr, (int)KSU_LSM_SLOTS_PER_HOOK);
