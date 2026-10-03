@@ -306,7 +306,7 @@ jobs:
             if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
           done
           if [ -z "$S" ]; then
-            echo "no vmlinux/System.map in the DDK image, runtime getdents symbol check skipped"
+            echo "no vmlinux/System.map in the DDK image: the getdents symbol check AND the undefined-symbol loader gate are both SKIPPED for $V - that is a gap in this variant's evidence, not a pass"
             exit 0
           fi
           echo "=== symbol source: $S ==="
@@ -351,6 +351,43 @@ jobs:
           done
           [ "$fail" = "0" ] || exit 1
           echo "both getdents wrapper symbols present in $S"
+
+          # ---- loader gate: every undefined symbol of the built .ko must be a name
+          # this tree's kallsyms has.
+          #
+          # The loaders (tools/susfs_insmod.c and ksud insmod) rewrite each SHN_UNDEF
+          # entry of the image to SHN_ABS/<address from /proc/kallsyms> before
+          # init_module(2), so a name that is not in kallsyms is an address nothing can
+          # supply: for a strong symbol the module does not load on that kernel at all,
+          # and for a weak one the feature it feeds silently does nothing.  System.map is
+          # generated from the same kallsyms data the loader reads, so this is the
+          # build-time half of "the loader will find it at load time".  The >= 6.18
+          # mount-id path depends on the loader in exactly this way - it takes
+          # mnt_id_xa/__xa_alloc/__xa_erase, which are not exported to modules at all.
+          echo "--- every undefined symbol of the .ko must be present in this tree ---"
+          KO="$PWD/kernel/susfs_guard_lkm.ko"
+          if [ ! -f "$KO" ]; then
+            echo "::error::$KO does not exist - the build step must have failed, so its undefined symbols cannot be checked"
+            exit 1
+          fi
+          nm "$KO" | awk '$1 == "U" || $1 == "w" || $1 == "v" { print $NF }' | sort -u > /tmp/undef-syms.txt
+          tu=$(wc -l < /tmp/undef-syms.txt)
+          echo "  undefined symbols in the artifact: $tu"
+          echo "  names: $(tr '\n' ' ' < /tmp/undef-syms.txt)"
+          miss=0
+          while read -r s; do
+            [ -n "$s" ] || continue
+            n=$(sym_count "$s")
+            if [ "$n" = "0" ]; then
+              echo "::error::'$s' is undefined in the module but not present in $S (variant $V) - no loader can supply its address on this kernel"
+              miss=$((miss + 1))
+            fi
+          done < /tmp/undef-syms.txt
+          if [ "$miss" != "0" ]; then
+            echo "::error::$miss undefined symbol(s) of the module are missing from $S (variant $V)"
+            exit 1
+          fi
+          echo "  all $tu undefined symbols are present in $S"
 
       - name: Upload .ko
         uses: actions/upload-artifact@v4

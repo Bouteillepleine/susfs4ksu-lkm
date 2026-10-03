@@ -32,22 +32,29 @@
  * enable time (and at module load) it walks the current mount namespace and
  * rewrites the mnt_id of every mount that looks like one of KernelSU's.
  *
- * The new id is a REAL id taken from the kernel's own mnt_id_ida:
- *   ida_alloc_range(&mnt_id_ida, DEFAULT_KSU_MNT_ID, INT_MAX - 1, GFP_KERNEL)
- * NOT an invented number.  That is not a style choice.  mnt_free_id()
- * (fs/namespace.c:136-139) unconditionally calls ida_free(&mnt_id_ida,
- * mnt->mnt_id) when the mount finally goes away, so a hand-made id makes
- * lib/idr.c:523-525 fire WARN(1, "ida_free called for id=%d which is not
- * allocated.") on umount - and a WARN plus stack dump in dmesg is exactly the
- * kind of trace a root detector greps for, i.e. worse than the feature doing
- * nothing.  Upstream is under the same constraint and short-circuits the free
- * for its fake ids (patch:582-588); mnt_free_id() is static + LTO-inlined on
- * this kernel, so we cannot patch it - owning the id for real is the fix.
+ * The new id is a REAL id taken from the kernel's own allocator for this release,
+ * NOT an invented number:
+ *   < 6.18   ida_alloc_range(&mnt_id_ida, DEFAULT_KSU_MNT_ID, INT_MAX - 1, GFP_KERNEL)
+ *   >= 6.18  __xa_alloc(&mnt_id_xa, &id, NULL, XA_LIMIT(DEFAULT_KSU_MNT_ID, INT_MAX - 1),
+ *                       GFP_KERNEL) under xa_lock()
+ * That is not a style choice.  mnt_free_id() gives the id back to that same allocator
+ * when the mount finally goes away (ida_free() at fs/namespace.c:136-139 on 6.12,
+ * xa_erase() at :240-243 on 6.18), so a hand-made id makes lib/idr.c:523-525 fire
+ * WARN(1, "ida_free called for id=%d which is not allocated.") on umount - and a WARN
+ * plus stack dump in dmesg is exactly the kind of trace a root detector greps for,
+ * i.e. worse than the feature doing nothing.  Upstream is under the same constraint
+ * and short-circuits the free for its fake ids (patch:582-588); mnt_free_id() is
+ * static + LTO-inlined on this kernel, so we cannot patch it - owning the id for real
+ * is the fix.  (6.18's erase has no such check, so the WARN is a < 6.18 concern; what
+ * both share is that the id must not be one the allocator can hand to another mount.)
  *
- * Degradation: if mnt_id_ida / ida_alloc_range / ida_free cannot ALL be
- * resolved, nothing is marked at all.  min_mnt_id then stays false, the feature
- * does nothing, and every missing symbol is named in a pr_warn.  Falling back to
- * a self-made id is deliberately NOT an option (see the WARN above).
+ * Degradation: if the release's allocator symbols cannot ALL be reached, nothing is
+ * marked at all.  min_mnt_id then stays false, the feature does nothing, and every
+ * missing piece is named in a pr_warn.  Falling back to a self-made id is deliberately
+ * NOT an option (see the WARN above).  On 6.18 "reached" includes the loader: the
+ * xarray and its entry points are undefined symbols of the module, filled from
+ * /proc/kallsyms by tools/susfs_insmod.c (or ksud insmod) - see the allocator state
+ * further down.
  *
  * A mount is recognised by either of:
  *   - mnt_devname contains "/data/adb/" (KSU/module bind mounts, whose source is
@@ -125,6 +132,9 @@
                              * version gates below into hard errors when it was missing */
 #include <linux/rbtree.h>   /* >= 6.12: ns->mounts is an rb-tree, not a list */
 #include <linux/rwsem.h>    /* >= 6.12: namespace_sem is a struct rw_semaphore */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#include <linux/xarray.h>   /* >= 6.18: struct xarray + XA_LIMIT()/xa_lock() for mnt_id_xa */
+#endif
 #include "mount.h"      /* fs/mount.h: struct mount + struct mnt_namespace + real_mount() */
 #include "symbol_resolver.h"
 #include "susfs_abi.h"
@@ -188,25 +198,89 @@ module_param_string(su_ctx, param_su_ctx, sizeof(param_su_ctx), 0644);
 
 static u32 su_sid;
 
-/* The kernel's own mount-id allocator, resolved at init:
- *   - mnt_id_ida: `static DEFINE_IDA(mnt_id_ida)` in fs/namespace.c:68 (data
- *     symbol; exactly one definition in the tree);
+/* The kernel's own mount-id allocator, resolved at init.
+ *
+ * < 6.18 (every release this module shipped for up to 6.12):
+ *   - mnt_id_ida: `static DEFINE_IDA(mnt_id_ida)` in fs/namespace.c (6.12:70)
+ *     (data symbol; exactly one definition in the tree);
  *   - ida_alloc_range(): the out-of-line allocator (lib/idr.c:380;
  *     ida_alloc_min() is only a header inline over it, which is why ida_alloc_min
  *     has no kallsyms entry - do not try to resolve that one);
  *   - ida_free(): resolved as a corroborating check only.  We never call it: the
  *     paired free is done by the kernel itself in mnt_free_id()
- *     (fs/namespace.c:136-139) when a marked mount is finally freed, which is
+ *     (6.12 fs/namespace.c:249-251) when a marked mount is finally freed, which is
  *     exactly what we want (and what keeps the umount path WARN-free).
- * All three must be present or we refuse to mark anything (fail closed). */
+ *
+ * >= 6.18 (android17-6.18): that ida is GONE - fs/namespace.c:79 is
+ * `static DEFINE_XARRAY_FLAGS(mnt_id_xa, XA_FLAGS_ALLOC);`, mnt_alloc_id() is
+ * `xa_lock(); __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt, XA_LIMIT(1, INT_MAX),
+ * GFP_KERNEL); xa_unlock();` (:228-238) and mnt_free_id() is
+ * `xa_erase(&mnt_id_xa, mnt->mnt_id);` (:240-243).  Two consequences:
+ *   - the ida_free() WARN rationale above no longer applies: the erase is by index
+ *     and has no "not allocated" check.  What still applies is that the index must be
+ *     one the allocator will not hand to another mount (so the id is genuinely
+ *     OURS) and that the kernel erases it itself when the mount dies - we never free
+ *     a used id;
+ *   - there is no usable export for that allocator, and `mnt_id_xa` is file-static,
+ *     so the addresses come from kallsyms by name: see the extern block below for how
+ *     they reach the module.
+ *
+ * Both spellings must be fully present or we refuse to mark anything (fail closed). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+static struct xarray *sus_mount_mnt_id_xa;
+static int (*pfn_xa_alloc)(struct xarray *xa, u32 *id, void *entry,
+                           struct xa_limit limit, gfp_t gfp);
+static void *(*pfn_xa_erase)(struct xarray *xa, unsigned long index);
+
+/* Where each address came from, for the init log line: "kallsyms" = the in-kernel
+ * name lookup, "loader" = the address the loader wrote into the undefined symbol
+ * below.  A field that came from nowhere keeps the feature refused, and the log says
+ * "none" rather than leaving it to be inferred. */
+static const char *sus_mount_xa_obj_src = "none";
+static const char *sus_mount_xa_alloc_src = "none";
+static const char *sus_mount_xa_erase_src = "none";
+
+/* 6.18 keeps its mount ids in an xarray that no header declares, so these three names
+ * are written out by hand and the module carries them as UNDEFINED ELF SYMBOLS:
+ * tools/susfs_insmod.c rewrites every SHN_UNDEF entry of the image to
+ * st_shndx = SHN_ABS / st_value = <address from /proc/kallsyms> before init_module(2),
+ * so the kernel's SHN_UNDEF branch - export lookup, namespace import, CRC and KMI
+ * checks - is never entered for them.  That is the only way to reach a file-static
+ * object from a module, and it is why the loader (our own, or ksud insmod, which loads
+ * with kallsyms access for the same reason) is required for the 6.18 mount-id path
+ * rather than being a convenience.
+ *
+ * Declared only under this gate on purpose: on an older variant the names do not
+ * exist in the kernel's kallsyms at all, and an undefined symbol the loader cannot
+ * resolve makes the whole module fail to load there.  The CI step "Check the getdents
+ * probe symbols in the DDK tree" asserts the other half of this contract - that every
+ * undefined symbol of the built .ko is present in that tree's System.map/vmlinux.
+ *
+ * `__xa_alloc`/`__xa_erase` are the out-of-line entry points (xa_alloc()/xa_erase()
+ * are header inlines over them in most releases); both are called with xa_lock() held,
+ * exactly like mnt_alloc_id() above, because __xa_alloc() may have to drop and retake
+ * the lock to allocate a node.  The entry passed is NULL: __xa_alloc() turns that into
+ * its own XA_ZERO_ENTRY, and nothing in the kernel ever loads an entry back out of
+ * mnt_id_xa (it is file-static, and the only accesses are the alloc and the erase) -
+ * so the id is what we are taking, not the slot's content. */
+extern struct xarray mnt_id_xa;
+extern int __xa_alloc(struct xarray *xa, u32 *id, void *entry,
+                      struct xa_limit limit, gfp_t gfp);
+extern void *__xa_erase(struct xarray *xa, unsigned long index);
+#else
 static struct ida *sus_mount_mnt_id_ida;
 static int (*pfn_ida_alloc_range)(struct ida *ida, unsigned int min,
                                   unsigned int max, gfp_t gfp);
 static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
+#endif
 
 static bool sus_mount_ida_ready(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    return sus_mount_mnt_id_xa && pfn_xa_alloc && pfn_xa_erase;
+#else
     return sus_mount_mnt_id_ida && pfn_ida_alloc_range && pfn_ida_free;
+#endif
 }
 
 /* Resolved kernel symbols.  security_cred_getsecid() is an EXPORT_SYMBOL in
@@ -235,19 +309,36 @@ static __nocfi bool sus_mount_is_su_domain(void)
     return sid == su_sid;
 }
 
-/* Allocate a genuine id in the KSU range out of the kernel's mnt_id_ida.
- * Process context (GFP_KERNEL, may sleep).  Returns the id, or a negative errno
- * (-ENOMEM / -ENOSPC) - never a bogus id. */
+/* Allocate a genuine id in the KSU range out of the kernel's own allocator for this
+ * release.  Process context (GFP_KERNEL, may sleep - __xa_alloc() drops and retakes
+ * the xarray lock when it has to allocate a node).  Returns the id, or a negative
+ * errno (-ENOMEM / -ENOSPC / -EBUSY) - never a bogus id. */
 static __nocfi int sus_mount_ida_alloc(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    struct xa_limit limit = XA_LIMIT((u32)DEFAULT_KSU_MNT_ID, (u32)(INT_MAX - 1));
+    u32 id = 0;
+    int ret;
+
+    xa_lock(sus_mount_mnt_id_xa);
+    ret = pfn_xa_alloc(sus_mount_mnt_id_xa, &id, NULL, limit, GFP_KERNEL);
+    xa_unlock(sus_mount_mnt_id_xa);
+    if (ret)
+        return ret;
+    return (int)id;
+#else
     return pfn_ida_alloc_range(sus_mount_mnt_id_ida,
                                (unsigned int)DEFAULT_KSU_MNT_ID,
                                (unsigned int)(INT_MAX - 1), GFP_KERNEL);
+#endif
 }
 
-/* Hand an unused id back to the same ida it came from.  MUST go through a
- * __nocfi function, like every other call this module makes through a resolved
- * kernel symbol: an indirect call from a normally-instrumented function is
+/* Hand an UNUSED id back to the same allocator it came from.  Used ids are never
+ * freed here: the kernel's own mnt_free_id() erases them by index when the mount
+ * dies, which is the pairing both allocators expect.
+ *
+ * MUST go through a __nocfi function, like every other call this module makes through
+ * a resolved kernel symbol: an indirect call from a normally-instrumented function is
  * type-checked by clang CFI, and an out-of-tree module's type hash for a kernel
  * prototype does not match the kernel's own - measured, and expensive to learn:
  *
@@ -258,7 +349,13 @@ static __nocfi int sus_mount_ida_alloc(void)
  * side never hit it because sus_mount_ida_alloc() is __nocfi.) */
 static __nocfi void sus_mount_ida_release(int id)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    xa_lock(sus_mount_mnt_id_xa);
+    pfn_xa_erase(sus_mount_mnt_id_xa, (unsigned long)(unsigned int)id);
+    xa_unlock(sus_mount_mnt_id_xa);
+#else
     pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)id);
+#endif
 }
 
 static __nocfi char *sus_mount_d_path(const struct path *path, char *buf, int buflen)
@@ -1488,20 +1585,21 @@ static bool sus_mount_path_is_ours(const char *s)
  *     (fs/namespace.c:1144-1145), so a stale pointer picked up here cannot be
  *     reused under us.
  *
- * ID ALLOCATION happens BEFORE the lock, in a small batch: ida_alloc_range() with
- * GFP_KERNEL may allocate a radix node and therefore sleep, and this loop runs
- * with a spinlock held.  A batch that is not fully used is handed back to the ida
- * afterwards (allocated and freed through the same ida, so the pairing the kernel
- * expects stays intact).
+ * ID ALLOCATION happens BEFORE the lock, in a small batch, and outside the
+ * rcu_read_lock() of the walk: the allocator may sleep (ida_alloc_range() with
+ * GFP_KERNEL takes an idr lock and may allocate a radix node; on >= 6.18
+ * __xa_alloc() drops and retakes the xarray lock for the same reason), and this loop
+ * ends up with a spinlock held on < 6.12 and under rcu_read_lock() on >= 6.12.  A
+ * batch that is not fully used is handed back to the allocator afterwards (allocated
+ * and freed through the same allocator, so the pairing the kernel expects stays
+ * intact).
  *
  * >= 6.12 replaces all of that with namespace_sem plus an rb-tree; the walk itself
  * and the version difference are spelled out at SUS_MOUNT_ITER_FOR() above - the
  * short version is that the lock is namespace_sem for read (taken first, because it
  * may sleep) and the "still there" guarantee comes from holding it, not from RCU.
- * Note also that 6.18 moved the mount ids themselves from mnt_id_ida to an xarray
- * (mnt_id_xa), so id ownership on 6.18 is a separate, still-open gap - the scan
- * reports it as "mnt_id_ida not found" and marks nothing rather than inventing an
- * id. */
+ * The id source is version-split as well (mnt_id_ida < 6.18, mnt_id_xa >= 6.18) and
+ * is documented at the allocator state above. */
 #define SUS_MOUNT_ID_BATCH 8
 
 /* ---- control surface: which mounts are ours ---- */
@@ -1949,11 +2047,16 @@ static int sus_mount_mark_ksu_mounts(void)
     unsigned long min;
     int marked;
 
-    /* Fail closed: without all three symbols we cannot own a real id, and a
-     * self-made id would leave an ida_free WARN behind on umount. */
+    /* Fail closed: without the release's full allocator we cannot own a real id, and a
+     * self-made id would leave an ida_free WARN behind on umount (< 6.18). */
     if (!sus_mount_ida_ready()) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+        pr_warn("sus_mount: NOT marking: mnt_id_xa=%s __xa_alloc=%s __xa_erase=%s must all be supplied; min_mnt_id stays false, so the feature does nothing\n",
+                sus_mount_xa_obj_src, sus_mount_xa_alloc_src, sus_mount_xa_erase_src);
+#else
         pr_warn("sus_mount: NOT marking: mnt_id_ida=%d ida_alloc_range=%d ida_free=%d must all resolve; min_mnt_id stays false, so the feature does nothing\n",
                 !!sus_mount_mnt_id_ida, !!pfn_ida_alloc_range, !!pfn_ida_free);
+#endif
         return -ENOSYS;
     }
 
@@ -1995,7 +2098,7 @@ static int sus_mount_mark_ksu_mounts(void)
     kfree(buf);
 
     if (marked > 0)
-        SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu), %d identity record(s) cached\n",
+        SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real ids from the kernel's own mount-id allocator (>= %llu), %d identity record(s) cached\n",
                 marked, DEFAULT_KSU_MNT_ID, READ_ONCE(n_ident));
     else if (marked < 0)
         SUSFS_LOGI("sus_mount: scan refused (%d), nothing marked - the reason is the pr_warn above\n",
@@ -2013,9 +2116,68 @@ int susfs_sus_mount_init(void)
     pfn_security_cred_getsecid =
         (void *)find_kernel_symbol_exact("security_cred_getsecid");
     pfn_d_path = (void *)find_kernel_symbol_exact("d_path");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    /* Two sources per address, in this order, and the log names the one that won:
+     *   1. the in-kernel name lookup (find_kernel_symbol_exact(), needs
+     *      CONFIG_KALLSYMS_ALL for a static data symbol - GKI sets it);
+     *   2. the loader-filled undefined symbol (`mnt_id_xa` and friends above), which
+     *      tools/susfs_insmod.c and ksud insmod rewrite from /proc/kallsyms before
+     *      init_module(2).  This is the source that has to work: 6.18 has no usable
+     *      export for the mount-id allocator, so the loader is what makes the feature
+     *      reachable at all.
+     * When neither supplied an address the pointer stays NULL and the readiness check
+     * refuses - the same fail-closed outcome as before, with the source of every
+     * missing piece named in the log.  A source that disagrees with the other one is
+     * reported too: both are looked up BY NAME, so a disagreement means the name
+     * resolved to two different symbols, which is worth seeing rather than averaging
+     * over.
+     *
+     * The loader addresses are read into locals first: `&symbol` is an undefined
+     * symbol of this module, so it is only known after the loader or the kernel
+     * resolved it, and testing it through a variable keeps the compiler from folding
+     * the test away as "address of an object is never NULL" (-Waddress, which GKI
+     * builds turn into an error). */
+    void *loader_xa = (void *)&mnt_id_xa;
+    void *loader_alloc = (void *)&__xa_alloc;
+    void *loader_erase = (void *)&__xa_erase;
+
+    sus_mount_mnt_id_xa = (struct xarray *)find_kernel_symbol_exact("mnt_id_xa");
+    if (sus_mount_mnt_id_xa) {
+        sus_mount_xa_obj_src = "kallsyms";
+        if (loader_xa && loader_xa != (void *)sus_mount_mnt_id_xa)
+            pr_warn("sus_mount: mnt_id_xa: kallsyms %px != loader %px\n",
+                    sus_mount_mnt_id_xa, loader_xa);
+    } else if (loader_xa) {
+        sus_mount_mnt_id_xa = loader_xa;
+        sus_mount_xa_obj_src = "loader";
+    }
+
+    pfn_xa_alloc = (void *)find_kernel_symbol_exact("__xa_alloc");
+    if (pfn_xa_alloc) {
+        sus_mount_xa_alloc_src = "kallsyms";
+        if (loader_alloc && loader_alloc != (void *)pfn_xa_alloc)
+            pr_warn("sus_mount: __xa_alloc: kallsyms %px != loader %px\n",
+                    (void *)pfn_xa_alloc, loader_alloc);
+    } else if (loader_alloc) {
+        pfn_xa_alloc = loader_alloc;
+        sus_mount_xa_alloc_src = "loader";
+    }
+
+    pfn_xa_erase = (void *)find_kernel_symbol_exact("__xa_erase");
+    if (pfn_xa_erase) {
+        sus_mount_xa_erase_src = "kallsyms";
+        if (loader_erase && loader_erase != (void *)pfn_xa_erase)
+            pr_warn("sus_mount: __xa_erase: kallsyms %px != loader %px\n",
+                    (void *)pfn_xa_erase, loader_erase);
+    } else if (loader_erase) {
+        pfn_xa_erase = loader_erase;
+        sus_mount_xa_erase_src = "loader";
+    }
+#else
     sus_mount_mnt_id_ida = (struct ida *)find_kernel_symbol_exact("mnt_id_ida");
     pfn_ida_alloc_range = (void *)find_kernel_symbol_exact("ida_alloc_range");
     pfn_ida_free = (void *)find_kernel_symbol_exact("ida_free");
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     /* >= 6.12 has no ns_lock: the per-namespace mount collection is an rb-tree and the
      * only lock that makes it walkable is namespace_sem, the same one the kernel's own
@@ -2047,12 +2209,23 @@ int susfs_sus_mount_init(void)
         pr_warn("sus_mount: d_path not found - only mnt_devname is checked, meta-overlayfs style mounts will NOT be marked\n");
     /* The id side must own real ids; each missing symbol is named explicitly and
      * only disables the marking (the hook itself can still be installed). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    SUSFS_LOGI("sus_mount: 6.18 mount-id allocator: mnt_id_xa via %s, __xa_alloc via %s, __xa_erase via %s\n",
+            sus_mount_xa_obj_src, sus_mount_xa_alloc_src, sus_mount_xa_erase_src);
+    if (!sus_mount_mnt_id_xa)
+        pr_warn("sus_mount: mnt_id_xa not supplied (neither kallsyms nor the loader has the name) - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+    if (!pfn_xa_alloc)
+        pr_warn("sus_mount: __xa_alloc not supplied - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+    if (!pfn_xa_erase)
+        pr_warn("sus_mount: __xa_erase not supplied - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+#else
     if (!sus_mount_mnt_id_ida)
         pr_warn("sus_mount: mnt_id_ida not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
     if (!pfn_ida_alloc_range)
         pr_warn("sus_mount: ida_alloc_range not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
     if (!pfn_ida_free)
         pr_warn("sus_mount: ida_free not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     if (!sus_mount_namespace_sem)
         pr_warn("sus_mount: namespace_sem not found - the namespace scan will refuse to walk, so KSU mounts will NOT be marked (feature does nothing)\n");
