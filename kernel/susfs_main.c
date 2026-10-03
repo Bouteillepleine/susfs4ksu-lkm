@@ -10,6 +10,9 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling
+				 * below is version-dependent, and nothing else in this
+				 * file's include list pulls version.h in */
 
 #include "symbol_resolver.h"
 #include "susfs_log.h"
@@ -265,9 +268,9 @@ MODULE_LICENSE("GPL");
  * which is why plain insmod failed on the phone before this line existed.
  *
  * The long form must be written out literally: MODULE_IMPORT_NS(ns) stringifies its
- * argument, so passing the macro name ANDROID_GKI_VFS_EXPORT_ONLY would import a
- * namespace that no kernel ever creates.  (Measured on the built .ko: .modinfo carried
- * no import_ns entry at all.)
+ * argument (up to 6.12 - see the version note at the bottom of this comment), so passing
+ * the macro name ANDROID_GKI_VFS_EXPORT_ONLY would import a namespace that no kernel ever
+ * creates.  (Measured on the built .ko: .modinfo carried no import_ns entry at all.)
  *
  * Note this is necessary but NOT sufficient for plain insmod: nine further symbols we
  * reference are not in the kernel's export table in any of the six supported GKI
@@ -275,6 +278,25 @@ MODULE_LICENSE("GPL");
  * __set_fixmap, copy_to_kernel_nofault, dcache_clean_inval_poc), so loading without a
  * helper still needs those to be resolved at runtime.  The userspace loader
  * (tools/susfs_insmod.c) sidesteps the whole question by rewriting undefined symbols to
- * absolute addresses, exactly as KernelSU's ksud does - see README. */
+ * absolute addresses, exactly as KernelSU's ksud does - see README.
+ *
+ * 6.13 changed the SPELLING of that argument ("module: convert symbol namespace to
+ * string literal"): from there on MODULE_IMPORT_NS() does not stringify any more
+ *
+ *   <= 6.12  #define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, __stringify(ns))
+ *   >= 6.13  #define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, ns)
+ *
+ * so the namespace must be a BARE identifier before that and a QUOTED string after it.
+ * Getting it wrong is silent in one direction and a hard error in the other: on <= 6.12 a
+ * quoted string is stringified WITH its quotes and imports a namespace no kernel creates
+ * (the .ko then refuses to load with "uses symbol ... but does not import it"), while on
+ * >= 6.13 a bare identifier is not a string literal at all and does not even compile
+ * ('expected ; after top level declarator' at this line, measured on android17-6.18).
+ * Both spellings emit the same .modinfo entry, and the CI step that fails a .ko with no
+ * import_ns entry is what checks it per variant. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+#else
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
 MODULE_DESCRIPTION("SUSFS guard LKM (susfs_guard_lkm) v2.3.0-gki");

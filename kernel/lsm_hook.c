@@ -362,10 +362,15 @@ static bool ksu_lsm_kptr_plausible(const void *p)
     return (unsigned long)p >= KSU_LSM_KPTR_MIN;
 }
 
-static int ksu_lsm_read_ptr(const void *addr, void **out)
+/* Read one pointer-sized word out of kernel memory without ever faulting.  @out is
+ * intentionally `void *` and not `void **`: the callers pass the address of a TYPED
+ * pointer (&scall->hl, &hl, ...) and C refuses to convert `struct foo **` to `void **`
+ * implicitly (-Wincompatible-pointer-types is an error in this build).  The word is the
+ * same word either way. */
+static int ksu_lsm_read_ptr(const void *addr, void *out)
 {
-    *out = NULL;
-    return (int)copy_from_kernel_nofault(out, addr, sizeof(*out));
+    memset(out, 0, sizeof(void *));
+    return (int)copy_from_kernel_nofault(out, addr, sizeof(void *));
 }
 
 /* Does @name denote the same implementation as @want, allowing the ".clone" suffix a
