@@ -323,6 +323,40 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 #endif
 }
 
+/* The NAME of a function whose address we hold, through the same bootstrapped
+ * kallsyms_lookup() the export check above uses.  The static-call takeover in
+ * lsm_hook.c needs this: it holds the address the kernel registered for SELinux's
+ * slot and has to confirm that it is the implementation of the hook it is about to
+ * take over.  Comparing against a symbol resolved BY NAME would be a weaker test -
+ * with LTO the registered function can be a clone (".constprop.0"), and then the
+ * name-resolved address is a different symbol than the one in the slot.
+ *
+ * Returns the length written into @buf (which must be KSYM_SYMBOL_LEN bytes), or
+ * -ENOSYS when kallsyms_lookup() is not available, -ENOENT when the address cannot be
+ * named.  @module_out, when non-NULL, receives the owning module's name or NULL for a
+ * vmlinux symbol - the caller refuses a module-owned function, same rule as
+ * find_kernel_symbol_exact(). */
+int ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out)
+{
+    char *modname = NULL;
+
+    if (module_out)
+        *module_out = NULL;
+    if (!buf)
+        return -EINVAL;
+    buf[0] = '\0';
+    if (!kallsyms_lookup_fn)
+        return -ENOSYS;
+    if (!addr)
+        return -EINVAL;
+    if (!kallsyms_lookup_fn(addr, NULL, NULL, &modname, buf))
+        return -ENOENT;
+    if (module_out)
+        *module_out = modname;
+
+    return (int)strlen(buf);
+}
+
 void __init ksu_init_symbol_resolver(void)
 {
     int match_ok = 0;
