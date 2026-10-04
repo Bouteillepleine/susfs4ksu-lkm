@@ -225,10 +225,16 @@ static void sus_path_save_caller_cred(void)
         put_cred(old);
 }
 
-static const struct cred *sus_path_override_creds(void)
+/* Returns the cred revert_creds() wants, and stores in @borrowed the reference THIS call took.
+ * get_cred() is what keeps the cred alive for the walk (the table's entry can be replaced
+ * meanwhile), and revert_creds() only puts the reference override_creds() itself took - so
+ * @borrowed has to be put here too, or every pass leaks one cred and pins the registering
+ * process' user_ns/ucounts until the module is unloaded. */
+static const struct cred *sus_path_override_creds(const struct cred **borrowed)
 {
     const struct cred *cred;
 
+    *borrowed = NULL;
     mutex_lock(&sus_path_cred_lock);
     cred = sus_path_pending_cred;
     if (cred)
@@ -237,14 +243,17 @@ static const struct cred *sus_path_override_creds(void)
     if (!cred)
         return NULL;
 
+    *borrowed = cred;
     atomic_inc(&sus_path_used_caller_cred);
     return override_creds(cred);
 }
 
-static void sus_path_revert_creds(const struct cred *saved)
+static void sus_path_revert_creds(const struct cred *saved, const struct cred *borrowed)
 {
     if (saved)
         revert_creds(saved);
+    if (borrowed)
+        put_cred(borrowed);
 }
 
 static void sus_path_drop_caller_cred(void)
@@ -415,6 +424,7 @@ static int sus_path_resolve_pending(void)
         struct sus_path_entry *e, *slot;
         struct inode *inode = NULL;
         const struct cred *saved;
+        const struct cred *borrowed = NULL;
         struct path p;
         char name[NAME_MAX + 1];
         bool published = false;
@@ -440,9 +450,9 @@ static int sus_path_resolve_pending(void)
         /* Exempt THIS task only, for the walk's duration, and undo it immediately
          * whatever the walk answers - every other process stays hidden throughout. */
         WRITE_ONCE(sus_path_resolver, current);
-        saved = sus_path_override_creds();
+        saved = sus_path_override_creds(&borrowed);
         rc = kern_path(path, LOOKUP_FOLLOW, &p);
-        sus_path_revert_creds(saved);
+        sus_path_revert_creds(saved, borrowed);
         WRITE_ONCE(sus_path_resolver, NULL);
 
         atomic_set(&sus_path_pend_last_rc, rc);
@@ -485,18 +495,19 @@ static int sus_path_resolve_pending(void)
             atomic_dec(&sus_path_n_pending);
             resolved++;
             published = true;
+            /* Relax INSIDE the section that owns `slot`.  `slot` is a raw pointer into the
+             * table, and sus_path_command()'s del/clear list_del() an entry under this lock
+             * but iput()+kfree() it OUTSIDE it and without sus_path_pending_lock, so
+             * touching `slot` after the unlock is a use-after-free write into freed memory
+             * (and into the freed entry's inode pointer with it).  The inode is ihold'ed
+             * here, so relaxing it needs no further lifetime argument. */
+            sus_path_relax_mode(slot);
         }
         spin_unlock(&sus_path_lock);
 
         if (inode) {
             iput(inode);                /* the rule is gone, or already resolved */
-        } else if (slot && published) {
-            /* Relaxed outside the lock: the inode is published and ihold'ed now, so it
-             * cannot go away under us. */
-            spin_lock(&sus_path_lock);
-            sus_path_relax_mode(slot);
-            spin_unlock(&sus_path_lock);
-        } else if (!rc) {
+        } else if (!published && !rc) {
             atomic_inc(&sus_path_pend_lost);    /* walk ok, nothing to publish */
         }
     }
