@@ -528,15 +528,23 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 
 /* AArch32 (compat) statbuf layouts.  There are TWO, and which one a syscall fills is decided by
  * its NUMBER, not by the caller being 32-bit:
- *   __NR_fstatat64 327, __NR_fstat64 197 -> struct stat64 (arch/arm64/include/asm/stat.h), filled
- *       by cp_new_stat64() via SYSCALL_DEFINE4(fstatat64,...) (fs/stat.c, __ARCH_WANT_COMPAT_STAT64);
- *       this struct is NOT struct compat_stat.
+ *   __NR_stat64 195, __NR_lstat64 196, __NR_fstat64 197, __NR_fstatat64 327 -> struct stat64
+ *       (arch/arm64/include/asm/stat.h), filled by cp_new_stat64() via SYSCALL_DEFINE2(stat64)/
+ *       (lstat64)/(fstat64) and SYSCALL_DEFINE4(fstatat64) (fs/stat.c, __ARCH_WANT_COMPAT_STAT64);
+ *       this struct is NOT struct compat_stat.  All four are handled below (the first three keep
+ *       statbuf in args[1], fstatat64 in args[2]).
  *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108 -> struct compat_stat
- *       (arch/arm64/include/asm/compat.h) via cp_compat_stat(); this tree's unistd32.h maps none of
- *       them, so nothing reaches them here.  They are listed so nobody concludes "compat =
- *       compat_stat" and wires the wrong offsets - which is what this code used to do: st_ino was
- *       read at +4, the HIGH half of st_dev in stat64 and always 0, so the lookup could never match
- *       (a match would have written into st_dev/st_rdev).
+ *       (arch/arm64/include/asm/compat.h) via cp_compat_stat().  They ARE mapped in this tree's
+ *       arch/arm64/include/asm/unistd32.h (106 -> compat_sys_newstat, 107 -> newlstat, 108 ->
+ *       newfstat), and an earlier note here claimed the opposite, so a 32-bit caller using
+ *       stat()/lstat()/fstat() gets the real numbers while its stat64()/fstat64() are spoofed - a
+ *       one-call oracle.  Wiring them needs their own struct compat_stat offsets (st_dev+0, st_ino+4,
+ *       st_nlink+10, st_size+20, st_blksize+24, st_blocks+28, atime+32/36, mtime+40/44, ctime+48/52),
+ *       which is not a copy of the table below, so it stays a separate change rather than half-done
+ *       here.  They are listed so nobody concludes "compat = compat_stat" and wires the wrong
+ *       offsets - which is what this code used to do: st_ino was read at +4, the HIGH half of st_dev
+ *       in stat64 and always 0, so the lookup could never match (a match would have written into
+ *       st_dev/st_rdev).
  *
  * ALIGNMENT (these numbers were established twice): compat_u64/compat_s64 are
  * __attribute__((aligned(4))) only when CONFIG_COMPAT_FOR_U64_ALIGNMENT is set
@@ -547,7 +555,7 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
  * size=25769803776 = 6 << 32 (low half from padding, high half from the value).  The offsets below
  * are what that client and the kernel agree on. */
 #define STAT64_ST_DEV_OFF       0	/* compat_u64 */
-#define STAT64_ST_BROKEN_INO_OFF 12	/* compat_ulong_t __st_ino (what is filled) */
+#define STAT64_ST_BROKEN_INO_OFF 12	/* compat_ulong_t __st_ino (one of the two ino fields) */
 #define STAT64_ST_NLINK_OFF     20	/* compat_uint_t */
 #define STAT64_ST_SIZE_OFF      48	/* compat_s64 */
 #define STAT64_ST_BLKSIZE_OFF   56	/* compat_ulong_t */
@@ -558,14 +566,17 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 #define STAT64_ST_MTIME_NSEC_OFF 84
 #define STAT64_ST_CTIME_OFF     88
 #define STAT64_ST_CTIME_NSEC_OFF 92
-#define STAT64_ST_INO_OFF       96	/* compat_u64 (unfilled: STAT64_HAS_BROKEN_ST_INO) */
+#define STAT64_ST_INO_OFF       96	/* compat_u64 st_ino (also written; the KEY is read from +12) */
 #define STAT64_ST_SIZE          104
 
-/* ARM EABI syscall numbers that fill struct stat64. */
+/* ARM EABI syscall numbers that fill struct stat64 (arch/arm64/include/asm/unistd32.h; the
+ * statbuf argument position is from fs/stat.c's COMPAT_SYSCALL_DEFINE2/4). */
 #define COMPAT_FSTATAT64_NR	327	/* fstatat64(dfd, path, statbuf, flag) */
+#define COMPAT_STAT64_NR	195	/* stat64(path, statbuf) */
+#define COMPAT_LSTAT64_NR	196	/* lstat64(path, statbuf) */
 #define COMPAT_FSTAT64_NR	197	/* fstat64(fd, statbuf) */
 
-/* compat (32-bit) statbuf: struct stat64 (see above) - the layout both handled syscalls use. */
+/* compat (32-bit) statbuf: struct stat64 (see above) - the layout all four handled syscalls use. */
 static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 {
 	struct sus_kstat_snapshot snap;
@@ -674,10 +685,18 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	 * inside each branch: fstat64(fd, statbuf) keeps it in args[1], and checking args[2] first
 	 * made every 32-bit fstat64() return early - the rule applied to fstatat64, not to fstat64. */
 	if (is_compat_task()) {
-		if (nr == COMPAT_FSTATAT64_NR)
+		switch (nr) {
+		case COMPAT_FSTATAT64_NR:
 			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[2]));
-		else if (nr == COMPAT_FSTAT64_NR)
+			break;
+		/* stat64/lstat64/fstat64: all three keep statbuf in args[1], and all three fill the
+		 * same struct stat64 this helper expects. */
+		case COMPAT_STAT64_NR:
+		case COMPAT_LSTAT64_NR:
+		case COMPAT_FSTAT64_NR:
 			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[1]));
+			break;
+		}
 	} else {
 		if (nr != __NR_newfstatat)
 			return;

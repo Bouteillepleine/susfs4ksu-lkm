@@ -49,6 +49,8 @@ typedef unsigned int u32;
 #define SYS_lseek 19
 #define __NR_fstatat64 327
 #define __NR_fstat64 197
+#define __NR_stat64 195
+#define __NR_lstat64 196
 #define AT_FDCWD (-100)
 
 struct stat64_compat {
@@ -322,6 +324,17 @@ void compat_main(long argc, char **argv)
 
 	rc = sys4(__NR_fstatat64, AT_FDCWD, (long)path, (long)&st, 0);
 	show("fstatat64", rc);
+
+	/* stat64/lstat64 take the path (and fstat64 the fd) with statbuf in the SECOND argument -
+	 * the same struct stat64 the two calls above fill.  Without these three the client could
+	 * not see that the kstat layer's compat dispatch used to handle only 327/197: a 32-bit
+	 * caller's stat64()/lstat64()/fstat64() answered with the real ino/dev/size while its
+	 * fstatat64() answered with the spoofed ones. */
+	rc = sys4(__NR_stat64, (long)path, (long)&st, 0, 0);
+	show("stat64   ", rc);
+
+	rc = sys4(__NR_lstat64, (long)path, (long)&st, 0, 0);
+	show("lstat64  ", rc);
 
 	fd = sys4(SYS_open, (long)path, 0, 0, 0);
 	if (fd >= 0) {
