@@ -3,13 +3,8 @@
 # Build against DDK kernel headers (same image that builds kernelsu.ko):
 #   make -C $KDIR M=$PWD ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules
 #
-# SELinux private headers (security.h/ss/*.h/flask.h) are exposed via:
-#   -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
-#   -I$(objtree)/security/selinux        (generated flask.h lives here)
-#
-# Only the shipping module is built.  The probe/test modules that were used while
-# working out the hooks (kernel/*_probe*.c, kernel/ih_*.c, kernel/syscall_test.c)
-# are still in the tree for reference; add them back here if they are ever needed.
+# Only the shipping module is built, and this objs list is the whole of it: the probe/test
+# modules that were used while working the hooks out are not in this tree any more.
 
 obj-m += susfs_guard_lkm.o
 
@@ -21,7 +16,21 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
 
 # 5.14+ replaced __flush_dcache_area/__flush_icache_range with
 # dcache_clean_inval_poc/caches_clean_inval_pou.  Detect which to use.
-KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h; echo $$?)
+#
+# The detection uses `grep -l` (a filename, or nothing) rather than an exit status: the old
+# `grep -q ...; echo $$?` form returned 2 when srctree was empty - and 2 is TRUE in
+# `#if KSU_NEW_DCACHE_FLUSH`, so an unset srctree silently selected the 5.14+ spelling on
+# every kernel and left an undefined dcache_clean_inval_poc in the module.  Fail loudly
+# instead of guessing.
+ifeq ($(srctree),)
+$(error srctree is not set - build this module through kbuild: make -C $(KDIR) M=$(PWD) modules)
+endif
+KSU_HAS_OLD_DCACHE := $(shell grep -l __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h 2>/dev/null)
+ifneq ($(KSU_HAS_OLD_DCACHE),)
+KSU_NEW_DCACHE_FLUSH := 0
+else
+KSU_NEW_DCACHE_FLUSH := 1
+endif
 ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
 
 # Match SukiSU's build flags: upstream code declares after statements and
@@ -33,10 +42,9 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
 # all public, so -I$(srctree)/fs is enough to reach it via #include "mount.h".
 ccflags-y += -I$(srctree)/fs
 
-# SELinux private headers are only needed once selinux hooks are added.
-# Uncomment when the selinux feature lands:
-# ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
-# ccflags-y += -I$(objtree)/security/selinux
+# SELinux private headers are not needed: the LSM layer reaches SELinux through the live
+# security_hook_heads (see kernel/lsm_hook.c), not through ss/ or flask.h, so the -I lines
+# that used to sit here "for when the feature lands" are gone with it.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

@@ -925,6 +925,16 @@ static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *r
         return 0;
     if (!m->buf || !m->count)
         return 0;
+    /* Only fdinfo's own file is rewritten, and above 5.15 this probe sits on ALL FOUR
+     * functions named seq_show (see the note at kr_fdinfo[]): the file being read is
+     * m->file, and /proc/<pid>/fdinfo/<fd> (and .../task/<tid>/fdinfo/<fd>) has a dentry
+     * whose parent is named "fdinfo".  The mnt_id label test below already makes the scan a
+     * no-op for another file, so this only keeps it off other files' buffers. */
+    if (!m->file || !m->file->f_path.dentry || !m->file->f_path.dentry->d_parent ||
+        strcmp(m->file->f_path.dentry->d_parent->d_name.name, "fdinfo") != 0) {
+        atomic_inc(&n_fdinfo_nolabel);
+        return 0;
+    }
     /* The su/ksu domain keeps seeing its own mounts' real ids, exactly like the
      * mount-line skip above. */
     if (sus_mount_is_su_domain())
@@ -939,14 +949,67 @@ static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *r
     return 0;
 }
 
-static struct kretprobe kr_fdinfo = {
-    .kp.symbol_name = "seq_show",		/* fs/proc/fd.c, unique in kallsyms */
-    .entry_handler = sus_mount_fdinfo_entry,
-    .handler = sus_mount_fdinfo_ret,
-    .data_size = sizeof(struct sus_mount_kretprobe_state),
-    .maxactive = 16,
-};
+/* fs/proc/fd.c's fdinfo callback is registered through single_open(file, seq_show, inode), so
+ * no table holds its address - and the name is NOT unique above 5.15: the DDK trees have four
+ * symbols called exactly `seq_show` on android14-6.1 and android15-6.6, and one on 5.10/5.15.
+ * register_kprobe(.symbol_name=...) attaches to whichever kallsyms lists first, which is how the
+ * fdinfo rewrite silently stopped working on those kernels (mountinfo showed the disguised id
+ * while /proc/<pid>/fdinfo/N printed the real one - a one-file oracle).  So: enumerate every
+ * match and hook all of them; the return handler decides by the file it sees, which makes an
+ * unrelated seq_show cost one comparison and change nothing. */
+#define SUS_MOUNT_FDINFO_MAX 8
+
+static struct kretprobe kr_fdinfo[SUS_MOUNT_FDINFO_MAX];
+static int n_fdinfo_probes;
 static bool kr_fdinfo_ok;
+
+static int sus_mount_fdinfo_arm(void)
+{
+    unsigned long addrs[SUS_MOUNT_FDINFO_MAX];
+    int i, n;
+
+    n = ksu_find_symbol_all("seq_show", addrs, SUS_MOUNT_FDINFO_MAX);
+    if (n <= 0) {
+        pr_warn("sus_mount: seq_show not resolved - fdinfo keeps printing the real mnt_id\n");
+        return -ENOENT;
+    }
+    for (i = 0; i < n; i++) {
+        struct kretprobe *kr = &kr_fdinfo[i];
+        int rc;
+
+        kr->kp.addr = (void *)addrs[i];
+        kr->entry_handler = sus_mount_fdinfo_entry;
+        kr->handler = sus_mount_fdinfo_ret;
+        kr->data_size = sizeof(struct sus_mount_kretprobe_state);
+        kr->maxactive = 16;
+        rc = register_kretprobe(kr);
+        if (rc) {
+            pr_warn("sus_mount: register_kretprobe(seq_show @%px) failed %d\n", (void *)addrs[i], rc);
+            kr->kp.addr = NULL;
+            continue;
+        }
+        n_fdinfo_probes++;
+    }
+    if (!n_fdinfo_probes)
+        return -EINVAL;
+    SUSFS_LOGI("sus_mount: fdinfo hooked on %d/%d seq_show symbol(s)\n", n_fdinfo_probes, n);
+    kr_fdinfo_ok = true;
+    return 0;
+}
+
+static void sus_mount_fdinfo_disarm(void)
+{
+    int i;
+
+    for (i = 0; i < SUS_MOUNT_FDINFO_MAX; i++) {
+        if (!kr_fdinfo[i].kp.addr)
+            continue;
+        unregister_kretprobe(&kr_fdinfo[i]);
+        kr_fdinfo[i].kp.addr = NULL;
+    }
+    n_fdinfo_probes = 0;
+    kr_fdinfo_ok = false;
+}
 
 /* ---- statx(2): stx_mnt_id ----
  *
@@ -1098,7 +1161,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "clone: walks=%d learned=%d (probe=%d)\n"
                      "newmount: seen=%d recorded=%d pathfail=%d (probe=%d)\n"
                      "keep: prefixes=%d rescans=%d\n"
-                     "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
+                     "fdinfo: probes=%d entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
                      sus_mount_idmap_live(), n_idmap,
@@ -1116,6 +1179,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_newmnt_seen), atomic_read(&n_newmnt_recorded),
                      atomic_read(&n_newmnt_pathfail), (int)kr_newmnt_ok,
                      n_mount_keep, atomic_read(&n_keep_rescans),
+                     n_fdinfo_probes,
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
                      atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
@@ -1837,10 +1901,8 @@ static void sus_mount_unregister(void)
         sus_mount_show_armed[i] = false;
     }
     n_show_probes = 0;
-    if (kr_fdinfo_ok) {
-        unregister_kretprobe(&kr_fdinfo);
-        kr_fdinfo_ok = false;
-    }
+    if (kr_fdinfo_ok)
+        sus_mount_fdinfo_disarm();
     if (kr_statx_ok) {
         unregister_kretprobe(&kr_statx);
         kr_statx_ok = false;
@@ -1931,11 +1993,9 @@ static int sus_mount_register(void)
      * lines are still hidden, so a missing symbol must not take the rest down -
      * but each failure is named, because it leaves the ids visible in exactly
      * the place upstream rewrites them. */
-    rc = register_kretprobe(&kr_fdinfo);
+    rc = sus_mount_fdinfo_arm();
     if (rc)
-        pr_warn("sus_mount: register_kretprobe(seq_show) failed %d - fdinfo keeps printing the real mnt_id\n", rc);
-    else
-        kr_fdinfo_ok = true;
+        pr_warn("sus_mount: the fdinfo probe could not be armed %d - /proc/<pid>/fdinfo keeps printing the real mnt_id\n", rc);
     rc = register_kretprobe(&kr_statx);
     if (rc) {
         pr_warn("sus_mount: register_kretprobe(__arm64_sys_statx) failed %d - statx keeps returning the real stx_mnt_id\n", rc);
