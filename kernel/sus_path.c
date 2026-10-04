@@ -38,9 +38,8 @@
 #include <linux/namei.h>
 #include <linux/fs.h>
 #include <linux/err.h>
-#include <linux/kprobes.h>
 #include <linux/compat.h>
-#include <linux/workqueue.h>	/* compat_ptr(), for 32-bit callers */
+#include <linux/workqueue.h>	/* the pending-resolution retry timer */
 #include <linux/mutex.h>	/* serialises the first rule's arming */
 #include <linux/limits.h>
 #include <linux/cred.h>
@@ -70,12 +69,20 @@
 /* Longest registered path; 256 matches the ABI's target_pathname field. */
 #define SUS_PATH_LEN 256
 
-/* arm64 compat syscall numbers, spelled out per arch/arm64/include/asm/unistd32.h
- * (asm/unistd.h is unreachable in this build): 217 maps to the NATIVE
- * sys_getdents64, 141 is the separate compat body - only the latter needed its
- * own probe. */
+/* Syscall numbers, spelled out per arch/arm64/include/asm/unistd32.h (asm/unistd.h is
+ * unreachable in this build) and include/uapi/asm-generic/unistd.h (native):
+ *   native   61  __NR_getdents64
+ *   AArch32 217  getdents64 - the SAME native body, so it shares 61's layout
+ *   AArch32 141  getdents   - its own compat body (__arm64_compat_sys_getdents)
+ *   native  106  __NR_getdents: the native unistd table has NO entry for it (see the
+ *                note above sus_path_dirent_filter()), kept only so the dispatcher
+ *                stays honest about which numbers it knows.
+ * The dispatcher that reaches this file is the sys_exit tracepoint in susfs_kstat.c
+ * (kernel/susfs_kstat.c: kstat_sys_exit()), which passes the caller's syscall number. */
 #define __NR_compat_getdents64 217
 #define __NR_compat_getdents 141
+#define __NR_native_getdents64 61
+#define __NR_native_getdents 106
 
 struct linux_dirent64 {
     u64 d_ino;
@@ -1074,11 +1081,10 @@ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int 
     return 0;
 }
 
-/* Every hook below the LSM layer is only worth its cost once something is registered: kprobe
- * entry costs a brk trap per hit.  With no rules there is nothing to answer, so they are armed on
- * the first rule and torn down with the module - the "no rules, no cost" effect of nop'ing a
- * patched call site, but through the kernel's own register/unregister paths instead of hand-written
- * text patching.  The LSM hooks are exempt: pointer swaps, already cost-free. */
+/* The LSM slots go in with the module (pointer swaps, cost-free) and this flag only marks that the
+ * layer as a whole is up, plus the one-time arming the kstat layer reports.  It used to gate the
+ * dirent kretprobes, which are gone: they cost a brk trap per listing, and the rewrite now rides
+ * kstat's already-registered sys_exit tracepoint instead (see above sus_path_dirent_filter()). */
 static bool hooks_armed;
 /* Secondary LSM hooks that could not be registered: the core two are fatal, these only mean one
  * class of operation is uncovered - reported through hide_list as well as the log. */
@@ -1100,17 +1106,21 @@ static DEFINE_MUTEX(sus_path_arm_lock);
  * sys_getdents64, not to a compat one); getdents AArch32 141 -> __arm64_compat_sys_getdents ->
  * __do_compat_sys_getdents.  __do_sys_getdents (the native table has no __NR_getdents) and
  * __arm64_compat_sys_old_readdir ("89 was sys_readdir", no AArch32 entry either) are covered
- * upstream through its fill callbacks but reachable from no table here, so no probe is on them.
+ * upstream through its fill callbacks but reachable from no table here, so nothing is filtered
+ * for them.
  *
- * A global sys_exit tracepoint does the same job - that is what this used to be - but it fires
- * for EVERY syscall and then compares the number: measured 28 ns on calls that have nothing to do
- * with listings (getpid: 113 -> 141 ns), while a kretprobe is paid for only by listings.  The
- * entry handler stashes the caller's buffer because the argument registers are gone by the return
- * handler; for a 32-bit caller the register holds the zero-extended user pointer, which is the
- * address to use as is (the wrapper de-louses it, __SC_DELOUSE in linux/syscalls.h). */
-struct sus_path_dirent_args {
-    unsigned long buf;
-};
+ * WHERE it runs: the ONE global sys_exit tracepoint that kernel/susfs_kstat.c already registers
+ * (kstat_sys_exit()).  Both kernels it was measured on pay for that tracepoint on every syscall
+ * already, so one more number in its whitelist costs one more compare (measured: no
+ * per-syscall change), while the two getdents kretprobes this replaces cost a trap per listing -
+ * measured 906 ns on top of the 23 ns the tracepoint itself adds, i.e. the whole +929 ns the
+ * paired bench used to report for a listing.  A kretprobe also carries maxactive (64 here) and
+ * silently DROPS a return once 64 are nested, which the tracepoint cannot: it is synchronous
+ * with the syscall.
+ *
+ * The tracepoint handler calls sus_path_dirent_filter() below, i.e. this file still owns the
+ * rewrite (the bounce buffer, the per-ABI record layout, the (ino, name) match and the gate);
+ * susfs_kstat.c owns only "which syscall number, which user pointer". */
 
 /* Record layouts: both reachable ABIs are NUL-terminated with an explicit d_reclen, so nothing
  * needs the d_namlen/computed-length variant old_readdir would have needed. */
@@ -1149,207 +1159,97 @@ static const struct sus_dirent_layout sus_dirent_compat = {
 };
 
 /* "Did this ABI reach us at all" is a different claim from "did we hide something": only the pair
- * can tell a dead probe from a working one, and the AArch32 layout is the one a 64-bit test tool
- * cannot exercise. */
+ * can tell a dead path from a working one, and the AArch32 layout is the one a 64-bit test tool
+ * cannot exercise.  Incremented in sus_path_filter() and sus_path_dirent_filter() only, i.e.
+ * AFTER the tracepoint's whitelist has already matched - an ordinary syscall still pays one
+ * add-immediate in the handler and nothing here. */
 static atomic_t n_dirent_calls[SUS_DIRENT_N];
+
+/* Every early-out of this layer, counted per reason: "calls(l64=N) and the entry still showed
+ * up" is otherwise indistinguishable from "nothing was registered", and the reasons have
+ * different fixes (a dead pointer, a full buffer, a rule that does not match, a gate).  Same
+ * reasoning as the kstat per-number counters in susfs_kstat.c. */
+static atomic_t n_dirent_no_filter[SUS_DIRENT_N];   /* sus_path_filter() found no buffer/knows the layout not */
+static atomic_t n_dirent_syscall_bad[SUS_DIRENT_N]; /* return <= 0: error, or an empty listing  */
+static atomic_t n_dirent_buf_null[SUS_DIRENT_N];    /* NULL user buffer: nothing to rewrite      */
+static atomic_t n_dirent_no_rule[SUS_DIRENT_N];     /* count==0 and hide_name unset: nothing to hide */
+
+/* The numbers this layer answers for - the same list the tracepoint whitelists.  Kept as a
+ * function of its own so the log line and the dispatcher cannot drift apart. */
+static const char *sus_path_dirent_abi_name(int lay_id)
+{
+    return lay_id == SUS_DIRENT_COMPAT ? "getdents (AArch32 141)"
+                                       : "getdents64 (native 61 + AArch32 217)";
+}
 
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay);
 
-/* Where the caller's arguments live depends on WHICH name got armed, so the argument style is the
- * only difference between the probes below (the entry handler stashes the buffer in ri->data):
+/* Called by the sys_exit tracepoint in susfs_kstat.c, which is the ONLY caller of this file's
+ * dirent layer now.
  *
- *   SUS_DIRENT_REGSP   the syscall-table wrapper (__arm64_sys_*, __arm64_compat_sys_*) is
- *                      `asmlinkage long f(const struct pt_regs *regs)`: the user arguments are NOT
- *                      in this frame, x0 holds the caller's pt_regs (SC_ARM64_REGS_TO_ARGS) and the
- *                      buffer is that pt_regs' regs[1];
- *   SUS_DIRENT_DIRECT  __do_* / __se_* receive the declared C arguments as an ordinary kernel
- *                      function does, so argument 1 is the buffer.
+ * Contract:
+ *   @syscall_nr  the caller's number (native or AArch32; the tracepoint passes it through)
+ *   @buf         the already-converted USER pointer of the listing buffer (the tracepoint does
+ *                compat_ptr() for a 32-bit caller - a compat pointer is a zero-extended u32 and
+ *                must not be passed raw)
+ *   @ret         the syscall's return value
+ * Return: what the syscall should now return.  @ret itself whenever nothing was filtered, or
+ * when the number is not one this layer handles - so the caller only has to assign it back.
  *
- * The regsp read is the live syscall pt_regs on the kernel stack, so it cannot be NULL for a
- * syscall-table call; the explicit check degrades a surprise to "this call is not filtered" (buf 0,
- * which the return handler skips) instead of oopsing in a kprobe. */
-enum sus_dirent_style {
-    SUS_DIRENT_REGSP = 0,
-    SUS_DIRENT_DIRECT,
-    SUS_DIRENT_STYLE_N,
-};
-
-static unsigned long sus_path_dirent_arg_buf(struct pt_regs *regs, int style)
+ * Non-sleeping, and it must stay that way: it runs in tracepoint context, which is exactly the
+ * constraint the kretprobes it replaces had (see the block above). */
+long sus_path_dirent_filter(long syscall_nr, unsigned long buf, long ret)
 {
-    const struct pt_regs *cregs;
+    if (ret <= 0) {
+        /* -errno, or 0 = end of directory: nothing to filter either way.  A zero return is
+         * normal and constant, so it is counted apart from a negative one. */
+        if (syscall_nr == __NR_native_getdents64 || syscall_nr == __NR_compat_getdents64 ||
+            syscall_nr == __NR_compat_getdents) {
+            int id = (syscall_nr == __NR_compat_getdents) ? SUS_DIRENT_COMPAT : SUS_DIRENT_L64;
 
-    if (style != SUS_DIRENT_REGSP)
-        return regs_get_kernel_argument(regs, 1);
-
-    cregs = (const struct pt_regs *)regs_get_kernel_argument(regs, 0);
-    if (!cregs)
-        return 0;
-    return cregs->regs[1];
-}
-
-/* One kretprobe per (layout, argument style) - four in total - with .kp.symbol_name deliberately
- * left NULL: a kretprobe struct carries exactly one symbol name, so which candidate a struct goes in
- * under is decided at registration time (sus_dirent_candidates[] below).  The return handler has to
- * know its layout, and struct kretprobe_instance has no back-pointer to the probe on 5.15, so layout
- * and style are baked in by the macro. */
-#define SUS_PATH_DIRENT_PROBE(layname, stylename, styleid)                      \
-    static int kr_##layname##_##stylename##_entry(struct kretprobe_instance *ri, \
-                                                  struct pt_regs *regs)        \
-    {                                                                          \
-        struct sus_path_dirent_args *a = (struct sus_path_dirent_args *)ri->data; \
-                                                                               \
-        a->buf = sus_path_dirent_arg_buf(regs, styleid);                        \
-        return 0;                                                              \
-    }                                                                          \
-                                                                               \
-    static int kr_##layname##_##stylename##_ret(struct kretprobe_instance *ri,  \
-                                                struct pt_regs *regs)          \
-    {                                                                          \
-        const struct sus_path_dirent_args *a =                                 \
-            (const struct sus_path_dirent_args *)ri->data;                     \
-        long ret = regs_return_value(regs);                                    \
-                                                                               \
-        if (ret <= 0 || !a->buf)                                               \
-            return 0;                                                          \
-        atomic_inc(&n_dirent_calls[sus_dirent_##layname.id]);                  \
-        if (!READ_ONCE(sus_path_count) && !hide_name[0])                       \
-            return 0;                                                          \
-                                                                               \
-        regs_set_return_value(regs,                                            \
-                              sus_path_filter(a->buf, ret, &sus_dirent_##layname)); \
-        return 0;                                                              \
-    }                                                                          \
-                                                                               \
-    static struct kretprobe krp_##layname##_##stylename = {                    \
-        .entry_handler = kr_##layname##_##stylename##_entry,                   \
-        .handler = kr_##layname##_##stylename##_ret,                           \
-        .data_size = sizeof(struct sus_path_dirent_args),                      \
-        .maxactive = 64,                                                       \
-    }
-
-SUS_PATH_DIRENT_PROBE(l64, regsp, SUS_DIRENT_REGSP);
-SUS_PATH_DIRENT_PROBE(l64, direct, SUS_DIRENT_DIRECT);
-SUS_PATH_DIRENT_PROBE(compat, regsp, SUS_DIRENT_REGSP);
-SUS_PATH_DIRENT_PROBE(compat, direct, SUS_DIRENT_DIRECT);
-
-/* WHICH NAME TO PROBE, and why it is a list rather than one string.
- * arch/arm64/include/asm/syscall_wrapper.h turns __SYSCALL_DEFINEx into three functions:
- * __arm64_sys##name (GLOBAL - the syscall table references it, so it exists in every build),
- * static __se_sys##name (one caller) and static inline __do_sys##name (one caller in the same TU,
- * so clang may inline it away and leave NO symbol); COMPAT_SYSCALL_DEFINEx is the same shape
- * under the compat spelling.
- * MEASURED on the 6.1 device: registering "__do_sys_getdents64" and "__do_compat_sys_getdents"
- * both came back -ENOENT (kallsyms_lookup_name() found no such symbol), which left the dirent
- * layer unarmed there.  The old name still works on the 5.15 device this module is tested on only
- * because that kernel is a vendor build without LTO - and inlining needs no LTO: a single-caller
- * `static inline` is inlined on its own; gki_defconfig also carries CONFIG_LTO_CLANG_FULL=y on
- * android12-5.10 and android13-5.15 (6.1/6.6 have no LTO setting at all), so __do_* is not a name
- * to depend on in any stock GKI build of these releases.
- * So the wrapper is tried FIRST - the only name guaranteed to exist, and arming it on 5.15
- * exercises the exact code path 6.1/6.6 will use (the regs-pointer argument style), which makes
- * the hardware check worth something for the releases that cannot be tested from here.  The
- * direct-style names stay as fallbacks; __se_* is last, because a name that survives only while
- * its single caller was not inlined is the least likely.  filldir/filldir64 are static on every
- * one of these releases (`static bool` on 6.1/6.6, `static int` on 5.10/5.15, fs/readdir.c), so
- * no probe is placed on them either. */
-
-struct sus_dirent_candidate {
-    const char *name;
-    unsigned char style;        /* enum sus_dirent_style */
-};
-
-#define SUS_DIRENT_CAND_N 3
-
-static const struct sus_dirent_candidate
-sus_dirent_candidates[SUS_DIRENT_N][SUS_DIRENT_CAND_N] = {
-    [SUS_DIRENT_L64] = {
-        {"__arm64_sys_getdents64",      SUS_DIRENT_REGSP},
-        {"__do_sys_getdents64",         SUS_DIRENT_DIRECT},
-        {"__se_sys_getdents64",         SUS_DIRENT_DIRECT},
-    },
-    [SUS_DIRENT_COMPAT] = {
-        {"__arm64_compat_sys_getdents", SUS_DIRENT_REGSP},
-        {"__do_compat_sys_getdents",    SUS_DIRENT_DIRECT},
-        {"__se_compat_sys_getdents",    SUS_DIRENT_DIRECT},
-    },
-};
-
-/* Which struct each candidate registers through: one per (layout, argument style), so a
- * candidate is never tried on a struct that is still carrying another name. */
-static struct kretprobe *const sus_dirent_probes[SUS_DIRENT_N][SUS_DIRENT_STYLE_N] = {
-    [SUS_DIRENT_L64]    = {&krp_l64_regsp,    &krp_l64_direct},
-    [SUS_DIRENT_COMPAT] = {&krp_compat_regsp, &krp_compat_direct},
-};
-
-static const char *const sus_dirent_abi_name[SUS_DIRENT_N] = {
-    [SUS_DIRENT_L64]    = "getdents64 (native 61 + AArch32 217)",
-    [SUS_DIRENT_COMPAT] = "getdents (AArch32 141)",
-};
-
-static bool dirent_probe_registered[SUS_DIRENT_N];
-/* The name that actually armed and the struct it armed through: the pair is what the
- * unregister path needs, so exactly the probe that went in is the one that comes out. */
-static const char *dirent_probe_armed_name[SUS_DIRENT_N];
-static struct kretprobe *dirent_probe_armed_kp[SUS_DIRENT_N];
-
-static void sus_path_dirent_register(void)
-{
-    int i, c = 0;
-
-    for (i = 0; i < SUS_DIRENT_N; i++) {
-        char tried[192];
-        size_t off = 0;
-        int j;
-
-        tried[0] = '\0';
-        for (j = 0; j < SUS_DIRENT_CAND_N; j++) {
-            const struct sus_dirent_candidate *cd = &sus_dirent_candidates[i][j];
-            struct kretprobe *p = sus_dirent_probes[i][cd->style];
-            int rc;
-
-            /* addr stays NULL and only the name is set, so each attempt resolves its
-             * own name instead of inheriting a resolved address from an earlier one. */
-            p->kp.symbol_name = cd->name;
-            rc = register_kretprobe(p);
-            off += scnprintf(tried + off, sizeof(tried) - off,
-                             "%s%s rc=%d", off ? ", " : "", cd->name, rc);
-            if (!rc) {
-                dirent_probe_registered[i] = true;
-                dirent_probe_armed_name[i] = cd->name;
-                dirent_probe_armed_kp[i] = p;
-                c++;
-                break;
-            }
+            atomic_inc(&n_dirent_syscall_bad[id]);
         }
-        if (!dirent_probe_registered[i])
-            /* The one thing the LSM slots cannot do: without it a hidden entry shows up in every
-             * listing.  Every candidate tried is named with its rc, so the log says which names
-             * this kernel is missing. */
-            pr_warn("sus_path: kretprobe for %s: every candidate failed (%s) - that ABI's listings are not filtered\n",
-                    sus_dirent_abi_name[i], tried);
+        return ret;
     }
-    if (c)
-        SUSFS_LOGI("sus_path: listing filter armed (%d/%d ABIs: l64=%s compat=%s)\n",
-                   c, (int)SUS_DIRENT_N,
-                   dirent_probe_armed_name[SUS_DIRENT_L64] ?
-                       dirent_probe_armed_name[SUS_DIRENT_L64] : "none",
-                   dirent_probe_armed_name[SUS_DIRENT_COMPAT] ?
-                       dirent_probe_armed_name[SUS_DIRENT_COMPAT] : "none");
+
+    switch (syscall_nr) {
+    case __NR_native_getdents64:
+    case __NR_compat_getdents64:
+        return sus_path_filter(buf, ret, &sus_dirent_l64);
+    case __NR_compat_getdents:
+        return sus_path_filter(buf, ret, &sus_dirent_compat);
+    case __NR_native_getdents:
+        /* No native table entry in this kernel; if one ever appears it is the same record
+         * layout as linux_dirent64. */
+        return sus_path_filter(buf, ret, &sus_dirent_l64);
+    default:
+        return ret;
+    }
 }
 
-static void sus_path_dirent_unregister(void)
+/* One line for the kstat counter block, next to the kstat per-number counters: which listing
+ * ABIs actually reached the filter, and why a listing that should have been filtered was not.
+ * Written with scnprintf so it cannot overrun; the caller passes a PAGE_SIZE buffer. */
+int sus_path_dirent_stat_line(char *buf, size_t size)
 {
-    int i;
-
-    for (i = 0; i < SUS_DIRENT_N; i++) {
-        if (!dirent_probe_registered[i])
-            continue;
-        unregister_kretprobe(dirent_probe_armed_kp[i]);
-        dirent_probe_registered[i] = false;
-        dirent_probe_armed_name[i] = NULL;
-        dirent_probe_armed_kp[i] = NULL;
-    }
+    return scnprintf(buf, size,
+        "  dirent (via the sys_exit tracepoint): l64=%d compat=%d | no-filter(l64=%d compat=%d) "
+        "| bad-ret(l64=%d compat=%d) null-buf(l64=%d compat=%d) "
+        "no-rule(l64=%d compat=%d) rewrite-fail=%d all-hidden=%d pending=%d\n",
+        atomic_read(&n_dirent_calls[SUS_DIRENT_L64]),
+        atomic_read(&n_dirent_calls[SUS_DIRENT_COMPAT]),
+        atomic_read(&n_dirent_no_filter[SUS_DIRENT_L64]),
+        atomic_read(&n_dirent_no_filter[SUS_DIRENT_COMPAT]),
+        atomic_read(&n_dirent_syscall_bad[SUS_DIRENT_L64]),
+        atomic_read(&n_dirent_syscall_bad[SUS_DIRENT_COMPAT]),
+        atomic_read(&n_dirent_buf_null[SUS_DIRENT_L64]),
+        atomic_read(&n_dirent_buf_null[SUS_DIRENT_COMPAT]),
+        atomic_read(&n_dirent_no_rule[SUS_DIRENT_L64]),
+        atomic_read(&n_dirent_no_rule[SUS_DIRENT_COMPAT]),
+        atomic_read(&n_dirent_rewrite_fail),
+        atomic_read(&n_dirent_all_hidden),
+        atomic_read(&sus_path_n_pending));
 }
 
 static void sus_path_hooks_arm(void)
@@ -1365,17 +1265,17 @@ static void sus_path_hooks_arm(void)
     /* Two layers, and neither of them is a syscall entry: the LSM slots (registered with the
      * module above) decide every path-based access by inode - ABI-independent, so 32-bit callers
      * are covered too, and undodgeable through a different spelling, a symlink, a hard link or a
-     * bind mount; the dirent kretprobes do the listing filter, which no LSM hook can do.
+     * bind mount; the dirent rewrite does the listing filter, which no LSM hook can do, and it
+     * rides the ONE sys_exit tracepoint susfs_kstat.c registers (no probe of its own, so there is
+     * nothing to arm here - see the block above sus_path_dirent_filter()).
      * Nothing else is needed: entry-layer hooks matched the caller's path STRING, which the LSM
      * match already covers more thoroughly, and a hook that cannot fire reads as coverage - so
      * those layers are DELETED, not disabled (see the note above sus_path_init()).
      * no_extra is the isolation switch: no LSM, no dirent filter. */
-    if (!no_extra)
-        sus_path_dirent_register();
-    else
+    if (no_extra)
         pr_warn("sus_path: no_extra - dirent filter off\n");
 
-    SUSFS_LOGI("sus_path: hooks armed (LSM + dirent kretprobes)\n");
+    SUSFS_LOGI("sus_path: hooks armed (LSM + dirent rewrite on the shared sys_exit tracepoint)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
 
@@ -1398,6 +1298,26 @@ static long sus_path_filter(unsigned long buf, long count,
     unsigned short head_reclen = 0;     /* first record's length, for the placeholder */
     bool failed = false;
     char *tmp;
+    int id = sus_dirent_l64.id;         /* which ABI's counters to move */
+
+    if (lay == &sus_dirent_compat)
+        id = sus_dirent_compat.id;
+
+    atomic_inc(&n_dirent_calls[id]);
+
+    /* The traced syscall names the buffer, and a NULL one reaches here: getdents64(fd, NULL, n)
+     * is a legal call that answers -EFAULT, so a positive return with a NULL buffer is not
+     * something to rewrite - but it used to be neither filtered nor reported. */
+    if (!buf) {
+        atomic_inc(&n_dirent_buf_null[id]);
+        return count;
+    }
+    /* Nothing registered, nothing to hide (hide_name is the legacy single-name debug switch):
+     * the buffer is left exactly as the kernel wrote it. */
+    if (!READ_ONCE(sus_path_count) && !hide_name[0]) {
+        atomic_inc(&n_dirent_no_rule[id]);
+        return count;
+    }
 
     spin_lock(&sus_path_buf_lock);
 
@@ -1410,6 +1330,7 @@ static long sus_path_filter(unsigned long buf, long count,
     if (!tmp) {
         pagefault_enable();
         spin_unlock(&sus_path_buf_lock);
+        atomic_inc(&n_dirent_no_filter[id]);
         return count;
     }
 
@@ -1735,13 +1656,13 @@ static int sus_path_format_list(char *buf, size_t size)
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
                    atomic_read(&n_enoent_meta));
+    /* The dirent counters moved next to the kstat ones (/proc/susfs_kstat), because the dirent
+     * rewrite is now carried by the tracepoint that file registers: `cat /proc/susfs_kstat` shows
+     * that layer's per-number counters followed by the listing filter's.  What stays here is what
+     * belongs to this table alone - how many rules are waiting for their path. */
     n = sus_path_list_puts(buf, n, &trunc,
-                   "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d  calls(l64=%d compat=%d)\n",
-                   atomic_read(&n_dirent_rewrite_fail),
-                   atomic_read(&n_dirent_all_hidden),
-                   atomic_read(&sus_path_n_pending),
-                   atomic_read(&n_dirent_calls[SUS_DIRENT_L64]),
-                   atomic_read(&n_dirent_calls[SUS_DIRENT_COMPAT]));
+                   "dirent: pending=%d (counters: /proc/susfs_kstat)\n",
+                   atomic_read(&sus_path_n_pending));
     if (n_lsm_ext_fail)
         n = sus_path_list_puts(buf, n, &trunc,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
@@ -2048,9 +1969,12 @@ int sus_path_init(void)
     if (!dirent_tmp)
         pr_warn("sus_path: dirent scratch buffer unavailable, listings will not be filtered\n");
 
-    /* The dirent kretprobes are armed by sus_path_hooks_arm() once a rule exists; with nothing
-     * registered there is nothing to answer, so they cost nothing until then. */
-    SUSFS_LOGI("sus_path: hooks deferred until the first rule\n");
+    /* No probe of our own is registered here any more: the dirent rewrite is called from kstat's
+     * sys_exit tracepoint, which exists from module load on (it is what spoofs stat), so the
+     * rewrite is reachable as soon as this buffer is.  With no rule registered it returns before
+     * touching the buffer, which is the "no rules, no cost" property the kretprobes used to get
+     * from being armed late. */
+    SUSFS_LOGI("sus_path: dirent rewrite rides the shared sys_exit tracepoint (no probe of its own)\n");
 
     if (no_extra) {
         SUSFS_LOGI("sus_path: no_extra=1 - the LSM layer and the dirent filter are OFF (isolation test)\n");
@@ -2153,8 +2077,9 @@ void sus_path_exit(void)
     }
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries (and their inode
-     * references) can be torn down safely.  Only the dirent kretprobes are armed after init. */
-    sus_path_dirent_unregister();
+     * references) can be torn down safely.  The dirent layer needs no teardown of its own: it is
+     * called from kstat's sys_exit tracepoint, which susfs_kstat_exit() unregisters, and kstat's
+     * exit runs after this one (susfs_main.c's layer table teardown order). */
 
     /* The retry timer must be off and no resolution pass may be in flight while the table is
      * emptied below: a pass re-finds its entry under the lock and never frees anything, but it
@@ -2378,7 +2303,8 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
                     info.target_pathname);
     }
 
-    /* First rule: arm the dirent kretprobes.  Idempotent, safe with a rule already in the list. */
+    /* First rule: arm the hooks (the LSM slots are up from init; this is the one that reports
+     * the layer as a whole).  Idempotent, safe with a rule already in the list. */
     sus_path_hooks_arm();
 
     if (!inode) {

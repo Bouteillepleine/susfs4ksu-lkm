@@ -34,6 +34,30 @@ int sus_path_add_self_hidden(const char *path);
  * reference); returns the number of rules removed, so 0 means "was not registered".  Process context only (iput). */
 int sus_path_del_path(const char *path);
 
+/* ---- sus_path's dirent filter, driven by the sys_exit tracepoint in susfs_kstat.c ----
+ *
+ * There is exactly ONE sys_exit tracepoint in this module and it lives in susfs_kstat.c (it is what
+ * spoofs stat).  The listing (getdents) rewrite is called from that handler through these two
+ * functions rather than through a second probe of its own: the tracepoint is paid for on every
+ * syscall already, so a whitelisted number costs one compare, while the two getdents kretprobes
+ * this replaces cost a trap per listing (measured 906 ns) and can silently drop a return once
+ * maxactive is reached.  sus_path.c still owns the whole rewrite (bounce buffer, per-ABI record
+ * layout, (ino, name) match, gate); susfs_kstat.c owns only "which number, which user pointer".
+ *
+ *   sus_path_dirent_filter(@syscall_nr, @buf, @ret)
+ *       @buf  is the ALREADY-converted user pointer (the caller must apply compat_ptr() for a
+ *             32-bit task: a compat pointer is a zero-extended u32 and must not be passed raw)
+ *       @ret  is the syscall's return value
+ *       returns what the syscall should return now - @ret itself when nothing was filtered or the
+ *       number is not one this layer knows, so the caller can always assign the result back.
+ *       Non-sleeping (tracepoint context); takes its own spinlock around the shared scratch buffer.
+ */
+long sus_path_dirent_filter(long syscall_nr, unsigned long buf, long ret);
+
+/* One line of dirent counters for /proc/susfs_kstat's counter block (which ABI reached the filter,
+ * and why a listing that should have been filtered was not).  Returns the bytes written. */
+int sus_path_dirent_stat_line(char *buf, size_t size);
+
 /* The module's own name: the /sys/module directory and the modinfo name are both the module file name, and the self-hide
  * rules and the /proc/modules filter have to agree with it. */
 #define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
