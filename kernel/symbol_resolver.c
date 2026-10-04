@@ -240,8 +240,14 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
  *
  * Module-owned symbols are dropped (they are not the kernel's function of that name), which
  * is the same ownership rule find_kernel_symbol_exact() applies.  Returns the number of
- * addresses written (0 = unknown/not found); the walker paths are bounded by @max. */
-int ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
+ * addresses written (0 = unknown/not found); the walker paths are bounded by @max.  __nocfi
+ * because it calls the walker through a function pointer, like every other resolved-address
+ * call in this file: without it the compiler instruments the call, and under LLVM CFI
+ * (< 6.1) the check runs against the kernel's type hash and panics on the first call -
+ * measured on a 5.15 device: "Kernel panic - not syncing: CFI failure (target:
+ * kallsyms_on_each_symbol+0x0/0x1e4)" with this function inlined into
+ * susfs_sus_mount_supercall (the fdinfo arm is on the mount-enable path). */
+int __nocfi ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
 {
     int n = 0;
 
