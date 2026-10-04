@@ -8,6 +8,7 @@
  * like upstream (a build-time CONFIG there, no runtime toggle).
  */
 #include <linux/module.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE: the kallsym_iter mirror below is version-gated */
 #include <linux/kprobes.h>
 #include <linux/seq_file.h>
 #include <linux/kallsyms.h>
@@ -381,10 +382,20 @@ static const struct proc_ops hide_modules_proc_ops = {
 
 static struct proc_dir_entry *hide_modules_entry;
 
-/* local mirror of kernel/kallsyms.c struct kallsym_iter (layout is KMI-frozen); only the name field matters here. */
+/* Local mirror of kernel/kallsyms.c struct kallsym_iter; only the name field matters here.
+ *
+ * It is a MIRROR, so the compiler cannot check it against the kernel's own struct, and the layout
+ * is not KMI-frozen across the versions this module builds against: v6.5 removed `pos_arch_end`
+ * (measured against upstream: v5.10/v5.15/v6.1 have it, v6.6 does not).  Getting this wrong
+ * shifts `name`/`module_name` by 8 bytes, which makes every prefix and module-name test miss
+ * while all the counters still report "armed" - a silent no-op, not a crash.  Hence the gate
+ * below for the drift that is known, and the plausibility check in hide_syms_s_show_pre() for
+ * the drift that is not. */
 struct kallsym_iter_local {
 	loff_t pos;
-	loff_t pos_arch_end;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+	loff_t pos_arch_end;		/* gone in v6.5 */
+#endif
 	loff_t pos_mod_end;
 	loff_t pos_ftrace_mod_end;
 	loff_t pos_bpf_end;
@@ -425,6 +436,24 @@ static bool name_should_hide(const char *name)
 
 static atomic_t hide_hit_count = ATOMIC_INIT(0);
 static atomic_t hide_enter_count = ATOMIC_INIT(0);
+static atomic_t hide_layout_bad = ATOMIC_INIT(0);
+
+/* Is this really a kernel struct kallsym_iter?  Two facts are always true of one: kallsyms
+ * fills `type` from its own alphabet, and `name` is NUL-terminated within the field.  The check
+ * exists because this kprobe is registered BY NAME and `s_show` is not unique in a kernel that
+ * has kernel/kallsyms.c's and kernel/trace/trace.c's (and mm/vmalloc.c's); if it lands on the
+ * wrong one, m->private is some other object and walking it with strncmp and strstr reads
+ * whatever is there.  With this gate the string walk below is bounded either way, and a
+ * mismatch is counted and reported instead of silently mis-hiding. */
+static bool hide_syms_iter_plausible(const struct kallsym_iter_local *it)
+{
+	if (!it->type || !strchr("aAbBdDgGijNnRrSsTtUuVvWw", it->type))
+		return false;
+	if (strnlen(it->name, sizeof(it->name)) >= sizeof(it->name))
+		return false;
+	/* Empty for a core-kernel symbol, a short module name otherwise - never unterminated. */
+	return strnlen(it->module_name, sizeof(it->module_name)) < sizeof(it->module_name);
+}
 
 /* s_show(m, p): m is arg #1 (regs->regs[0]) */
 static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
@@ -436,6 +465,11 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!m || !m->private)
 		return 0;
 	iter = (struct kallsym_iter_local *)m->private;
+	if (!hide_syms_iter_plausible(iter)) {
+		if (atomic_inc_return(&hide_layout_bad) == 1)
+			pr_err("susfs_hide_syms: m->private does not look like struct kallsym_iter - the kprobe is on another s_show or the mirror drifted; not touching it (symbol hiding is NOT active)\n");
+		return 0;
+	}
 	if (!iter->name[0])
 		return 0;
 
@@ -594,7 +628,8 @@ void susfs_hide_syms_exit(void)
 	/* The /sys/module rules are ours: drop them here, not in sus_path's teardown - this layer cleans up what it registered. */
 	hide_modules_commit(hide_modules_applied, 0);
 	hide_modules_sync_sysfs();
-	SUSFS_LOGI("susfs_hide_syms: exit enter=%d hit=%d (module lines=%d listed modules' syms=%d)\n",
+	SUSFS_LOGI("susfs_hide_syms: exit enter=%d hit=%d layout_bad=%d (module lines=%d listed modules' syms=%d)\n",
 		atomic_read(&hide_enter_count), atomic_read(&hide_hit_count),
+		atomic_read(&hide_layout_bad),
 		atomic_read(&n_modlines_skipped), atomic_read(&n_kallsyms_mod_skipped));
 }

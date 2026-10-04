@@ -27,6 +27,7 @@
 #include <linux/delay.h>
 #include <linux/rcupdate.h>
 #include <linux/string.h>
+#include <linux/version.h>		/* LINUX_VERSION_CODE for the gates below (do not rely on a transitive include) */
 
 #include "symbol_resolver.h"
 #include "lsm_hook.h"
