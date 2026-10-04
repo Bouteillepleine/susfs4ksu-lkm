@@ -1,7 +1,15 @@
 name: build-lkm-ddk
 
 on:
+  # Every push to main (and any other buildable branch) builds all six variants in privileged
+  # containers; the legacy branch has no DDK image for its pre-5.10 range and must not be built
+  # at all.  A documentation-only push has nothing to compile.  (Same trigger the legacy branch
+  # carries; kept in sync deliberately.)
   push:
+    branches-ignore:
+      - legacy
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 jobs:
@@ -324,6 +332,85 @@ jobs:
             exit 1
           fi
           echo "  all $tu undefined symbols are present in $S"
+
+      # The module resolves a SECOND class of symbols BY NAME at runtime
+      # (kernel/symbol_resolver.c: find_kernel_symbol_exact + the kprobe bootstrap).  Those never
+      # appear in the .ko's undefined list, so the loader gate above cannot see them - and a name
+      # that moved, was renamed, or was inlined away in ONE tree silently disables that feature on
+      # that variant only.  Measured on android14-6.1: `__do_sys_getdents64` and
+      # `__do_compat_sys_getdents` are gone there while the wrappers stay, which is exactly why the
+      # dirent layer probes the wrapper first.  This step prints the DDK tree's own answer for every
+      # by-name lookup the module makes, per variant.  The three show_* callbacks are a hard error
+      # (without them /proc/mounts and /proc/self/mountinfo are not filtered at all, i.e. the mount
+      # layer is off on that variant); everything else is reported, because the module degrades
+      # feature-by-feature there.  The >= 6.12 lookups (static_calls_table, lsm_active_cnt,
+      # mnt_id_xa) are not listed: this branch has no 6.12/6.18 job and that code is never built
+      # here.
+      - name: Check the symbols the module resolves by name (DDK tree)
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          S=""
+          for d in "${KDIR:-}" "${KERNEL_SRC:-}" "/opt/ddk/kdir/$V" "/opt/ddk/src/$V" /opt/ddk/kdir/* /opt/ddk/src/*; do
+            if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
+          done
+          if [ -z "$S" ]; then
+            echo "::warning::no vmlinux/System.map for $V - the by-name symbol check is SKIPPED for this variant (a gap in its evidence, not a pass)"
+            exit 0
+          fi
+          sym_count() {
+            _s="$1"; _n=0
+            if [ -f "$S/System.map" ]; then
+              _n=$(grep -cE "(^|[[:space:]])${_s}$" "$S/System.map" 2>/dev/null || true)
+            fi
+            if [ "${_n:-0}" = "0" ] && [ -f "$S/vmlinux" ]; then
+              _n=$(nm "$S/vmlinux" 2>/dev/null | grep -cE "(^|[[:space:]])${_s}$" || true)
+            fi
+            if [ "${_n:-0}" = "0" ] && [ -f "$S/vmlinux" ]; then
+              _n=$(readelf -sW "$S/vmlinux" 2>/dev/null | grep -cE "[[:space:]]${_s}$" || true)
+            fi
+            echo "${_n:-0}"
+          }
+          echo "=== by-name lookups (kernel/symbol_resolver.c, find_kernel_symbol_exact) in $S ==="
+          # --- hard: the mount layer's three show callbacks (/proc/mounts, mountinfo, mountstats)
+          hardmiss=0
+          for s in show_vfsmnt show_mountinfo show_vfsstat; do
+            n=$(sym_count "$s"); printf '  %-34s %s\n' "$s" "$n"
+            if [ "$n" = "0" ]; then
+              echo "::error::$s is not in $S (variant $V): the mount layer hooks it by name per mount line; without it /proc/mounts / mountinfo are not filtered on this kernel"
+              hardmiss=$((hardmiss + 1))
+            fi
+          done
+          # --- reported: everything else the module resolves by name.  A 0 means the feature that
+          #     needs it degrades on this variant (the module logs which one at load).
+          for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
+                   __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
+                   mnt_id_ida ida_alloc_range ida_free namespace_sem \
+                   kallsyms_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
+                   kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
+                   saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
+                   security_hook_heads set_memory_ro set_memory_rw set_memory_x \
+                   aarch64_insn_patch_text text_poke module_alloc \
+                   smaps_walk_ops smaps_shmem_walk_ops pagemap_ops \
+                   dcache_clean_inval_poc caches_clean_inval_pou __flush_dcache_area \
+                   __arm64_sys_getdents64 __arm64_compat_sys_getdents \
+                   __do_sys_getdents64 __do_compat_sys_getdents; do
+            n=$(sym_count "$s"); printf '  %-34s %s\n' "$s" "$n"
+            if [ "$n" = "0" ]; then
+              echo "::warning::$s is not in $S (variant $V) - the feature that resolves it by name cannot arm on this kernel"
+            fi
+            # More than one match is a hazard in itself, not just for the callers that use
+            # .symbol_name: print the neighbours of each match so the log says WHO else is
+            # called that (measured: `seq_show` is four symbols from 6.1 on, one on 5.10/5.15).
+            if [ "$n" -gt 1 ] && [ -f "$S/System.map" ]; then
+              grep -nE "(^|[[:space:]])${s}$" "$S/System.map" | cut -d: -f1 | while read -r _l; do
+                echo "      match at System.map:$_l and its neighbours:"
+                sed -n "$(( _l > 1 ? _l - 1 : 1 )),$(( _l + 1 ))p" "$S/System.map" | sed 's/^/        /'
+              done
+            fi
+          done
+          [ "$hardmiss" = "0" ] || exit 1
+          echo "the three mount show callbacks are present in $S"
 
       - name: Upload .ko
         uses: actions/upload-artifact@v4
