@@ -67,9 +67,8 @@ struct ksu_lsm_hook {
     }
 #endif
 
-/* Runtime patching of existing LSM hook slots (workaround for out-of-tree
- * modules; the normal path is security_add_hooks()).  Coherent via
- * text patching + RCU synchronization. */
+/* Runtime patching of existing LSM hook slots (workaround for out-of-tree modules; the normal
+ * path is security_add_hooks()), made coherent by text patching + RCU synchronization. */
 
 int ksu_lsm_hook(struct ksu_lsm_hook *hook);
 void ksu_lsm_unhook(struct ksu_lsm_hook *hook);

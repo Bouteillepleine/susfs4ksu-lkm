@@ -1,10 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * lsm_hook.c - runtime LSM hook installation (ported from KernelSU/SukiSU
- * hook/lsm_hook.c).
- *
- * Two mechanisms, both writing through ksu_patch_text() because every word they touch
- * lives in read-only-after-init memory:
+ * lsm_hook.c - runtime LSM hook installation (ported from KernelSU/SukiSU hook/lsm_hook.c).
+ * Both mechanisms write through ksu_patch_text(): every word they touch is read-only text, and the
+ * replacement lives in module .text, so a patch has to go through stop_machine.
  *
  *   replace  - find the struct security_hook_list whose function slot equals a symbol
  *              resolved by name and overwrite that slot; the old pointer is kept in
@@ -42,8 +40,7 @@ struct ksu_lsm_hook_entry {
     struct ksu_lsm_hook *hook;
 };
 
-/* Defined below, called from ksu_unregister_lsm_hook() - see its comment for why
- * synchronize_rcu() alone is not enough. */
+/* Defined below; called from ksu_unregister_lsm_hook(). */
 static void ksu_lsm_hook_drain(void);
 
 static DEFINE_MUTEX(ksu_lsm_hook_lock);
@@ -103,40 +100,22 @@ static int ksu_lsm_hook_patch_slot(void **slot, void *value)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 /* ---- insertion into a hook list (hook->insert) -------------------------------
- *
- * security_hook_heads.member is a struct hlist_head and every LSM that implements the
- * hook owns a node in it (SELinux's live in selinux_hooks[] __lsm_ro_after_init, so
- * every write below goes through ksu_patch_text()).  Our node is one member of
- * struct ksu_lsm_hook in module memory and is writable directly - but note that it is
- * only reachable from the kernel's list after the patched write of head->first, so the
- * walk can never observe a half-initialised node.
- */
+ * SELinux's node lives in selinux_hooks[] __lsm_ro_after_init, hence ksu_patch_text()
+ * below; our node is writable and becomes reachable only once head->first is patched, so
+ * no walk can observe a half-initialised node. */
 
-/* Locate the list head for hook->head_name and cross-check it against the kernel's own
- * registration.
- *
- * The address is computed from offsetof(struct security_hook_heads, member), and
- * security_hook_heads is __randomize_layout.  RANDSTRUCT is off in every GKI build this
- * module targets (the CI log prints the struct), so the offset is correct today - but
- * rather than depend on that, the computed value is validated against the entries the
- * kernel itself registered: LSM_HOOK_INIT sets entry->head to the address of the member
- * it was added to, so the first entry found at that address must point back at it.
- *
- * That check is what makes a wrong offset harmless: patching an hlist_head that no LSM
- * call site ever walks would install a hook that is silently never called, which reads
- * exactly like a working layer in every counter.  A mismatch fails the load instead.
- *
- * The heads this module inserts into are non-empty at load time (SELinux registers its
- * table at boot), and the replace path treated "target not found" as a hard error too,
- * so an empty head is -ENOENT rather than a second, unvalidatable code path. */
+/* Locate the list head for hook->head_name and cross-check it: the address is
+ * offsetof(struct security_hook_heads, member), a __randomize_layout struct (RANDSTRUCT is off in
+ * every GKI build this module targets), so LSM_HOOK_INIT's entry->head verifies that the first
+ * entry at that address points back at it.  A wrong offset would otherwise patch an hlist_head no
+ * call site walks - a hook silently never called, which reads like a working layer in every
+ * counter - hence a mismatch fails the load, and an empty head is -ENOENT (as in replace). */
 static int ksu_lsm_hook_head_at(unsigned long heads_addr, struct ksu_lsm_hook *hook,
                                 struct hlist_head **out)
 {
     struct hlist_head *head;
     struct security_hook_list *first;
 
-    /* The offset must land on a whole word inside the array, or the computed address is
-     * not even a head and reading it would be out of bounds. */
     if (hook->head_offset + sizeof(struct hlist_head) > sizeof(struct security_hook_heads)) {
         pr_err("lsm_hook: %s: head offset %#lx is outside security_hook_heads\n",
                 hook->head_name ?: "unknown", (unsigned long)hook->head_offset);
@@ -161,8 +140,7 @@ static int ksu_lsm_hook_head_at(unsigned long heads_addr, struct ksu_lsm_hook *h
     return 0;
 }
 
-/* Insert our node at the head of the (non-empty) list.  Called with the lock held and
- * only after ksu_lsm_hook_head_at() validated the head. */
+/* Insert our node at the head of the list; lock held, head already validated. */
 static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head *head)
 {
     struct security_hook_list *node = &hook->list;
@@ -177,10 +155,8 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
         return -EAGAIN;
     }
 
-    /* Our node: set the hook word through the same offset the slot path uses, so the
-     * per-hook initialiser never has to name the union member itself.  `lsm` is char *
-     * on 5.10/5.15 and const char * on 6.1/6.6 - a plain literal assignment compiles on
-     * both (CI prints the field per variant). */
+    /* Set the hook word through the offset the slot path uses (the per-hook initialiser
+     * need not name the union member); `lsm` is char * on 5.10/5.15, const char * on 6.1. */
     memset(node, 0, sizeof(*node));
     *(void **)((char *)node + hook->hook_offset) = hook->replacement;
     node->head = head;
@@ -188,20 +164,16 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
     node->list.next = first;
     node->list.pprev = &head->first;
 
-    /* 1. head->first, in __lsm_ro_after_init memory.  This is the write that publishes
-     *    the node: everything else it needs is already in place above. */
+    /* 1. head->first, in __lsm_ro_after_init memory: this write publishes the node. */
     ret = ksu_lsm_hook_patch_slot((void **)&head->first, node);
     if (ret)
         return ret;
 
-    /* 2. the displaced node's back pointer, inside selinux_hooks[] (also RO after init).
-     *    The dispatcher's walk only reads ->next, so the chain works without this - it is
-     *    needed so that whoever removes THAT node later (another LSM unloading, or the
-     *    kernel's own hlist_del) does not unlink from a stale pointer into our node. */
+    /* 2. the displaced node's back pointer, inside selinux_hooks[] (also RO after init):
+     *    a later removal of THAT node must not unlink from a stale pointer into ours. */
     ret = ksu_lsm_hook_patch_slot((void **)&first->pprev, &node->list.next);
     if (ret) {
-        /* Roll the publication back: a node that is linked but whose neighbour points at
-         * it the wrong way would corrupt the list on the next removal. */
+        /* Roll back the publication - a wrong-way neighbour corrupts the list. */
         if (ksu_lsm_hook_patch_slot((void **)&head->first, first))
             pr_err("lsm_hook: %s: failed to roll back head->first after a failed insert\n",
                     hook->head_name ?: "unknown");
@@ -216,9 +188,7 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
     return 0;
 }
 
-/* Unlink our node from the head of the list.  hook->list.pprev points either at
- * &head->first or - if something inserted in front of us after we were installed - at the
- * previous node's ->next; both live in memory that only ksu_patch_text() may write. */
+/* Unlink our node; the words it writes live in memory only ksu_patch_text() may touch. */
 static int ksu_lsm_hook_remove_head(struct ksu_lsm_hook *hook)
 {
     struct hlist_node **pprev = hook->list.list.pprev;
@@ -231,21 +201,16 @@ static int ksu_lsm_hook_remove_head(struct ksu_lsm_hook *hook)
         return -EINVAL;
     }
 
-    /* 1. whatever points at us must point at our successor. */
     ret = ksu_lsm_hook_patch_slot((void **)pprev, next);
     if (ret)
         return ret;
 
-    /* 2. the successor must point back at that same slot.  Not needed for the walk (it
-     *    never reads ->pprev), needed so that the removal of THAT node later - by any
-     *    LSM, or by the kernel's own hlist_del - does not write through a pointer into
-     *    this module's memory after the module is gone. */
+    /* 2. the successor's back pointer: not needed for the walk, but a later removal of
+     *    THAT node must not write through a pointer into this module's memory. */
     if (next) {
         ret = ksu_lsm_hook_patch_slot((void **)&next->pprev, pprev);
         if (ret) {
-            /* Our node is already out of the chain; only the successor's back pointer is
-             * stale.  Put the chain back the way it was rather than leave the list in a
-             * state where a later removal writes through our node. */
+            /* Our node is already out; re-link rather than leave a stale back pointer. */
             if (ksu_lsm_hook_patch_slot((void **)pprev, &hook->list.list))
                 pr_err("lsm_hook: %s: failed to re-link our node after a failed unlink\n",
                         hook->head_name ?: "unknown");
@@ -349,9 +314,7 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
 #endif
     }
 
-    /* ---- replace path: find the entry whose function slot holds the resolved symbol.
-     * Everything below is the pre-insertion mechanism, kept for hooks that do not set
-     * hook->insert (and for the 6.12+ static-call dispatch). ---- */
+    /* ---- replace path: find the entry whose function slot holds the resolved symbol. ---- */
     target_name = hook->target_name;
     if (!target_name) {
         pr_err("lsm_hook: hook %s: target_name is required\n", hook->head_name ?: "unknown");
@@ -380,13 +343,10 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     }
 
     if (scalls_count == 0) {
-        /* sym_size is deliberately just sizeof() and not kallsyms_lookup_size_offset(),
-         * for the same reason the <6.12 branch below gives: that symbol is UNEXPORTED in
-         * every GKI tree this module targets, so importing it would make the module
-         * unloadable by a plain `insmod` (unknown symbol) - and it is the fifth name the
-         * "Verify sections" CI step now refuses in the .ko's undefined list.  It is also
-         * the same number: static_calls_table IS one struct lsm_static_calls_table, and
-         * the fallback when the lookup failed was already this struct size. */
+        /* sym_size is sizeof() and not kallsyms_lookup_size_offset(): that symbol is UNEXPORTED
+         * in every GKI tree this module targets, so importing it makes the module unloadable by
+         * a plain `insmod` (unknown symbol) - it is the fifth name the "Verify sections" CI step
+         * refuses in the .ko's undefined list - and the number is the same either way. */
         unsigned long sym_size = sizeof(struct lsm_static_calls_table);
         u32 lsm_active_cnt = 5;
         unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");
@@ -565,7 +525,6 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
                     ret = -EINVAL;
                     goto out_unlock;
                 }
-                /* just check if already hooked */
                 hlist_for_each_entry (entry, head, list) {
                     void **slot = (void **)((char *)entry + hook->hook_offset);
                     void *current_origin = READ_ONCE(*slot);
@@ -663,11 +622,8 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     }
 
     if (hook->entry == &hook->list) {
-        /* Our own struct security_hook_list node is in the list: either a hook->insert
-         * node, or (legacy) a replace-mode hook that found its head empty.  Both are
-         * unlinked the same way - the general hlist removal through hook->list.pprev,
-         * which is &head->first for a node at the head, so the old code's
-         * "head->first = NULL" falls out of it. */
+        /* Our own security_hook_list node is in the list: an insert node, or (legacy) a
+         * replace-mode hook that found its head empty; both unlink through list.pprev. */
         if (ksu_lsm_hook_remove_head(hook)) {
             mutex_unlock(&ksu_lsm_hook_lock);
             return;
@@ -691,31 +647,20 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
 #endif
     mutex_unlock(&ksu_lsm_hook_lock);
 
-    /* Drained AFTER the lock is released.  The wait is unbounded by nature
-     * (synchronize_rcu_tasks() waits for every task to reach a quiescent state, and
-     * the fallback is a 50 ms sleep), and holding ksu_lsm_hook_lock across it
-     * serialised every other hook operation behind this one - including the rollback
-     * of a failed load.  The node/slot is already unlinked above, so nothing can newly
-     * enter the replacement function while we wait.  It stays on the removal path for
-     * the insert case as much as for the slot case: the dispatcher's walk is not an
-     * RCU read-side section (see ksu_lsm_hook_drain()), and a task can be inside our
-     * replacement - reached through the very node that was just unlinked - when the
-     * module text goes away. */
+    /* Drained after the lock is released: the wait is unbounded (a quiescent state for every
+     * task, or the 50 ms fallback) and holding ksu_lsm_hook_lock across it serialises every
+     * other hook operation, while the node/slot is already unlinked above and only a task
+     * already inside the replacement can still be there. */
     ksu_lsm_hook_drain();
 }
 
 /* Wait until nothing can still be inside a replacement function.
- *
- * synchronize_rcu() is not enough here: the LSM call sites walk their hook list
- * with a plain hlist_for_each_entry (security/security.c), so they are not RCU
- * read-side sections and a task that is already executing our replacement is
- * invisible to that barrier.  It can still be there when the module text is
- * unmapped, which is a use-after-free on the next instruction.
- *
- * synchronize_rcu_tasks() waits for every task to pass through a context switch,
- * which does cover it.  The symbol is resolved at runtime and called through a
- * __nocfi wrapper (kCFI checks the type hash at such a call sites); if it cannot
- * be resolved, a delay is the fallback, and synchronize_rcu() still runs. */
+ * synchronize_rcu() is not enough: the LSM call sites walk their hook list with a plain
+ * hlist_for_each_entry (security/security.c), not through an RCU read-side section, so a task already
+ * inside the replacement is invisible to that barrier and would still be there when the module text is
+ * unmapped - a use-after-free on the next instruction.  synchronize_rcu_tasks() waits for every task to
+ * pass a context switch, which does cover it; it is resolved at runtime and reached through a __nocfi
+ * wrapper (kCFI checks the type hash at the call site), with a 50 ms delay if it cannot be resolved. */
 static void (*ksu_lsm_sync_rcu_tasks_fn)(void);
 static bool ksu_lsm_sync_looked_up;
 
@@ -730,8 +675,7 @@ static void ksu_lsm_hook_drain(void)
         ksu_lsm_sync_rcu_tasks_fn =
             (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
         if (ksu_lsm_sync_rcu_tasks_fn) {
-            /* Cache SUCCESS only: caching a failure keeps the 50 ms fallback forever,
-             * even on a kernel where the symbol would have been found later. */
+            /* Cache SUCCESS only - caching a failure keeps the 50 ms fallback forever. */
             ksu_lsm_sync_looked_up = true;
         } else {
             pr_warn("lsm_hook: synchronize_rcu_tasks not found, using a delay\n");
@@ -755,11 +699,8 @@ void ksu_unregister_lsm_hook(struct ksu_lsm_hook *hook)
     ksu_lsm_unhook(hook);
 }
 
-/* No __init/__exit annotation on these two, on purpose: the module's layer table
- * (susfs_main.c) holds their addresses and calls the exit from the rollback path of
- * a FAILED load, i.e. from plain .text.  Keeping them in the init/exit sections
- * would make the table hold a pointer into a section modpost reports as a mismatch
- * and the kernel frees after a successful load.  They are a few dozen bytes. */
+/* No __init/__exit annotation on these two on purpose: the layer table (susfs_main.c) holds their
+ * addresses and calls the exit from the rollback path of a FAILED load, i.e. from plain .text. */
 void ksu_lsm_hook_init(void)
 {
     SUSFS_LOGI("lsm_hook: init, tracked hooks=%d\n", READ_ONCE(ksu_lsm_hook_count));

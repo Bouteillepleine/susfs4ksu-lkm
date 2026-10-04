@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * susfs_uname.c - spoof uname release/version (SUSFS SPOOF_UNAME feature).
- *
- * Upstream SUSFS patches the body of SYSCALL_DEFINE1(newuname) between the
- * memcpy(utsname) and copy_to_user.  The LKM equivalent hooks
- * __arm64_sys_newuname with a kretprobe and rewrites the release/version
- * fields of the user buffer right before the syscall returns.
- *
- * The target pages were just faulted-in by the original copy_to_user, so the
- * kretprobe handler's copy_to_user cannot fault (no sleep in atomic context).
- *
- * Upstream semantics: spoofing is OFF by default (static key false, empty
- * buffer).  It is enabled only when CMD_SUSFS_SET_UNAME is issued, with the
- * caller passing the release/version strings; passing "default" copies the
- * device's CURRENT utsname()->release/version at runtime instead of a
- * hardcoded value.  The kretprobe is therefore registered lazily on first
- * enable, so a loaded-but-unused module costs nothing on the uname hot path.
+ * susfs_uname.c - spoof uname release/version (SUSFS SPOOF_UNAME).  Upstream patches the body of
+ * SYSCALL_DEFINE1(newuname) between the memcpy(utsname) and copy_to_user; the LKM equivalent hooks
+ * __arm64_sys_newuname with a kretprobe and rewrites the release/version fields of the user buffer just before
+ * the syscall returns - the target pages were just faulted in by the original copy_to_user, so the handler's
+ * copy_to_user cannot fault, and "default" copies the device's CURRENT utsname()->release/version at runtime.
+ * Upstream semantics: OFF by default, enabled by CMD_SUSFS_SET_UNAME alone, kretprobe registered lazily.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -112,7 +102,6 @@ static void uname_unregister(void)
 
 int susfs_uname_init(void)
 {
-    /* only arm on explicit insmod override (release+version+enabled) */
     if (uname_spoof_enabled && fake_release[0] && fake_version[0]) {
         int rc = uname_register();
 
@@ -144,8 +133,7 @@ void susfs_uname_supercall(void __user **arg)
         info.err = -EINVAL;
         goto out;
     }
-    /* char[65] ABI fields the caller need not terminate; strcmp() below and
-     * strscpy() after it would both run past the end if they are not. */
+    /* char[65] ABI fields the caller need not terminate; strcmp() and strscpy() below would run past the end. */
     if (!susfs_abi_path_ok(info.release, sizeof(info.release)) ||
         !susfs_abi_path_ok(info.version, sizeof(info.version))) {
         info.err = -ENAMETOOLONG;

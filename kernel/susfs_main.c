@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * susfs_main.c - SUSFS LKM entry point.
- *
- * Skeleton only for now.  Feature code (sus_path / sus_kstat / sus_map /
- * open_redirect / avc spoofing / uname spoofing) is added incrementally.
- *
- * Loaded via `ksud insmod` (unexported symbols are relocated via kallsyms).
+ * susfs_main.c - SUSFS LKM entry point: the layer table plus this module's control nodes.
+ * Loaded via `ksud insmod`, with unexported symbols relocated via kallsyms.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -18,68 +14,41 @@
 
 #define SUSFS_LKM_VERSION "2.3.0-gki"
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
- * the directory under /sys/module and the rules that hide it have to agree with what
- * the kernel derives from the module file name, and the hide_module feature in
- * susfs_hide_syms.c needs the same spelling. */
+ * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree. */
 
 /* The /proc/susfs_* control nodes are created by default and are 0777 on purpose.
- *
- * An earlier revision created them 0600 and had them hidden by sus_path.  Measured
- * on device, that does not work:
- *   ls -l /proc/susfs_kstat -> No such file or directory   (sus_path inode_getattr fired)
- *   cat  /proc/susfs_kstat -> Permission denied            (it did NOT)
- * and the sus_path perm counter stayed at 0.  Reason: inode_permission() runs the
- * DAC check BEFORE security_inode_permission(), so a 0600 root-owned node fails DAC
- * first and the LSM hook is never reached - the caller gets EACCES, which advertises
- * that the node exists.
- *
- * That is a general property of sus_path's path layer, not specific to these nodes:
- * it can only turn an ENOENT-shaped answer out of files DAC would have ALLOWED
- * (which is why a 0644 file like /data/local/tmp/susfs.ko works and a 0600 one does
- * not).  Hence 0777: DAC passes, and the LSM layer is the only thing that answers -
- * ENOENT for every non-root caller.
- *
- * Two consequences, both deliberate:
- *   - the nodes exist only when the LSM layer that hides them is installed
- *     (susfs_control_node_allowed()), so an unprotected world-writable node cannot
- *     happen;
- *   - "readable/writable by root only" is enforced by the handlers' uid checks, not
- *     by the mode.
- * expose_proc=0 removes the nodes entirely for operators who want nothing under
- * /proc at all. */
+ * Measured on device, 0600 plus sus_path hiding does not work: `ls -l /proc/susfs_kstat`
+ * -> ENOENT (the inode_getattr hook fired) but `cat` -> Permission denied (it did not), with
+ * sus_path's perm counter stuck at 0 - inode_permission() runs the DAC check BEFORE
+ * security_inode_permission(), so a 0600 root-owned node fails DAC first, the LSM hook is
+ * never reached, and EACCES advertises that the node exists.  General to sus_path's path
+ * layer: it can only turn an ENOENT-shaped answer out of files DAC would have ALLOWED.
+ * Hence 0777: DAC passes, the LSM layer is the only thing that answers (ENOENT for every
+ * non-root caller).
+ * The nodes exist only when the layer that hides them is installed
+ * (susfs_control_node_allowed()), so an unprotected world-writable node cannot happen, and
+ * root-only access is enforced by the handlers' uid checks, not by the mode.  expose_proc=0
+ * removes the nodes entirely. */
 bool susfs_expose_proc = true;
 module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
 
-/* Our own control nodes.  Hidden from app processes by sus_path below. */
 static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_kstat",
     "/proc/susfs_open_redirect",
     "/proc/susfs_enable_log",
     "/proc/susfs_avc_spoof",
-    /* hide_modules' control node: it is 0777 like the others (so DAC does not answer
-     * EACCES first) and root-only through its own uid checks, which makes this rule
-     * the thing that gives everyone else ENOENT. */
     SUSFS_HIDE_MODULES_NODE,
     SUSFS_HIDE_MOUNTS_NODE,
-    /* sus_path's own interface (the rule listing).  It goes through the same table it
-     * prints, which is the point: the module exercises its own hiding path on its own
-     * diagnostics, so a broken rule table is visible in the very view that reports it. */
+    /* sus_path's own interface (the rule listing): it goes through the same table it
+     * prints, so a broken rule table is visible in the very view that reports it. */
     SUSFS_PATH_NODE,
-    /* The module's own sysfs directory is NOT here any more: it belongs to the
-     * hide_module feature (susfs_hide_syms.c), which adds and drops that rule at
-     * runtime.  It used to sit in this list, which tied it to expose_proc by
-     * accident - expose_proc=0 then also stopped hiding /sys/module/<name>. */
+    /* The module's own sysfs directory is NOT here: it belongs to hide_module
+     * (susfs_hide_syms.c), which adds and drops that rule at runtime. */
 };
 
-/* Register our control nodes in sus_path's hidden set.
- *
- * An app probing /proc/susfs_kstat must see ENOENT, not EACCES: "permission
- * denied" tells the detector the node is there, "no such file or directory"
- * does not.  Using sus_path for this also means the module exercises its own
- * hiding path on every boot, so a broken sus_path shows up immediately.
- *
- * Runs after every feature init, because the nodes must exist for kern_path()
- * to resolve them, and after sus_path_init() so the hooks are already patched. */
+/* Register our control nodes in sus_path's hidden set: probing them must answer ENOENT,
+ * not EACCES.  Runs after every feature init (the nodes must exist for kern_path() to
+ * resolve them) and after sus_path_init(), so the hooks are already patched. */
 static void susfs_self_hide_nodes(void)
 {
     int i;
@@ -97,41 +66,24 @@ static void susfs_self_hide_nodes(void)
 }
 
 /* ---- layer table: arming order IS the teardown order, reversed --------------
- *
- * Two properties are wanted here and neither is cosmetic:
- *
- *  1. A load that fails half way must leave NOTHING armed.  When module_init()
- *     returns an error the kernel frees this module's memory, so anything still
- *     installed - a patched security_hook_heads slot above all - becomes a
- *     function pointer into freed memory and the next syscall goes through it.
- *     That is why the table calls the exits of the layers it already armed before
- *     failing, instead of just returning the error.
- *
- *  2. Teardown runs in the exact reverse of arming, in one place.  The order has a
- *     visible consequence: sus_path's LSM layer is what answers ENOENT for this
- *     module's own control nodes, and those nodes are world-writable (0777) by
- *     design so that DAC does not answer EACCES first (see the expose_proc note).
- *     Unhooking that layer before the nodes are removed would expose them to every
- *     process for the duration of the unload; with the order in this table the
- *     nodes are gone first, and the LSM layer goes down last.
- *
- * `fatal` marks the two layers whose absence makes the module useless or silent:
- * sus_path (a registered path would not be hidden at all) and the supercall hook
- * (no command would ever reach the module).  Everything else logs its own failure
- * and degrades to "off".
- *
- * The exits are idempotent and safe on a layer whose init never ran (each guards on
- * its own registered/armed flag), which is what lets one path be used for both the
- * failure rollback and the real unload. */
+ * A failed load must leave NOTHING armed: when module_init() returns an error the kernel
+ * frees this module's memory, so anything still installed - a patched security_hook_heads
+ * slot above all - becomes a function pointer into freed memory that the next syscall goes
+ * through.  Hence the exits of the already-armed layers run before failing.
+ * Teardown runs in the exact reverse of arming, in one place, and the order matters:
+ * sus_path's LSM layer is what answers ENOENT for this module's own 0777 control nodes (see
+ * the expose_proc note), so unhooking it before the nodes are removed would expose them to
+ * every process during the unload - here the nodes go first and the LSM layer last.
+ * `fatal` marks the two layers whose absence makes the module useless or silent: sus_path
+ * and the supercall hook; the rest log their own failure and degrade to "off".  The exits
+ * are idempotent, which lets one path serve rollback and unload alike. */
 static int layer_lsm_hook_init(void)
 {
     ksu_lsm_hook_init();
     return 0;
 }
 
-/* Not const: the `armed` flags live here (and the function pointers have to stay
- * valid for the whole module lifetime anyway - see the note on lsm_hook_init/exit
- * about why those two lost their __init/__exit annotations). */
+/* Not const: the `armed` flags live here (the pointers must outlive __init too). */
 static struct {
     const char *name;
     int (*init)(void);
@@ -153,16 +105,13 @@ static struct {
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, false },
 };
 
-/* Diagnostic: make one layer's init fail, by 1-based index, so the rollback path
- * above can be exercised on the device instead of only being read.  Failing a
- * `fatal` layer must end the load with nothing armed; the check is that the device
- * survives it (a stale LSM slot would be used by the very next syscall) and that a
- * normal load still works afterwards. */
+/* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
+ * on the device - a `fatal` layer failing must leave the load with nothing armed. */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
 
-/* Not __init/__exit on purpose: it is called from both, and calling an __exit
- * function from __init code is what modpost reports as a section mismatch. */
+/* Not __init/__exit: it is called from both, and an __exit callee in __init code is a
+ * modpost section mismatch. */
 static void susfs_layers_down(int upto)
 {
     int i;
@@ -186,8 +135,7 @@ static int __init susfs_init(void)
     for (i = 0; i < (int)ARRAY_SIZE(susfs_layers); i++) {
         int ret;
 
-        /* Marked before the call: a layer that half-ran still has to be taken down
-         * (sus_path frees its scratch buffer there, for instance). */
+        /* Marked before the call: a layer that half-ran still has to be taken down. */
         susfs_layers[i].armed = true;
 
         if (fail_layer == i + 1) {
@@ -204,8 +152,7 @@ static int __init susfs_init(void)
         if (susfs_layers[i].fatal) {
             pr_err("susfs_guard_lkm: %s init failed %d, refusing to load\n",
                    susfs_layers[i].name, ret);
-            /* Everything armed so far goes back down: the kernel is about to free
-             * this module's memory, and a hook left behind would point into it. */
+            /* The kernel is about to free this module; a hook left behind points into it. */
             susfs_layers_down(i);
             return ret;
         }
@@ -213,28 +160,19 @@ static int __init susfs_init(void)
                 susfs_layers[i].name, ret);
     }
 
-    /* Registered last and undone implicitly: these are entries in sus_path's table,
-     * which sus_path_exit() empties - and it runs last, while its LSM layer is still
-     * answering ENOENT for the nodes. */
+    /* Registered last and undone implicitly: these are entries in sus_path's table, which
+     * sus_path_exit() empties while its LSM layer still answers ENOENT for the nodes. */
     susfs_self_hide_nodes();
 
-    /* Operator note, because the module hides its own traces from EVERY caller -
-     * root included (a built-in SUSFS has no module entry at all, so hiding it
-     * only from non-root would leave a trace upstream does not have).  The
-     * consequence is that `lsmod | grep susfs` is always empty, and a second
-     * `insmod` fails with -EEXIST ("File exists"), which reads like a broken
-     * module.  Say where the truth is.
-     *
-     * THE ONE LINE THAT IGNORES THE LOG SWITCH.  Everything else the module says
-     * is informational and follows enable_log (see susfs_log.h); this line is the
-     * only evidence that the module came up, and it is the one thing an operator
-     * greps for - so it stays unconditional, including for a load that starts
-     * silent (`insmod ... enable_log=0`) and for CMD_SUSFS_ENABLE_LOG 0 later.
-     * Otherwise "loaded but logging off" is indistinguishable from "not loaded".
-     * Note the ordering: susfs_enable_log_init() runs above, so the parameter is
-     * already parsed by the time this prints.  The prefix comes from pr_fmt
-     * (susfs_log.h), so the message itself must not repeat it - it used to print
-     * "susfs_guard_lkm: susfs_guard_lkm: loaded." */
+    /* Operator note.  The module hides its own traces from EVERY caller, root included (a
+     * built-in SUSFS has no module entry, so hiding it only from non-root would leave a
+     * trace upstream does not have): `lsmod | grep susfs` stays empty and a second `insmod`
+     * fails with -EEXIST, which reads like a broken module.
+     * THE ONE LINE THAT IGNORES THE LOG SWITCH: everything else follows enable_log
+     * (susfs_log.h), but this is the only evidence the module came up and the one thing an
+     * operator greps for, so it stays unconditional even for a silent load - otherwise
+     * "loaded but logging off" is indistinguishable from "not loaded".  The prefix comes
+     * from pr_fmt (susfs_log.h), so the message must not repeat it. */
     pr_info("loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
             SUSFS_LKM_MODULE_NAME);
 

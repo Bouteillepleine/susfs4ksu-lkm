@@ -3,13 +3,14 @@
  * sus_mount.c - hide KSU mounts from /proc/mounts and /proc/mountinfo.
  *
  * Upstream SUSFS skips a mount line when r->mnt_id >= DEFAULT_KSU_MNT_ID, and
- * (patch:1561-1585) it only installs those show functions for NON-ksu domains:
- * mounts_open()/mountinfo_open()/mountstats_open() pick susfs_show_vfsmnt()/
- * susfs_show_mountinfo()/susfs_show_vfsstat() only when
- * !susfs_is_current_ksu_domain(), so the su/ksu domain keeps seeing its own
- * mounts.  The stock show functions are static but live behind proc_ops
- * function pointers, so they are NOT LTO-inlined and remain kprobe-able
- * (verified in kallsyms).
+ * (patch:1561-1585) installs those show functions only for NON-ksu domains
+ * (!susfs_is_current_ksu_domain() in mounts_open()/mountinfo_open()/mountstats_open()),
+ * so the su/ksu domain keeps seeing its own mounts (zygisk in post-fs-data and ksud
+ * break otherwise).  The stock show functions are static but sit behind proc_ops function
+ * pointers, so they are NOT LTO-inlined and stay kprobe-able (verified in kallsyms); the
+ * LKM hooks all three with a kprobe pre_handler and returns early (regs->pc = x30) for a
+ * KSU-range id, under the same domain gate.  struct mount / real_mount() come from the
+ * private fs/mount.h (its includes are all public headers, so -I$(srctree)/fs is enough).
  *
  * The LKM hooks all three show functions with a kprobe pre_handler and returns
  * early (regs->pc = x30) when the mount id is in the KSU range - but only for
@@ -28,9 +29,11 @@
  * handing out small ids - measured on device: 91..39693, so the old fixed 2e9
  * threshold could never match and the feature was 100% OFF.
  *
- * Instead, sus_mount_mark_ksu_mounts() retro-fits upstream's semantics: at
- * enable time (and at module load) it walks the current mount namespace and
- * rewrites the mnt_id of every mount that looks like one of KernelSU's.
+ * A mount is one of ours when mnt_devname contains "/data/adb/" (KSU/module bind mounts)
+ * or the mount POINT - d_path() of {mnt, mnt_root}, the path show_mountinfo() prints - is
+ * under /data/adb (catches meta-overlayfs, whose source is /dev/block/loopNN).  Marked ids
+ * are never restored on disable, matching upstream, where an id is assigned once at mount
+ * time and stays for the mount's lifetime.
  *
  * The new id is a REAL id taken from the kernel's own mnt_id_ida:
  *   ida_alloc_range(&mnt_id_ida, DEFAULT_KSU_MNT_ID, INT_MAX - 1, GFP_KERNEL)
@@ -125,11 +128,9 @@
 #include "susfs.h"	/* module-wide declarations */
 
 /* ---- the "which mounts are ours" prefix list: state ----
- *
- * The state lives up here, not next to the control surface further down, because
- * mount_stat() - which sits between the two - reports the list length and the
- * rescan count.  Declaring it below its first use is a compile error, not a
- * style issue. */
+ * Up here, not next to the control surface further down, because mount_stat() between
+ * the two reports the list length and the rescan count - and declaring it below its
+ * first use would be a compile error, not a style issue. */
 #define SUS_MOUNT_KEEP_MAX 8
 #define SUS_MOUNT_KEEP_LEN 128
 #define SUS_MOUNT_KEEP_CMDLINE (SUS_MOUNT_KEEP_MAX * (SUS_MOUNT_KEEP_LEN + 2) + 32)
@@ -141,19 +142,16 @@ static const char *const mount_keep_default = "/data/adb/";
 static atomic_t n_keep_rescans = ATOMIC_INIT(0);
 
 /* How many of the three mount-table hooks (show_vfsstat / show_mountinfo /
- * show_vfsmnt) are actually armed.  Declared up here because mount_stat() reports
- * it and mount_stat() sits above the probes in this file.  3 is the healthy value;
- * 1 or 2 means the feature hides fewer files than it says, which is exactly the
- * kind of "enabled but smaller" state that must be visible rather than inferred -
- * see sus_mount_register(). */
+ * show_vfsmnt) are armed; 3 is healthy.  1 or 2 means the feature hides fewer files
+ * than it says, which must be visible rather than inferred (see
+ * sus_mount_register()).  Declared up here because mount_stat() reports it. */
 static int n_show_probes;
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
-/* P3: min_mnt_id is a raw ulong tunable and 0/1 would make EVERY mount line
- * match the threshold below, hiding the whole of /proc/mounts,
- * /proc/<pid>/mountinfo and /proc/<pid>/mountstats from every process (su
- * included).  Anything below this is clamped back to DEFAULT_KSU_MNT_ID. */
+/* min_mnt_id is a raw ulong tunable: 0/1 would make EVERY mount line match the
+ * threshold, hiding all of /proc/mounts, /proc/<pid>/mountinfo and mountstats from
+ * every process, su included.  Below this it is clamped back to DEFAULT_KSU_MNT_ID. */
 #define SUS_MOUNT_MIN_SANE_MNT_ID 1000
 
 /* Hard bound on the mount-namespace walk.  A concurrent umount_tree() does
@@ -161,21 +159,18 @@ static int n_show_probes;
  * itself, so an unbounded list_for_each() can spin forever if it lands on it. */
 #define SUS_MOUNT_MAX_SCAN 65536
 
-/* Everything at/above this is "already a KSU-range id" (upstream's own test,
- * patch:807).  The marking side deliberately uses this constant instead of the
- * min_mnt_id tunable: if the tunable were raised above 2e9 a tunable-based test
- * would re-mark an already-marked mount and allocate a SECOND id from the ida,
- * leaking the first one for the mount's lifetime.  With the default tunable
- * (2e9) the two tests are identical. */
+/* At/above this is "already a KSU-range id" (upstream's own test, patch:807).  The
+ * marking side uses this constant and not the min_mnt_id tunable: a raised tunable
+ * would re-mark an already-marked mount and allocate a SECOND id, leaking the first
+ * for the mount's lifetime.  With the default tunable the two tests are identical. */
 #define SUS_MOUNT_KSU_ID_MIN ((unsigned int)DEFAULT_KSU_MNT_ID)
 
 static unsigned long param_min_mnt_id = DEFAULT_KSU_MNT_ID;
 module_param_named(min_mnt_id, param_min_mnt_id, ulong, 0644);
 
-/* P2-12: SELinux context of the su/ksu domain, resolved to a sid at init.
- * Keep in sync with susfs_avc_spoof.c's avc_su_ctx default ("u:r:ksu:s0", the
- * SukiSU variant; stock KernelSU uses "u:r:su:s0", override with
- * susfs_guard_lkm.su_ctx=u:r:su:s0). */
+/* P2-12: SELinux context of the su/ksu domain, resolved to a sid at init.  Keep in sync
+ * with susfs_avc_spoof.c's avc_su_ctx ("u:r:ksu:s0", the SukiSU variant; stock KernelSU
+ * is "u:r:su:s0", override with susfs_guard_lkm.su_ctx=u:r:su:s0). */
 static char param_su_ctx[128] = "u:r:ksu:s0";
 module_param_string(su_ctx, param_su_ctx, sizeof(param_su_ctx), 0644);
 
@@ -202,18 +197,16 @@ static bool sus_mount_ida_ready(void)
     return sus_mount_mnt_id_ida && pfn_ida_alloc_range && pfn_ida_free;
 }
 
-/* Resolved kernel symbols.  security_cred_getsecid() is an EXPORT_SYMBOL in
- * security/security.c:1742, but GKI's symbol list is not guaranteed to carry it
- * for modules, so it is looked up in kallsyms like the other optional symbols
- * this LKM uses. */
+/* security_cred_getsecid() is EXPORT_SYMBOL in security/security.c, but GKI's symbol
+ * list is not guaranteed to carry it for modules, so it is resolved from kallsyms like
+ * the other optional symbols this LKM uses. */
 static void (*pfn_security_cred_getsecid)(const struct cred *cred, u32 *secid);
 static char *(*pfn_d_path)(const struct path *path, char *buf, int buflen);
 
-/* __nocfi on every function that reaches a resolved kernel symbol through a
- * function pointer: kCFI validates the type hash at such a call site and panics
- * with "CFI failure (target: ...)" otherwise.  We hit exactly that once (see
- * susfs_inline_hook.c:60-63 and :106-118, "CFI failure (target:
- * smp_call_function)"), so these wrappers must keep the attribute. */
+/* __nocfi on every function that reaches a resolved kernel symbol through a function
+ * pointer: kCFI validates the type hash at such a call site and panics with
+ * "CFI failure (target: ...)" otherwise - measured on this device, so these wrappers
+ * keep the attribute. */
 static __nocfi bool sus_mount_is_su_domain(void)
 {
     u32 sid = 0;
@@ -245,10 +238,7 @@ static __nocfi int sus_mount_ida_alloc(void)
  * prototype does not match the kernel's own - measured, and expensive to learn:
  *
  *   Kernel panic - not syncing: CFI failure (target: ida_free+0x0/0x480)
- *   Call trace: sus_mount_mark_ksu_mounts+0x9b0 [susfs_guard_lkm]
- *
- * (The first version of this helper was missing the annotation.  The allocation
- * side never hit it because sus_mount_ida_alloc() is __nocfi.) */
+ *   Call trace: sus_mount_mark_ksu_mounts+0x9b0 [susfs_guard_lkm] */
 static __nocfi void sus_mount_ida_release(int id)
 {
     pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)id);
@@ -276,47 +266,26 @@ static bool mount_registered;
 
 /* ---- the same id in the two other places upstream rewrites ----
  *
- * Skipping the mount line is not enough on its own: /proc/<pid>/fdinfo/N prints
- * "mnt_id:\t<i>" and statx(2) returns stx_mnt_id, both taken straight from the
- * mount the file lives on.  An app can therefore walk the fds it holds, collect
- * their mnt_ids and look for ones /proc/self/mountinfo never mentions - a
- * positive indicator that something is hidden, and one that needs no root.
+ * Not enough to skip the mount line: /proc/<pid>/fdinfo/N prints "mnt_id:\t<i>" and statx(2)
+ * returns stx_mnt_id, both taken straight from the mount the file lives on, so an app can
+ * collect the mnt_ids of the fds it holds and look for ones /proc/self/mountinfo never
+ * mentions - a positive indicator that something is hidden, and one that needs no root.
+ * Upstream rewrites both to the id of the first mount up the chain that is not a KSU mount
+ * (susfs_get_non_sus_mnt_id_from_mnt(), patch:849-858); that value is computed here once per
+ * marked mount, at marking time, and kept in a small id table, because at rewrite time all we
+ * have is the id (kprobe context: no sleeping, no lookups).
  *
- * Upstream rewrites both to the id of the first mount up the chain that is not a
- * KSU mount (susfs_get_non_sus_mnt_id_from_mnt(), patch:849-858), so the number
- * the app sees is one that mountinfo does print for a line it keeps.  That value
- * is computed here once per marked mount - at marking time, when the mount
- * pointer is still in hand - and kept in a small id table, because at rewrite
- * time all we have is the id (kprobe context, no sleeping, no lookups).
- *
- * That table is the one piece of state whose key the kernel can hand to somebody
- * else: mnt ids are allocated from mnt_id_ida and returned there by mnt_free_id()
- * when a mount dies, so a number learned for OUR mount can later belong to a
- * completely unrelated one, and a stale hit would rewrite an innocent mount's id
- * (the app would then see, for its own fd, a number that names another mount's
- * line).  Measured on this device: a freed mnt id IS handed out again immediately
- * (mount tmpfs, note the id, umount, mount again - same id), so this is not a
- * theoretical window.  Each entry therefore carries the s_dev it was learned on,
- * and is invalidated in three places, in the order the cases matter:
- *
- *   - superblock teardown: the mount's filesystem is being unmounted, so the entry
- *     can only ever match a recycled id from now on.  A kprobe on
- *     generic_shutdown_super() drops every entry with that s_dev, which is also
- *     the earliest point where nothing can have taken the freed id yet.
- *   - sighting: every hide hook walks a namespace's mount list and sees each mount
- *     with its CURRENT id and whether it is ours.  A mount that is NOT ours and
- *     carries an id we have an entry for proves that id was recycled, so the entry
- *     is dropped right there (sus_mount_idmap_drop()).  Authoritative, not a guess,
- *     and it is what lets the table stay fixed-size: freed slots are reused.
- *   - refresh: seeing one of OUR mounts again rewrites its entry, so the pair is
- *     current for every mount whose line a reader actually enumerated - which is
- *     exactly the case where a cross-check against fdinfo is possible at all.
- *   - what is left is an id recycled while nobody reads a mount table at all: the
- *     entry is then only ever consulted by the rewrites, and no reader holds a
- *     mount list to compare the rewritten number against.
- *
- * A shown_id needs no expiry of its own: it is an ancestor of its mount, and an
- * ancestor cannot be unmounted while a child mount is still alive. */
+ * The key is the one piece of state the kernel can hand to somebody else: mnt ids go back to
+ * mnt_id_ida in mnt_free_id(), and the reuse is immediate, not theoretical - measured on this
+ * device: mount tmpfs, note the id, umount, mount again hands out the SAME id.  Each entry
+ * therefore carries the s_dev it was learned on and is dropped when (a) its superblock is torn
+ * down (kprobe on generic_shutdown_super(), the earliest point where nothing can have taken the
+ * id yet), (b) a mount that is NOT ours is seen carrying that id - proof of a recycle, so the
+ * hide hook drops the entry right there (sus_mount_idmap_drop()), which is what keeps the table
+ * fixed-size by reusing freed slots - or (c) it is refreshed by seeing one of OUR mounts again.
+ * Left over is an id recycled while nobody reads a mount table at all: no reader then holds a
+ * mount list to compare the rewritten number against.  A shown_id needs no expiry of its own:
+ * an ancestor of its mount cannot be unmounted while the child is alive. */
 #define SUS_MOUNT_IDMAP_MAX 64
 
 /* sus_id == 0 marks a free slot; mnt ids are never 0. */
@@ -345,9 +314,8 @@ static void sus_mount_idmap_add(int sus_id, int shown_id, dev_t s_dev)
     if (sus_id <= 0 || shown_id <= 0)
         return;
     spin_lock_irqsave(&idmap_lock, flags);
-    /* The same mount is seen again on every enable (and by both ways in below),
-     * so an entry that is already there must not be appended twice: the table is
-     * fixed size and a re-enable loop would fill it with copies. */
+    /* Seen again on every enable and by both paths in, so an existing entry must not be
+     * appended twice: the table is fixed size. */
     for (i = 0; i < n_idmap; i++) {
         if (mount_idmap[i].sus_id == sus_id) {
             mount_idmap[i].shown_id = shown_id;
@@ -387,9 +355,8 @@ static void sus_mount_idmap_drop_dev(dev_t s_dev)
     spin_unlock_irqrestore(&idmap_lock, flags);
 }
 
-/* The id in @sus_id currently belongs to a mount that is NOT ours, so whatever we
- * learned for it is about a mount that no longer exists: a recycled id.  Called
- * from the hide hooks, which is where that fact is observable. */
+/* The id in @sus_id now belongs to a mount that is NOT ours, so what was learned for it
+ * described a mount that no longer exists - a recycled id, observable in the hide hooks. */
 static void sus_mount_idmap_drop(int sus_id)
 {
     unsigned long flags;
@@ -444,48 +411,27 @@ static int sus_mount_shown_id(struct mount *mnt)
 /* ---- "is this mount one of ours", by IDENTITY and not only by id ----
  *
  * The id test is a property of ONE mount object in ONE namespace, and the id only
- * exists because the marking scan put it there.  A mount that KernelSU created
- * inside the app/zygote namespace carries whatever id the stock allocator gave it
- * - measured on this device: the meta-overlayfs mount at
- * /data/adb/modules/meta-overlayfs/mnt has id 2000000000 in the init namespace and
- * id 1111 in the zygote's, so the id test hid the line in one view and left it in
- * the other.  That is the view that matters: an app is forked from zygote, so the
- * zygote namespace IS the app's own mount table, and a checker that reads its own
- * mountinfo (or /proc/<zygote>/mountinfo) saw a normal-looking mount for a module
- * path.
+ * exists because the marking scan put it there: a KSU mount inside the app/zygote
+ * namespace carries whatever id the stock allocator gave it (measured: the
+ * meta-overlayfs mount is 2000000000 in the init namespace and 1111 in the
+ * zygote's), so the id test hid the line in one view and left it in the other - the
+ * app's own mount table, the one a checker reads.
  *
- * So the identity of a mount is remembered as well, in the three things that
- * survive a namespace boundary - the mount OBJECT does not, but its filesystem
- * does:
+ * So the scan remembers what survives a namespace boundary (the mount OBJECT does not, its
+ * filesystem does): s_dev + root ino, exact and cheap, because the root dentry is shared by
+ * every mount of a superblock and a second tmpfs has its own root inode.  The NUMBER is
+ * stored, not the dentry pointer: a held pointer would need dget() - pinning dentry and inode
+ * past the superblock's shutdown, measured: rmmod of that build dput()'d it and panicked in
+ * shmem_evict_inode, "Oops: Fatal exception" - or be used unlocked after the mount is gone.
+ * mnt_devname is compared only when it is a path (starts with '/'), so a recorded
+ * "tmpfs"/"overlay" cannot hide every mount of that kind.
  *
- *   s_dev + root ino    : exact and cheap (two compares).  The root dentry is
- *                         shared by every mount of the same superblock, and its
- *                         inode number cannot match an unrelated mount: a second
- *                         tmpfs instance has its own root dentry and inode.
- *                         The NUMBER is stored, not the dentry pointer: a pointer
- *                         kept across the mount's life would have to either hold a
- *                         reference (dget pins the dentry, hence the inode - and a
- *                         record whose filesystem is later unmounted then keeps
- *                         that inode alive past its superblock's shutdown; measured
- *                         on this device: rmmod of that build dput()'d it and
- *                         panicked in shmem_evict_inode, "Oops: Fatal exception")
- *                         or be used unlocked after the mount is gone.  Reading the
- *                         live mount's root inode number at compare time has
- *                         neither problem and needs no release step on unload.
- *   mnt_devname         : equality only when it is a path (starts with '/'), so a
- *                         recorded "tmpfs"/"overlay" cannot hide every mount of
- *                         that kind.
- *
- * Only mounts the scan ACCEPTS are recorded, so this never widens into "hide
- * anything that looks similar".
- *
- * A record is valid only while its filesystem is mounted, and the numbers it is
- * keyed by are reusable (measured: the tmpfs mounted, recorded and unmounted by
- * this test left s_dev 0:304 and root inode 1 behind, and the very next tmpfs mount
- * got both - i.e. a stale record matched an unrelated filesystem and hid it).  So a
- * kprobe on generic_shutdown_super() drops every record whose s_dev is going away
- * (sus_mount_ident_drop_dev()), and the record survives exactly as long as its
- * superblock - which is the case the identity test exists for. */
+ * Only mounts the scan ACCEPTS are recorded, so this never widens into "hide anything that
+ * looks similar".  A record is valid only while its filesystem is mounted, and its keys are
+ * reusable: measured, a tmpfs mounted/recorded/unmounted by this test left s_dev 0:304 and
+ * root inode 1 behind and the very next tmpfs got both, i.e. a stale record hid an unrelated
+ * filesystem - hence the kprobe on generic_shutdown_super() that drops every record whose
+ * s_dev is going away. */
 #define SUS_MOUNT_DEVNAME_MAX 64
 #define SUS_MOUNT_IDENT_MAX 32
 /* Defined with the scan helpers further down; the identity test needs it here. */
@@ -495,9 +441,9 @@ struct sus_mount_ident {
     dev_t s_dev;
     unsigned long root_ino;	/* 0 = free slot */
     bool devname_is_path;
-    /* strscpy() truncates a longer devname; without this flag the record could
-     * never match its own live mount again (strcmp of a truncated copy against the
-     * full string is always unequal), which silently disabled this fallback. */
+    /* strscpy() truncates a longer devname; without this flag the record could never match
+     * its own live mount again (a truncated copy is always unequal), silently disabling
+     * this fallback. */
     bool devname_truncated;
     char devname[SUS_MOUNT_DEVNAME_MAX];
 };
@@ -513,9 +459,8 @@ static atomic_t n_sb_down = ATOMIC_INIT(0);		/* superblocks seen shut down */
 
 static int mount_dbg;
 module_param_named(mount_dbg, mount_dbg, int, 0644);
-/* Diagnostic: name the fields the identity test compares, for the first few mounts
- * the hide hook looks at, so "why did identity not match" is answerable from dmesg
- * instead of guessed. */
+/* Diagnostic: name the fields the identity test compares, for the first few mounts the
+ * hook sees, so "why did identity not match" is answerable from dmesg instead of guessed. */
 static atomic_t n_dbg_logged = ATOMIC_INIT(0);
 
 /* Process context.  Takes no reference on anything (see the note above): the
@@ -536,8 +481,7 @@ static void sus_mount_ident_add(struct mount *r)
         return;
 
     spin_lock_irqsave(&ident_lock, flags);
-    /* Re-check under the lock: two scans cannot both append.  A second scan of the
-     * same mounts (a re-enable) finds them here and stops. */
+    /* Re-check under the lock so two scans cannot both append; a re-enable finds them here. */
     for (i = 0; i < n_ident; i++) {
         if (mount_ident[i].s_dev == r->mnt.mnt_sb->s_dev &&
             mount_ident[i].root_ino == ino)
@@ -547,8 +491,7 @@ static void sus_mount_ident_add(struct mount *r)
     }
     if (slot < 0) {
         if (n_ident >= SUS_MOUNT_IDENT_MAX) {
-            /* Silent truncation is exactly the kind of "registered but not
-             * effective" failure this project keeps finding, so say it once. */
+            /* Silent truncation is a "registered but not effective" failure; say it once. */
             if (atomic_inc_return(&n_ident_full) == 1)
                 pr_warn("sus_mount: identity table full (%d), %s is NOT recognised in other namespaces\n",
                         SUS_MOUNT_IDENT_MAX,
@@ -607,18 +550,9 @@ static bool sus_mount_ident_match(struct mount *r)
 /**
  * sus_mount_ident_drop_dev() - forget every record that lived on @s_dev
  *
- * Called from a kprobe on generic_shutdown_super(), i.e. the moment a superblock
- * is torn down - which is the only moment that makes these records wrong rather
- * than merely old.  Without it a record outlives its filesystem, and the numbers
- * it is keyed by are exactly the recyclable ones (measured on this device: a fresh
- * tmpfs got the same s_dev 0:304 AND the same root inode number 1 as the tmpfs
- * mounted, recorded and unmounted just before it, so a stale record matched a
- * completely unrelated filesystem and hid it).  Letting the record die with its
- * superblock closes that hole at the source, while keeping the record for as long
- * as the filesystem is mounted - which is the case the identity test exists for
- * (the same fs mounted in a namespace the scan cannot reach).
- *
- * Process context (umount/sb shutdown), takes only our own spinlock, never sleeps.
+ * From a kprobe on generic_shutdown_super(): without it a record outlives its filesystem,
+ * and the numbers it is keyed by are recyclable (measured above), so a stale record hides
+ * an unrelated filesystem.  Process context, takes only our own spinlock, never sleeps.
  */
 static void sus_mount_ident_drop_dev(dev_t s_dev)
 {
@@ -712,34 +646,13 @@ static void sus_mount_note_id(struct mount *r)
  * marked mount has no 2e9 id at all).  So after an app unshares, or after zygote
  * restarts, nothing in that namespace carries a marked id.
  *
- * Hiding still works - the identity test (superblock + root inode) is namespace
- * independent and does not care about ids (measured: the module mount and a
- * recorded tmpfs are both hidden inside a freshly cloned namespace).  What does NOT
- * work before this kretprobe existed is the fdinfo/statx face: the rewrite feeds on
- * the id table, that table only learns an id when somebody READS a mount table, so
- * a process that opens a file in the new namespace and reads /proc/self/fdinfo/N
- * first gets an id its own mountinfo does not list (measured: mnt_id=29127,
- * listed_in_my_mountinfo=0 - the "fdinfo names a mount that is not there" pattern),
- * and only the first mount-table read makes it consistent (29117, listed=1).
- * Upstream has no such window: it assigns the big id at mount creation, so the copy
- * is marked from the start.
- *
- * So: when a namespace is copied, learn the ids of every mount in the NEW tree that
- * we would hide, right there.
- *
- * Safety of walking that tree (this is the trap that once panicked this device):
- *   - we only ever walk a namespace this task has just built and that is not yet
- *     installed anywhere: copy_mnt_ns() returns to create_new_namespaces()/
- *     unshare_nsproxy_namespaces(), and the nsproxy is switched in afterwards
- *     (switch_task_namespaces), so no other task can add or remove a mount in it.
- *     namespace_sem is released inside copy_mnt_ns() (fs/namespace.c:3490
- *     namespace_unlock()), and it is not needed for a tree nobody else can reach.
- *   - the flags are checked first: without CLONE_NEWNS copy_mnt_ns() returns the
- *     CURRENT namespace (fs/namespace.c:3436) - that is the plain fork path, which
- *     runs constantly, and walking a live namespace there would be exactly the bug
- *     that took the device down before.
- *   - no allocation and no sleeping: the id table is fixed size (the scan's id
- *     batch trick is not needed here because we allocate no ids). */
+ * Walking that tree is safe (this trap once panicked the device): it is the namespace
+ * copy_mnt_ns() has just built for THIS task and no nsproxy carries yet
+ * (switch_task_namespaces() runs later), so no other task can mount into or umount from
+ * it, and namespace_sem was released inside copy_mnt_ns() (fs/namespace.c:3986).  The
+ * flags are checked first - without CLONE_NEWNS copy_mnt_ns() returns the CURRENT
+ * namespace, the plain fork path, and walking a live namespace there is exactly that bug -
+ * and nothing is allocated or slept on: the id table is fixed size. */
 static atomic_t n_clone_walks = ATOMIC_INIT(0);
 static atomic_t n_clone_learned = ATOMIC_INIT(0);
 
@@ -809,32 +722,19 @@ static bool kr_clone_ns_ok;
 
 /* ---- mounts that appear AFTER the enable ----
  *
- * The marking scan runs once, on the current namespace, and only sees what exists at
- * that moment: a filesystem mounted later - the ordinary case for a module image
- * installed while the phone is up - carried no marked id and no recorded identity, so
- * nothing hid it, in ANY namespace (measured before this hook existed: the line was
- * visible to a non-su reader in both the init namespace and a freshly cloned one).
+ * The scan runs once, on the current namespace: a filesystem mounted later - the ordinary
+ * case for a module image installed while the phone is up - carried no marked id and no
+ * recorded identity, so nothing hid it in ANY namespace (measured before this hook existed:
+ * visible to a non-su reader in the init namespace and in a fresh clone).
  *
- * Registration at mount time fixes that, and the place to do it is the one function
- * every mount path goes through: fs/namespace.c calls attach_recursive_mnt() from
- * exactly two places - graft_tree() (which serves mount(2)/fsmount and bind mounts
- * via do_loopback) and do_move_mount() (a move) - so one kretprobe covers all of them.
- *
- * What is recorded, and why not an id:
- *   - the IDENTITY (superblock device + root inode), which is what the hide hooks
- *     compare, needs no allocation and is namespace independent, so the mount is
- *     hidden in every namespace including ones cloned later;
- *   - allocating a KSU-range id instead would need ida_alloc_range(GFP_KERNEL), and a
- *     kprobe handler runs with preemption disabled - it must not sleep.  A GFP_NOWAIT
- *     allocation plus a pooled batch would work, but it buys nothing here: identity is
- *     what the hide path checks anyway.
- *   - the shown id (the entry the app is allowed to see in fdinfo/statx) is learned at
- *     the RETURN, because that is when mnt_parent/mnt_mountpoint exist - the same
- *     reason the namespace-copy hook above learns there.
- *
- * The acceptance rule is the scan's (a /data/adb devname, or a mountpoint under
- * /data/adb), so this cannot widen what gets hidden - and a bind of an already
- * recorded filesystem needs no record here at all: identity matches it already. */
+ * attach_recursive_mnt() is the one function every mount path goes through - exactly two
+ * callers, graft_tree() (mount(2)/fsmount and do_loopback binds) and do_move_mount() (a
+ * move) - so one kretprobe covers all of them.  Identity is recorded and not an id: it is
+ * what the hide hooks compare, needs no allocation and is namespace independent, whereas a
+ * KSU-range id needs ida_alloc_range(GFP_KERNEL) and a kprobe handler must not sleep.  The
+ * shown id is learned at the RETURN (mnt_parent/mnt_mountpoint exist then), and the
+ * acceptance rule is the scan's, so this cannot widen what is hidden - a bind of an already
+ * recorded filesystem needs no record at all. */
 #define SUS_MOUNT_NEWMNT_PATH_MAX 256
 
 static atomic_t n_newmnt_seen = ATOMIC_INIT(0);
@@ -918,32 +818,23 @@ static bool kr_newmnt_ok;
 
 /* ---- /proc/<pid>/fdinfo/N ----
  *
- * fs/proc/fd.c:seq_show() formats pos/flags/mnt_id/ino into the seq_file buffer
- * and returns; the buffer is handed to userspace right after.  A kprobe cannot
- * see the mnt_id as a value (it is a local of that function), but it can read the
- * text that is already in m->buf at return time, which is the same information:
- * find the label, parse the decimal that follows it, replace it with the id the
- * app is supposed to see.  The replacement is never longer than the original
- * (a shown id is a normal, small one), so the buffer is only ever shortened.
- *
- * Works whether the kernel formats that line with one seq_printf (as AOSP 5.15
- * does) or with seq_put_decimal_ull() - both leave "mnt_id:\t<digits>" in the
- * buffer by the time the function returns. */
+ * fs/proc/fd.c:seq_show() formats pos/flags/mnt_id/ino into the seq_file buffer and
+ * returns; a kprobe cannot see the mnt_id (a local), but it can read the text already in
+ * m->buf at return time: find the label, parse the decimal after it, replace it with the id
+ * the app is supposed to see.  The replacement is never longer (a shown id is a normal,
+ * small one), so the buffer is only shortened.  Works whether the kernel formats the line
+ * with one seq_printf (AOSP 5.15) or with seq_put_decimal_ull() - both leave
+ * "mnt_id:\t<digits>" in the buffer at return. */
 #define SUS_MOUNT_MNTID_LABEL		"mnt_id:\t"
 #define SUS_MOUNT_MNTID_LABEL_LEN	8
 
-/* Per-instance state for the four kretprobes below (fdinfo + the two statx
- * landing points).
- *
- * It lives in ri->data, NOT in per-CPU storage: seq_show() formats through
- * seq_printf(), whose seq_buf_alloc() is GFP_KERNEL and can sleep - with
- * CONFIG_PREEMPT=y the task may be preempted inside the probed function and
- * resume on another CPU, where a per-CPU slot would hold NULL or, worse, a
- * seq_file belonging to an unrelated /proc read that the return handler would
- * then memmove into.  A kretprobe instance is per-task, which is what makes the
- * entry/return pair safe; the getdents64 filter in sus_path.c does the same.
- *
- * The same struct serves all of them because the fields are disjoint. */
+/* Per-instance state for the kretprobes below (fdinfo + the two statx landing points), in
+ * ri->data and NOT in per-CPU storage: seq_show() formats through seq_printf(), whose
+ * seq_buf_alloc() is GFP_KERNEL and can sleep, so with CONFIG_PREEMPT=y the task can resume
+ * on another CPU where a per-CPU slot would hold NULL or a seq_file of an unrelated /proc
+ * read that the return handler would then memmove into.  A kretprobe instance is per-task
+ * (the getdents64 filter in sus_path.c does the same), and one struct serves all of them
+ * because the fields are disjoint. */
 struct sus_mount_kretprobe_state {
     struct seq_file *m;		/* fdinfo: the seq_file being filled */
     unsigned long ubuf;		/* statx: the caller's struct statx __user * */
@@ -966,14 +857,11 @@ static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs 
     return 0;
 }
 
-/* Replaces the decimal that follows the mnt_id label in the seq_file's already
- * formatted buffer, when the id has a disguise in sus_mount's table (KSU-range id
- * -> the host id).  Returns true when the buffer was rewritten.  The replacement
- * never grows, so the buffer is only ever shortened and m->count stays consistent.
- *
- * The other half of the same fdinfo line (the ino) belongs to open_redirect and is
- * rewritten by that feature's own kretprobe - it must fire whether or not this
- * feature's hide switch is on, and this probe is only registered while it is. */
+/* Replaces the decimal after the mnt_id label in the seq_file's already formatted buffer
+ * when the id has a disguise in sus_mount's table (KSU-range id -> host id).  The
+ * replacement never grows, so m->count stays consistent.  The other half of the fdinfo line
+ * (the ino) belongs to open_redirect's own kretprobe, which must fire whether or not this
+ * feature's hide switch is on. */
 static bool sus_mount_fdinfo_replace_mntid(struct seq_file *m)
 {
     char *buf = m->buf, digits[12];
@@ -1062,28 +950,22 @@ static bool kr_fdinfo_ok;
 
 /* ---- statx(2): stx_mnt_id ----
  *
- * vfs_statx() fills stat->mnt_id from the path's mount right after the getattr
- * callback, so the only place a kprobe can change it is the uapi struct the
- * syscall is about to copy out - hence entry (take the user pointer, argument 5)
- * plus return (rewrite the field if the call succeeded).
+ * vfs_statx() fills stat->mnt_id right after the getattr callback, so the only place a
+ * kprobe can change it is the uapi struct the syscall is about to copy out: entry (take the
+ * user pointer) plus return (rewrite if the call succeeded).  Two landing points, because
+ * "the wrapper is in kallsyms" says nothing about who is really called: __arm64_sys_statx is
+ * the syscall entry, do_statx what it delegates to.  The rewrite is idempotent (a rewritten
+ * id is not in the table), so arming both is safe, and which one fires is reported
+ * separately.
  *
- * Two landing points, because "the wrapper exists in kallsyms" says nothing
- * about who is really called: __arm64_sys_statx is the syscall entry, do_statx is
- * what it delegates to.  The rewrite is idempotent (the second one finds a
- * rewritten id that is not in the table), so arming both is safe - which of them
- * fires is reported separately.
- *
- * The two entry points do NOT read the same register:
- *   - __arm64_sys_statx is `asmlinkage long __arm64_sys_statx(const struct
- *     pt_regs *)` (arch/arm64/include/asm/syscall_wrapper.h), i.e. its only
- *     argument is the pt_regs pointer, so the user buffer is
- *     ((struct pt_regs *)regs->regs[0])->regs[4].  Reading regs->regs[4] directly
- *     happens to work only because the dispatcher leaves x1..x7 untouched - the
- *     same reason the reboot handler in susfs_supercall.c goes through
- *     PT_REAL_REGS.
- *   - do_statx(int dfd, const char __user *filename, unsigned flags, unsigned int
- *     mask, struct statx __user *buffer) is an ordinary function, so x4 IS the
- *     buffer. */
+ * They do NOT read the same register: __arm64_sys_statx is `asmlinkage long
+ * __arm64_sys_statx(const struct pt_regs *)`
+ * (arch/arm64/include/asm/syscall_wrapper.h), so its buffer is
+ * ((struct pt_regs *)regs->regs[0])->regs[4] - reading regs->regs[4] directly works only
+ * because the dispatcher leaves x1..x7 untouched, the reason the reboot handler in
+ * susfs_supercall.c goes through PT_REAL_REGS.  do_statx(int dfd, const char __user
+ * *filename, unsigned flags, unsigned int mask, struct statx __user *buffer) is an ordinary
+ * function, so x4 IS the buffer. */
 static atomic_t n_statx_entry = ATOMIC_INIT(0);
 static atomic_t n_statx_ret = ATOMIC_INIT(0);
 static atomic_t n_statx_nobuf = ATOMIC_INIT(0);
@@ -1320,29 +1202,18 @@ static bool sus_mount_show_armed[SUS_MOUNT_SHOW_N];
 
 /* ---- which mounts count as "ours" ----
  *
- * One test, used by both the enable-time scan and the mount-time hook so the two
- * cannot drift: a mount is ours when its source string (mnt_devname) or its
- * mountpoint path starts with one of the PREFIXES below.
- *
- * The list used to be a hardcoded "/data/adb/", which is where KernelSU keeps its
- * module images - correct for that case, and useless for anything else.  A container
- * (proot/chroot) mounts tmpfs/proc/sysfs/devpts at, say, /data/local/tmp/ubuntu2/dev,
- * and those were never hidden because no prefix matched.  The list is now runtime
- * configurable:
- *
- *   echo "add /data/local/tmp/ubuntu2" > /proc/susfs_hide_mounts   (or the parameter
- *   echo "set /data/adb/ /data/local/tmp/ubuntu2" > ...             of the same name)
- *
- * Anchored (strncmp against each prefix), never a substring search: a devname such as
- * "/mnt/media_rw/x/data/adb/y" or an app-chosen directory name is not a KernelSU
- * mount, and matching those hid unrelated mounts (measured: a mount whose source was
- * "x/data/adb/y" disappeared for non-su readers).
- *
- * Changing the list rescans the current namespace, so a path that is ALREADY mounted
- * is picked up without re-enabling the feature; mounts that appear later are caught by
- * the attach_recursive_mnt hook above.  Entries recorded before a change stay recorded
- * (their identity is dropped when their filesystem is torn down, or on unload) - the
- * list decides what is accepted from now on, not what is already known. */
+ * One test, used by both the enable-time scan and the mount-time hook so the two cannot
+ * drift: ours when the source string (mnt_devname) or the mountpoint path starts with one of
+ * the PREFIXES below.  Runtime configurable - it used to be a hardcoded "/data/adb/"
+ * (KernelSU's module store), which never matched a container (proot/chroot) mounting
+ * tmpfs/proc/sysfs/devpts at, say, /data/local/tmp/ubuntu2/dev (see the command surface
+ * below).  Anchored (strncmp), never a substring search: a devname such as
+ * "/mnt/media_rw/x/data/adb/y" is not a KernelSU mount, and matching those hid unrelated
+ * mounts (measured: a mount whose source was "x/data/adb/y" disappeared for non-su readers).
+ * Changing the list rescans the current namespace, so an already-mounted path is picked up
+ * without re-enabling (later ones come from the attach_recursive_mnt hook); entries recorded
+ * before a change stay recorded - the list decides what is accepted from now on, not what is
+ * already known. */
 
 /* Interrupt/kprobe safe: read-only, no allocation. */
 static bool sus_mount_path_is_ours(const char *s)
@@ -1470,20 +1341,17 @@ static void sus_mount_keep_rescan(void)
 			rc, rc < 0 ? rc : 0);
 }
 
-/* Commands, same shape as the hide_modules node:
- *   add <prefix> | del <prefix> | set <prefix>... | reset | clear
- * `reset` restores the built-in default (/data/adb/); `clear` leaves no prefix at
- * all, which stops NEW mounts from being accepted while the KSU mounts stay hidden by
- * their ids.  @bare_list is for the insmod form of the parameter only.
+/* Commands, same shape as the hide_modules node: add <prefix> | del <prefix> |
+ * set <prefix>... | reset | clear.  `reset` restores the built-in default (/data/adb/);
+ * `clear` leaves no prefix at all, which stops NEW mounts from being accepted while the KSU
+ * mounts stay hidden by their ids; @bare_list is for the insmod form of the parameter only.
  *
- * The two staging buffers (1072 + 1024 bytes) used to be locals, which made this
- * function's frame 2192 bytes and 6.6 rejects that outright:
- *   "error: stack frame size (2192) exceeds limit (2048) in 'sus_mount_keep_command'
- *    [-Werror,-Wframe-larger-than]"
- * (-Wframe-larger-than is an error in the 6.6 GKI build.)  They are allocated instead:
- * every caller here is a proc/sysfs write handler or module_param setter, i.e. process
- * context that may sleep, so GFP_KERNEL is safe.  The command semantics are unchanged -
- * the only structural difference is that the early returns now go through @out. */
+ * The two staging buffers used to be locals, which made this frame 2192 bytes and 6.6
+ * rejects that outright - "error: stack frame size (2192) exceeds limit (2048) in
+ * 'sus_mount_keep_command' [-Werror,-Wframe-larger-than]", and -Wframe-larger-than is an
+ * error in the 6.6 GKI build.  They are kvmalloc'd instead: every caller here is a proc/sysfs
+ * write handler or module_param setter, i.e. process context that may sleep, so GFP_KERNEL is
+ * safe.  The command semantics are unchanged - the early returns now go through @out. */
 static int sus_mount_keep_command(const char *val, bool bare_list)
 {
 	char *cmd;
@@ -1741,21 +1609,15 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
             n_skipped_ns++;
             continue;
         }
-        /* Anything already carrying a KSU-range id: this is the idempotency guard
-         * for a re-enable (or an enable after the load-time scan, where a second
-         * id for the same mount would leak the first one for the mount's
-         * lifetime) AND the cover for KernelSU's own mounts, which this kernel
-         * already hands such an id to - on this device exactly one, the
-         * meta-overlayfs loop mount at 2000000000.  Their line is skipped by that
-         * id alone (no marking needed), so they need the very same "the id the app
-         * is allowed to see" mapping, or fdinfo/statx keep printing a number
-         * mountinfo no longer lists.  Compares against the constant, not the
-         * tunable, see SUS_MOUNT_KSU_ID_MIN.
-         *
-         * The identity is remembered as well: this namespace's mount is a different
-         * OBJECT from the one the same filesystem has in the next namespace, so
-         * without a record the next namespace's copy cannot be recognised once its
-         * id is out of the range (measured: 2000000000 here, 1111 in the zygote's). */
+        /* Anything already carrying a KSU-range id: the idempotency guard for a re-enable (a
+         * second id for the same mount would leak the first for its lifetime) AND the cover
+         * for KernelSU's own mounts, which this kernel already hands such an id to - measured
+         * on this device: exactly one, the meta-overlayfs loop mount at 2000000000.  Their
+         * line is skipped by the id alone, so they need the same "id the app may see" mapping
+         * or fdinfo/statx print a number mountinfo no longer lists.  Compares against the
+         * constant, not the tunable (SUS_MOUNT_KSU_ID_MIN), and records the identity as well:
+         * this namespace's mount is a different OBJECT from the same filesystem's mount in the
+         * next namespace (measured: 2000000000 here, 1111 in the zygote's). */
         if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN) {
             n_skipped_marked++;
             sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r), r->mnt.mnt_sb->s_dev);
@@ -2040,23 +1902,17 @@ static int sus_mount_register(void)
     if (mount_registered)
         return 0;
 
-    /* The three mount-table hooks, registered INDEPENDENTLY.
-     *
-     * They used to be fatal on the first failure, and silent about which one it was:
-     * -EINVAL from register_kprobe() (its answer when the address is not probeable -
-     * a notrace/blacklisted region, for instance) came back to userspace as a bare
-     * -EINVAL, with nothing in the log and no way to tell show_vfsstat from
-     * show_mountinfo.  Measured on a vendor 5.15 kernel: enabling the feature failed
-     * that way while every mount table stayed unhidden, and only reading the source
-     * said which probe had failed.
+    /* The three mount-table hooks, registered INDEPENDENTLY.  They used to be fatal on the
+     * first failure and silent about which one it was: -EINVAL from register_kprobe() (its
+     * answer when the address is not probeable) came back to userspace as a bare -EINVAL with
+     * nothing in the log - measured on a vendor 5.15 kernel, where enabling failed that way
+     * while every mount table stayed unhidden, and only the source said which probe it was.
      *
      * Each hook covers a different file - show_vfsstat serves /proc/<pid>/mountstats,
-     * show_mountinfo serves mountinfo, show_vfsmnt serves /proc/mounts and
-     * /proc/<pid>/mounts - so one that cannot be armed must NOT take the other two
-     * down with it.  Every failure is named, and the number that did arm is on
-     * mount_stat as `show_probes=<n>/3`, which is what makes a partial hide visible
-     * instead of silently smaller.  Only "none of the three" is fatal: that is
-     * "enabled but nothing hidden" again, and it is reported to the caller. */
+     * show_mountinfo mountinfo, show_vfsmnt /proc/mounts and /proc/<pid>/mounts - so one that
+     * cannot be armed must not take the other two down.  Every failure is named and the number
+     * armed is on mount_stat as `show_probes=<n>/3`, which makes a partial hide visible instead
+     * of silently smaller.  Only "none of the three" is fatal. */
     for (i = 0; i < SUS_MOUNT_SHOW_N; i++) {
         rc = register_kprobe(sus_mount_show_probes[i]);
         if (rc) {
@@ -2142,16 +1998,11 @@ void susfs_sus_mount_supercall(void __user **arg)
             info.err = rc;
             goto out;
         }
-        /* Only now does the threshold matter, so mark the KSU mounts (also
-         * catches everything mounted since the module was loaded).
-         *
-         * A failed scan is REPORTED, not just logged: with no mount carrying a
-         * KSU-range id the threshold test never matches, so nothing is hidden -
-         * mountinfo, /proc/mounts, fdinfo and statx all keep showing the mounts.
-         * Answering err=0 there is the "enabled, does nothing" failure mode a
-         * caller cannot see; the hook staying live does not change that.  (A scan
-         * that found zero KSU mounts on purpose is not a failure: that is rc==0.)
-         */
+        /* Only now does the threshold matter, so mark the KSU mounts (this also catches
+         * everything mounted since the module was loaded).  A failed scan is REPORTED, not just
+         * logged: with no mount carrying a KSU-range id the threshold never matches, so nothing
+         * is hidden while the hook stays live - "enabled, does nothing", which a caller cannot
+         * see from err=0.  (A scan that found zero KSU mounts is not a failure: rc==0.) */
         rc = sus_mount_mark_ksu_mounts();
         if (rc < 0) {
             pr_warn("sus_mount: scan on enable failed %d - hook is live but no mount was marked, reporting the failure to userspace\n",
