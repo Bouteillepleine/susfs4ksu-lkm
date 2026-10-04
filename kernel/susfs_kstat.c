@@ -536,6 +536,17 @@ static void kstat_note_unlisted(long nr)
  * come after them or it would reference names that do not exist yet.  Its /proc report and this
  * file's dispatcher both read it, which is what keeps the two from drifting apart. */
 
+/* The dispatch state for one call.  Passed by pointer into the helpers so a call site never
+ * repeats the counter bookkeeping, and typed counters cannot be wired to the wrong line.
+ * `compat` is the one thing a helper cannot work out from its counter set: on a 32-bit task the
+ * user buffer is a zero-extended u32 and has to go through compat_ptr() first.
+ * Defined here - before the helpers, and independent of the whitelist table, which is built
+ * further down from the syscall-number constants that live next to the AArch32 struct layouts. */
+struct kstat_call_state {
+	struct kstat_call_counters *cnt;
+	bool compat;
+};
+
 /* Rewrite the requested fields of the native user statbuf.  Returns true when the buffer was
  * really changed, so the caller can count "matched" from "rewrote". */
 static bool susfs_kstat_spoof_statbuf(struct kstat_call_state *st, unsigned long statbuf)
@@ -749,6 +760,8 @@ struct kstat_nr_entry {
 	struct kstat_call_counters *cnt;
 };
 
+/* The dispatch state (struct kstat_call_state) and the helpers are defined above; the table
+ * itself is here because it is built from the numbers below. */
 static struct kstat_nr_entry kstat_nr_table[] = {
 	{ __NR_newfstatat, "newfstatat", &cnt_nfstatat },
 	{ __NR_fstat,      "fstat",      &cnt_nfstat },
@@ -759,16 +772,7 @@ static struct kstat_nr_entry kstat_nr_table[] = {
 	{ COMPAT_FSTAT64_NR,   "fstat64/compat",   &cnt_fstat64 },
 };
 
-/* The dispatch state for one call.  Passed by pointer into the helpers so a call site never
- * repeats the counter bookkeeping, and typed counters cannot be wired to the wrong line.
- * `compat` is the one thing a helper cannot work out from its counter set: on a 32-bit task the
- * user buffer is a zero-extended u32 and has to go through compat_ptr() first. */
-struct kstat_call_state {
-	struct kstat_call_counters *cnt;
-	bool compat;
-};
-
-/* compat (32-bit) statbuf: struct stat64 (see above) - the layout both handled syscalls use. */
+/* compat (32-bit) statbuf: struct stat64 (see above) - the layout all four handled syscalls use. */
 static bool susfs_kstat_spoof_compat_statbuf(struct kstat_call_state *st, unsigned long statbuf)
 {
 	struct sus_kstat_snapshot snap;

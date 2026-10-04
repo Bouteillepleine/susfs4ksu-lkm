@@ -239,20 +239,20 @@ jobs:
             exit 1
           fi
 
-      # The dirent layer probes a syscall entry point BY NAME (kernel/sus_path.c:
-      # sus_dirent_candidates[]), and which of those names survives is a property of the
-      # BUILD, not of the source: __arm64_sys_* is referenced by the syscall table and so
-      # always exists, while __do_*/__se_* are `static inline`/`static` with a single caller
-      # and can be inlined away (measured on a 6.1 device: __do_sys_getdents64 and
-      # __do_compat_sys_getdents were both gone, kallsyms_lookup_name() found neither, and
-      # the listing filter was never armed there).
+      # The stat/listing layers hook the syscall RETURN through one global sys_exit tracepoint
+      # (kernel/susfs_kstat.c: kstat_sys_exit()), which dispatches on the caller's syscall number:
+      # the stat family (native 79 newfstatat / 80 fstat / 291 statx, AArch32 327 fstatat64 /
+      # 197 fstat64) and sus_path's listing numbers (native 61 getdents64, AArch32 217 getdents64
+      # and 141 getdents).  Nothing is probed BY NAME any more - the two getdents kretprobes and the
+      # vfs_getattr kretprobe this module used to register are gone - so what a variant has to
+      # provide is not a symbol but the syscall TABLE that lets numbers reach those handlers.
       #
-      # The module now tries the wrapper first, so what has to hold at runtime is that the
-      # WRAPPER exists.  If this variant's DDK tree ships a built image or a symbol map, that
-      # is checkable here, before anyone loads anything.  If it ships neither - which is the
-      # case for a headers-only DDK image - this step cannot say anything at all and says so
-      # out loud, instead of passing silently as if it had verified something.
-      - name: Check the getdents probe symbols in the DDK tree (best effort)
+      # That is a property of the build, and this step is the best-effort half of it: the numbers
+      # themselves are compile-time constants in the source, while the DDK tree's own headers (or,
+      # when it ships a built image, its symbol map) are the only local evidence about which entries
+      # its unistd table carries.  When the image has neither, this step says so out loud instead of
+      # passing silently as if it had verified something.
+      - name: Check the stat/getdents syscall entry symbols in the DDK tree (best effort)
         run: |
           set -e
           V="${{ matrix.variant }}"
@@ -261,7 +261,7 @@ jobs:
             if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
           done
           if [ -z "$S" ]; then
-            echo "no vmlinux/System.map in the DDK image: the getdents symbol check AND the undefined-symbol loader gate are both SKIPPED for $V - that is a gap in this variant's evidence, not a pass"
+            echo "no vmlinux/System.map in the DDK image: the syscall-entry symbol check AND the undefined-symbol loader gate are both SKIPPED for $V - that is a gap in this variant's evidence, not a pass"
             exit 0
           fi
           echo "=== symbol source: $S ==="
@@ -283,29 +283,43 @@ jobs:
             echo "${_n:-0}"
           }
 
-          # Informational: the whole candidate list, so a variant's log shows which of the
-          # three fallbacks would have been available as well.
-          echo "--- candidates from kernel/sus_path.c (informational) ---"
-          for s in __arm64_sys_getdents64 __do_sys_getdents64 __se_sys_getdents64 \
-                   __arm64_compat_sys_getdents __do_compat_sys_getdents __se_compat_sys_getdents; do
-            printf '  %-32s %s\n' "$s" "$(sym_count "$s")"
+          # Informational: the tables this module's dispatch assumes, so a variant's log records
+          # what its own headers say.  The syscall numbers are NOT read from these files - the
+          # module carries them as constants - so a mismatch shows up as "the counter stayed at 0"
+          # on that variant, and this listing is where that gets explained.
+          echo "--- the unistd tables this dispatch depends on (informational) ---"
+          for f in include/uapi/asm-generic/unistd.h arch/arm64/include/asm/unistd32.h; do
+            if [ -f "$S/$f" ]; then
+              echo "  $f:"
+              grep -nE "__NR_(newfstatat|fstat|statx|getdents64|fstatat64|fstat64)\b|__NR_(stat|getdents)\b" "$S/$f" | head -40 || true
+            else
+              echo "  $f: (absent in this tree)"
+            fi
           done
 
-          # Hard error: the two names the module arms FIRST and therefore depends on at
-          # runtime.  Without them the dirent layer is dead on this variant and a hidden
-          # entry shows up in every listing.
-          echo "--- asserted ---"
+          echo "--- asserted: the entry points the dispatch reaches through the syscall table ---"
+          # The two native entries the whitelist needs at runtime: without them __NR_newfstatat /
+          # __NR_fstat cannot be dispatched to, and the stat spoofing silently does nothing.
           fail=0
-          for s in __arm64_sys_getdents64 __arm64_compat_sys_getdents; do
+          for s in __arm64_sys_newfstatat __arm64_sys_statx; do
             n=$(sym_count "$s")
             printf '  %-32s %s\n' "$s" "$n"
             if [ "$n" = "0" ]; then
-              echo "::error::$s is not in $S (variant $V) - this is the getdents wrapper the LKM arms first (kernel/sus_path.c: sus_dirent_candidates[]); without it the dirent filter cannot arm on this variant"
+              echo "::error::$s is not in $S (variant $V) - it is a number the sys_exit dispatch must reach (kernel/susfs_kstat.c: kstat_sys_exit())"
               fail=1
             fi
           done
           [ "$fail" = "0" ] || exit 1
-          echo "both getdents wrapper symbols present in $S"
+          echo "the asserted syscall entry points are present in $S"
+
+          # The rest is informational: __arm64_sys_newfstat is the FD-BASED one (__NR_fstat on
+          # arm64 = 80, whose C symbol is __arm64_sys_newfstat, not __arm64_sys_fstat), and the two
+          # AArch32 entries only exist in a kernel built with CONFIG_COMPAT.
+          echo "--- informational ---"
+          for s in __arm64_sys_newfstat __arm64_compat_sys_fstatat64 __arm64_compat_sys_fstat64 \
+                   __arm64_sys_getdents64 __arm64_compat_sys_getdents; do
+            printf '  %-32s %s\n' "$s" "$(sym_count "$s")"
+          done
 
           # ---- loader gate: every undefined symbol of the built .ko must be a name
           # this tree's kallsyms has.
@@ -551,6 +565,27 @@ jobs:
         with:
           name: susfs_compat_stat
           path: /tmp/susfs_compat_stat
+          if-no-files-found: warn
+
+      # A 64-bit client for the syscalls the shell cannot reach.  `ls -li` and toybox stat only
+      # exercise newfstatat(79); fstat(80) and statx(291) fill a DIFFERENT struct (statx's is a
+      # separate layout with a mask contract) and are otherwise only reachable through libc, which
+      # a freestanding client deliberately does not link.  Same shape as the compat client above.
+      - name: Build 64-bit stat/statx/fstat client
+        run: |
+          set -e
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_stat tools/susfs_stat.c
+          file /tmp/susfs_stat
+          ls -la /tmp/susfs_stat
+
+      - name: Upload 64-bit stat/statx/fstat client
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_stat
+          path: /tmp/susfs_stat
           if-no-files-found: warn
 
       # The loading half of this project: it loads the .ko on a stock vendor kernel

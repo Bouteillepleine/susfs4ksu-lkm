@@ -30,7 +30,10 @@ abi_layout_check/
 # hardware-specific scaffolding, not part of the module.  Earlier revisions
 # tracked them; this keeps new ones out.  (tools/ is NOT ignored - CI builds
 # tools/susfs_sc.c into the supercall client.)
+# t_dev.ps1 is the same thing on the host side: it pushes and runs those scripts
+# (plus t_*.ps1 scratch), and is only useful against a device this machine owns.
 t_*.sh
+t_*.ps1
 art/
 
 # internal working documents: audit findings, subagent reports, implementation
