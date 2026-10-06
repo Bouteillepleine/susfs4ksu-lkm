@@ -33,16 +33,13 @@ abi_layout_check/
 t_*.sh
 art/
 
-# internal working documents: audit findings, subagent reports, implementation
-# notes.  Publishing them would describe exactly how the module hides itself and
-# what it is checked against - the opposite of the point.  They stay on disk.
+# Documents that are not needed to build or use the module are kept out of the tree:
+# only README.md, PROC_INTERFACES.md and this branch's LEGACY_PORTING.md are published.
 *.md
 !README.md
-# 接口文档是要给使用者的，与 README 同级发布；其余 *.md 仍是内部文档（会写清隐藏手法本身）。
 !PROC_INTERFACES.md
-# The legacy branch's porting map is meant to be read by whoever ports this to a pre-5.10
-# kernel, so it ships with that branch.  It is written at the API/porting level (which
-# release moved which interface), not at the evasion level the internal notes are about.
+# The legacy branch's porting map ships with that branch, for whoever ports this to a
+# pre-5.10 kernel: it is written at the API level (which release moved which interface).
 !LEGACY_PORTING.md
 
 # development-only scaffolding: the probe/test modules and C test programs used
