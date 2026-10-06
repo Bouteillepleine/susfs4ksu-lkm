@@ -59,12 +59,6 @@ adb shell "su -c 'mkdir -p /data/adb/loader && cp /data/local/tmp/susfs_guard_lk
 adb shell "su -c 'sh /data/local/tmp/verify-gki.sh'"
 ```
 
-## 技术说明
-
-各内核版本（5.10–6.18）与厂商内核上的实测数据、ABI/布局结论、13 个 hook 的定位方式，以及踩过一次的坑，
-都按文件、按源码顺序整理在 **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**：每条以它所注释的那行代码为标题，
-`grep -n "<标题>" <文件>` 就能回到原处。
-
 ## 发布
 
 预发布用 tag `v2.3.0-r<N>-dev<M>`，标题写明是预览、这一版修了什么（6.12 / 6.18 标为 preview）。
