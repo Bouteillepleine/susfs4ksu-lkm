@@ -413,6 +413,7 @@ jobs:
                    kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
                    security_hook_heads static_calls_table lsm_active_cnt \
+                   __static_call_update arch_static_call_transform cpus_read_lock \
                    smaps_walk_ops smaps_shmem_walk_ops pagemap_ops \
                    dcache_clean_inval_poc caches_clean_inval_pou __flush_dcache_area \
                    __arm64_sys_getdents64 __arm64_compat_sys_getdents \

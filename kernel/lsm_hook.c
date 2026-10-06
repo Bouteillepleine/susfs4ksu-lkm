@@ -227,14 +227,37 @@ static int ksu_lsm_hook_remove_head(struct ksu_lsm_hook *hook)
 #endif /* < 6.12 */
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-typedef void (*ksu_static_call_update_t)(struct static_call_key *key, void *tramp, void *func);
+/* The kernel's own __static_call_update(), resolved by name at load and called through a __nocfi
+ * wrapper like every other resolved-address call in this module.
+ *
+ * Why not the compile-time one: linux/static_call.h defines __static_call_update() as a
+ * `static __always_inline` unless the kernel was built with CONFIG_HAVE_STATIC_CALL_INLINE, and
+ * the trees this module is compiled against all take the inline arm.  With the inline arm the
+ * call SITE has to be patched (arch_static_call_transform()), and the generic
+ * `WRITE_ONCE(key->func, func)` only changes what a trampoline reads - so on a kernel that has
+ * the inline arm the takeover would silently not take effect.  Resolving the symbol means using
+ * the very implementation the running kernel registers its own hooks with, on any config;
+ * lsm_static_call_init() itself calls it as __static_call_update(scall->key, scall->trampoline,
+ * hl->hook.lsm_func_addr), i.e. with exactly the two values this wrapper passes on.  When the
+ * kernel has no such symbol (every tree this module currently builds against:
+ * CONFIG_HAVE_STATIC_CALL(_INLINE) unset, so it is an inline) the compile-time call is the same
+ * thing and stays the fallback.  Either way the module looks the name up itself, like
+ * static_calls_table and every other by-name symbol - nothing new for the loader. */
+static void (*ksu_static_call_update_fn)(struct static_call_key *key, void *tramp, void *func);
+
+static __nocfi void ksu_lsm_call_scall_update(struct static_call_key *key, void *tramp, void *func)
+{
+    ksu_static_call_update_fn(key, tramp, func);
+}
 
 static int ksu_lsm_hook_update_scall(struct lsm_static_call *scall, void *value)
 {
-    /* The generic arm of __static_call_update() is `WRITE_ONCE(key->func, func)` and cannot
-     * fail - which is the arm these builds compile (the .ko imports neither __static_call_update
-     * nor arch_static_call_transform), so the int return exists only for a tree whose config
-     * selects the inline/arch arm, where the call can reject. Callers check it either way. */
+    if (ksu_static_call_update_fn) {
+        ksu_lsm_call_scall_update(scall->key, scall->trampoline, value);
+        smp_wmb();
+        return 0;
+    }
+
     __static_call_update(scall->key, scall->trampoline, value);
     smp_wmb();
     return 0;
@@ -262,15 +285,9 @@ static int ksu_lsm_hook_update_scall(struct lsm_static_call *scall, void *value)
  * bpf-lsm) still run whenever the hook's default is returned.  The displaced function is
  * called from the replacement (hook->original via SUS_LSM_PASS_ORIG()), so nothing SELinux
  * decided is lost - including the -ECHILD inode_permission's RCU walk depends on.  The only
- * symbol needed is static_calls_table; the write is the kernel's own __static_call_update().
- *
- * Which of linux/static_call.h's three definitions of __static_call_update() is compiled is decided by
- * CONFIG_HAVE_STATIC_CALL(_INLINE), NOT by the architecture; the extern one (kernel/static_call_inline.c)
- * needs HAVE_STATIC_CALL_INLINE, unset in every tree this module is built against.  Measured, not assumed:
- * the built android16-6.12 and android17-6.18 .ko files import neither __static_call_update nor
- * cpus_read_lock nor arch_static_call_transform(), i.e. the generic `WRITE_ONCE(key->func, func)` arm is
- * what got compiled - the same config that makes the trampoline those trees register NULL (security.c's
- * LSM_HOOK_TRAMP()).
+ * symbol needed is static_calls_table; the switch itself goes through
+ * ksu_lsm_hook_update_scall() above, i.e. the kernel's own __static_call_update() whenever
+ * the running kernel has it as a symbol.
  *
  * NOTHING IS WRITTEN until the slot passes all five validations below: the failure this must
  * not have is a jump target that is wrong rather than absent.  Every read uses
@@ -1000,6 +1017,15 @@ void ksu_unregister_lsm_hook(struct ksu_lsm_hook *hook)
  * addresses and calls the exit from the rollback path of a FAILED load, i.e. from plain .text. */
 void ksu_lsm_hook_init(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* The device's own implementation, when it has one as a symbol - see the note on
+     * ksu_lsm_hook_update_scall().  NULL is the normal case on the trees this module is built
+     * against (the header's static inline is not a symbol) and selects the compiled-in call. */
+    ksu_static_call_update_fn = (void *)find_kernel_symbol_exact("__static_call_update");
+    SUSFS_LOGI("lsm_hook: static-call switch via %s\n",
+            ksu_static_call_update_fn ? "the kernel's __static_call_update() symbol" :
+            "the compiled-in __static_call_update() (no such symbol on this kernel)");
+#endif
     SUSFS_LOGI("lsm_hook: init, tracked hooks=%d\n", READ_ONCE(ksu_lsm_hook_count));
 }
 
