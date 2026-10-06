@@ -369,8 +369,12 @@ static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect
                     member, fn, want, buf);
             return 0;
         }
-        pr_warn("lsm_hook: %s: %px resolves to %s%s%s, which is neither %s nor contains \"%s\"\n",
-                member, fn, buf, mod ? " [" : "", mod ? mod : "", mod ? "]" : "", want, member);
+        if (mod)
+            pr_warn("lsm_hook: %s: %px resolves to %s [%s], which is neither %s nor contains \"%s\"\n",
+                    member, fn, buf, mod, want, member);
+        else
+            pr_warn("lsm_hook: %s: %px resolves to %s, which is neither %s nor contains \"%s\"\n",
+                    member, fn, buf, want, member);
         return -EINVAL;
     }
 
