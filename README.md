@@ -61,23 +61,14 @@ adb shell "su -c 'sh /data/local/tmp/verify-gki.sh'"
 
 ## 技术说明
 
-源码里只留贴着代码的短注释（约 3%），其余注释全部原样搬进了 **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**：
-按文件、按源码顺序排列，每条以它所注释的那行代码为标题，`grep -n "<标题>" <文件>` 就能回到原处。
-里面是各内核版本（5.10–6.18）与厂商内核上的实测数据、ABI/布局结论、每个 hook 是怎么定位的，以及踩过一次的坑。
-
-> The sources keep only short notes next to the code (about 3%). Every other comment
-> lives in **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**, in source order, each entry
-> headed by the code line it documented.
+各内核版本（5.10–6.18）与厂商内核上的实测数据、ABI/布局结论、13 个 hook 的定位方式，以及踩过一次的坑，
+都按文件、按源码顺序整理在 **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**：每条以它所注释的那行代码为标题，
+`grep -n "<标题>" <文件>` 就能回到原处。
 
 ## 发布
 
-所有 GitHub release(**含 pre-release**)的描述一律用**英文**书写(自 `v2.3.0-r10` 起的规定)。
-资产固定为各 GKI 变体的 `susfs_guard_lkm-<variant>.ko` 加 `susfs_insmod`(工具只发这一个);
-预发布用 tag `v2.3.0-r<N>-dev<M>`,标题里写明是预览以及这一版修了什么。
-
-> Every GitHub release -- stable **and** pre-release -- carries an **English** description
-> (rule in force since `v2.3.0-r10`).  The assets are the per-variant
-> `susfs_guard_lkm-<variant>.ko` files plus `susfs_insmod` only.
+预发布用 tag `v2.3.0-r<N>-dev<M>`，标题写明是预览、这一版修了什么（6.12 / 6.18 标为 preview）。
+资产固定为各 GKI 变体的 `susfs_guard_lkm-<variant>.ko` 加 `susfs_insmod`（工具只发这一个）。
 
 ## License
 
