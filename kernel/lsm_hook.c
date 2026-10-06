@@ -325,8 +325,32 @@ static bool ksu_lsm_name_is(const char *name, const char *want)
     return name[n] == '\0' || name[n] == '.';
 }
 
-/* Is @fn the SELinux implementation of @member?  0 yes, negative no/unknown.  Primary source is the
- * kallsyms name for @fn (the function really registered); fallback the exact @expect; -ENOSYS = neither. */
+/* Is @fn the SELinux implementation of @member?  0 yes, negative no/unknown.
+ *
+ * Three sources of evidence, strongest first:
+ *   1. the kallsyms name is exactly selinux_<member>, clone suffixes allowed
+ *      (.cold/.isra/.constprop/.llvm.N) - what a stock kernel registers;
+ *   2. the kallsyms name CONTAINS <member>: an OEM wrapper around selinux_<member>, a
+ *      vendor-prefixed symbol, or an LTO renaming that does not begin with the base name.
+ *      This is the relaxation a vendor device needs - issue #1 (6.12.23-android16) refuses to
+ *      load with "holds ... which is not selinux_inode_getattr", and upstream's
+ *      lsm_hook_defs.h / lsm_hooks.h / selinux/hooks.c are byte-identical between v6.12.23 and
+ *      the v6.12 DDK this module is built from, so that device registers something other than
+ *      the stock symbol for this hook.  It does NOT cost the shifted-layout guard: no OTHER
+ *      hook name CONTAINS <member> in any hook list this module builds against (234 hooks on
+ *      5.10, 238/5.15, 243/6.1, 249/6.6, 268/6.12, 273/6.18 - checked pairwise), so a slot
+ *      that belongs to a different hook still cannot match this;
+ *   3. the address equals the resolved selinux_<member> (@expect), used when the kallsyms name
+ *      could not be read at all.
+ *
+ * A module-owned function is refused before either name test: the static-call table lives in
+ * core (security/security.c) and an LSM registered in it cannot come from a module, so a
+ * modname here is a resolution error rather than a renamed hook.
+ *
+ * Both the accept-by-relaxation and every rejection name the function that was actually
+ * found: the caller's message prints only the expected name, which is the one fact a field
+ * report cannot supply (issue #1).
+ */
 static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect)
 {
     char buf[KSYM_SYMBOL_LEN];
@@ -337,8 +361,18 @@ static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect
     snprintf(want, sizeof(want), "selinux_%s", member);
 
     len = ksu_symbol_name_of((unsigned long)fn, buf, &mod);
-    if (len > 0)
-        return (!mod && ksu_lsm_name_is(buf, want)) ? 0 : -EINVAL;
+    if (len > 0) {
+        if (!mod && ksu_lsm_name_is(buf, want))
+            return 0;
+        if (!mod && strstr(buf, member)) {
+            pr_warn("lsm_hook: %s: %px is not %s but its name contains it (%s) - accepting\n",
+                    member, fn, want, buf);
+            return 0;
+        }
+        pr_warn("lsm_hook: %s: %px resolves to %s%s%s, which is neither %s nor contains \"%s\"\n",
+                member, fn, buf, mod ? " [" : "", mod ? mod : "", mod ? "]" : "", want, member);
+        return -EINVAL;
+    }
 
     if (expect)
         return (fn == expect) ? 0 : -EINVAL;
