@@ -1574,7 +1574,7 @@ static int sus_mount_mark_ksu_mounts(void)
         return -ENOENT;
     }
 
-    /* P3: clamp the tunable (a value of 0/1 would match every mount line). */
+    /* clamp the tunable (a value of 0/1 would match every mount line). */
     if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID) {
         pr_warn("sus_mount: min_mnt_id=%lu is below %d, clamping to %llu\n",
                 param_min_mnt_id, SUS_MOUNT_MIN_SANE_MNT_ID, DEFAULT_KSU_MNT_ID);
