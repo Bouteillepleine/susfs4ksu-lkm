@@ -19,12 +19,12 @@
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | sus_path 规则表——**`cat` 就是清单** | `add <路径>` / `del <路径>` / `clear` |
 
-节点只在 sus_path 的 LSM 层装上时才创建（`expose_proc=1` 且 LSM 生效）。
+节点只在 sus_path 的 LSM 层装上时才创建。
 ---
 
 ## /proc/susfs_kstat
 
-登记一个路径，让 app 看到的 `stat()`/`statx()`/`maps` 里的 inode 与时间戳变成登记时的值（`add_sus_kstat` 用"登记那一刻的真实值"作为伪装值）。
+登记一个路径，让 app 看到的 `stat()`/`statx()`/`maps` 里的 inode 与时间戳变成登记时的值。
 
 **读**：每条规则一行，外加两组计数器。
 
@@ -112,7 +112,7 @@ echo "set kernelsu frida"      > /proc/susfs_hide_modules   # 整份替换
 echo clear                     > /proc/susfs_hide_modules   # 一个都不隐藏（调试模式，lsmod 会重新列出本模块）
 ```
 
-已知边界：只过滤"模块自己那一行"。别的模块若**依赖**它，`/proc/modules` 的 used-by 列里仍会出现该名字（实测隐藏 `explorer` 后仍有 `camera 10440704 35 explorer, Live …`）。
+已知边界：只过滤"模块自己那一行"。别的模块若**依赖**它，`/proc/modules` 的 used-by 列里仍会出现该名字。
 
 ---
 
