@@ -1,38 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_sc - minimal SUSFS supercall client, no libc.
- *
- * The module's supercall entry point is the KernelSU reboot ABI:
- *
- *     reboot(KSU_INSTALL_MAGIC1, SUSFS_MAGIC, cmd, payload)
- *
- * (see kernel/susfs_supercall.c: reboot_pre() checks regs[0] against
- * KSU_INSTALL_MAGIC1 and regs[1] against SUSFS_MAGIC -- the second magic is the
- * SUSFS one, not KernelSU's MAGIC2.)
- *
- * The prebuilt ksu_susfs tool covers most commands, but not
- * CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS and not CMD_SUSFS_ADD_SUS_PATH_LOOP,
- * so those have to be sent by hand.  This is the hand: it writes the command
- * number and a caller-supplied payload (as hex) straight to the syscall.
- *
- * Android refuses non-PIE executables, and we have no bionic sysroot in the
- * build container, so this is freestanding: -nostdlib -static-pie with our own
- * _start and raw svc instructions.
- *
- * Build (in the DDK container, same clang that builds the module):
- *
- *     clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
- *           -fno-stack-protector -fuse-ld=lld -Wl,-e,_start \
- *           -o susfs_sc tools/susfs_sc.c
- *
- * Usage:
- *
- *     susfs_sc <cmd-hex> [payload-hex]
- *     susfs_sc 0x55561 0100000000000000      # hide_sus_mnts_for_non_su_procs 1
- *
- * Exit status: 0 on a successful syscall, the syscall's (negated) error
- * otherwise, 2 for a usage error.
- */
 
 typedef unsigned long u64;
 typedef long s64;
@@ -44,18 +10,8 @@ typedef long s64;
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
 #define SUSFS_MAGIC 0xFAFAFAFA
 
-/* Large enough for the biggest payload struct in the ABI
- * (st_susfs_spoof_cmdline_or_bootconfig and st_susfs_enabled_features are 8196:
- * a 4096-byte buffer here made the kernel copy 4 KB past its end). */
 #define PAYLOAD_MAX 8196
 
-/* Every reply struct in kernel/susfs_abi.h ends with its `int err` as the LAST
- * field, and all twelve have sizeof - offsetof(err) == 4 (260/256, 376/372,
- * 136/132, 8/4, 520/516, 8196/8192, 20/16), so when the caller supplies the
- * whole struct as hex the err lives at len-4.  Reading it as
- * `*(unsigned long *)(payload + ((len - 8) & ~7))` - which this tool used to do -
- * rounds DOWN to an 8-byte boundary and therefore prints the four bytes BEFORE
- * err for every struct whose size is 4 mod 8, i.e. for most of them. */
 #define ERR_SEED 126		/* ERR_CMD_NOT_SUPPORTED, like the C tool */
 
 static char payload[PAYLOAD_MAX] __attribute__((aligned(16)));
@@ -204,10 +160,7 @@ int sc_main(long argc, char **argv)
 
 	len = 0;
 	if (argc > 2) {
-		/* parse_hex() returns -1 when the input does not fit in the buffer, so
-		 * an oversized struct is refused here instead of being handed to the
-		 * kernel truncated (the kernel would copy_from_user the full struct and
-		 * read past the end of this buffer). */
+
 		len = parse_hex(argv[2], payload, PAYLOAD_MAX);
 		if (len < 0) {
 			say("susfs_sc: bad or oversized payload hex\n");
@@ -215,10 +168,6 @@ int sc_main(long argc, char **argv)
 		}
 	}
 
-	/* Seed 126 like the stock C tool does: if the kernel does not recognise the
-	 * command it leaves the buffer untouched, and "still 126" is how userspace
-	 * detects "not supported".  Without the seed this client could never show
-	 * that, which was the whole point of its err readback. */
 	if (len >= 4)
 		*(int *)(payload + len - 4) = ERR_SEED;
 
@@ -236,8 +185,7 @@ int sc_main(long argc, char **argv)
 	say(")\n");
 	if (len >= 4 && err == ERR_SEED)
 		say("susfs_sc: err is still the 126 sentinel: this kernel did not answer that command\n");
-	/* Non-zero when either half of the contract failed: the syscall result or
-	 * the err the kernel wrote back. */
+
 	return (rc == 0 && err == 0) ? 0 : 1;
 }
 

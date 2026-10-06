@@ -1,59 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_insmod - load susfs_guard_lkm.ko on a stock vendor kernel, without ksud.
- *
- * The problem
- * -----------
- * A vendor kernel's loader refuses this module for three reasons, and all three of
- * them live in the same place: the SHN_UNDEF branch of simplify_symbols().
- *
- *   1. unexported symbols (kallsyms_lookup_name, saved_boot_config, init_mm,
- *      task_work_add, ...) are not in the kernel's export table at all, so
- *      resolve_symbol() fails and the loader prints "Unknown symbol ... (err -22)";
- *   2. namespaced symbols (kern_path, ihold, override_creds, ...) additionally have
- *      to be imported by name - verify_namespace_is_imported() is the
- *      "VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver" refusal that a
- *      plain `insmod` hits;
- *   3. symbol CRCs (check_version()) and the Android KMI whitelist are checked
- *      there too.
- *
- * `case SHN_ABS:` does nothing but break (kernel/module.c, ~2342 in 5.15) and
- * relocation uses st_value verbatim for such a symbol.  So an undefined symbol that
- * has already been rewritten to st_shndx = SHN_ABS / st_value = <runtime address>
- * before the image reaches the kernel never enters any of those checks.  That is
- * exactly what ksud's userspace loader (SukiSU-Ultra userspace/ksuinit/src/lib.rs,
- * load_module()) does, and what this tool does:
- *
- *   1. map the .ko MAP_PRIVATE|PROT_WRITE (writes stay in this process' memory);
- *   2. walk .symtab: for every SHN_UNDEF entry with a non-empty name, look the name
- *      up in /proc/kallsyms and rewrite that Elf64_Sym in place to
- *      st_shndx = SHN_ABS, st_value = <address> (last kallsyms occurrence wins);
- *   3. init_module(2) the patched buffer with the joined module parameters;
- *   4. if that fails and /dev/kmsg says the vermagic is wrong, patch the .modinfo
- *      "vermagic=" value in place and retry once.
- *
- * What it deliberately does NOT do
- * --------------------------------
- *   * no finit_module(2) (no fd, so no signature step at open), no KernelSU
- *     supercall, no /data/adb/ksu or ksud binary dependency;
- *   * no section is resized: the vermagic fixup keeps the .modinfo bytes exactly as
- *     long as they were.  The kernel's next_string() skips NUL padding, so a shorter
- *     required value is NUL-padded in place and a longer one is truncated - and
- *     that truncation is reported, never silent;
- *   * no address guessing: if /proc/kallsyms only prints zeroes (kptr_restrict),
- *     the load is refused rather than attempted with SHN_ABS/0 symbols;
- *   * no vermagic "fix" that the kernel did not ask for: the patch runs only after
- *     the kernel itself printed "version magic '...' should be '...'".
- *
- * Build (this is the recipe the CI tools job uses):
- *
- *   clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
- *         -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
- *         -o susfs_insmod tools/susfs_insmod.c
- *
- * Usage: susfs_insmod [-v] <module.ko> [module-params ...]
- * Exit:  0 on a successful load, else the failing syscall's errno (2 for usage).
- */
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -61,14 +6,7 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 typedef long s64;
 
-/* The type a syscall number, argument and return value travels in: pointer-sized.
- * On the target it is plain `long`; a host build (SUSFS_INSMOD_HOSTTEST) must also
- * be able to hand a pointer through it, so it is spelled the compiler's way. */
 typedef __INTPTR_TYPE__ sysarg;
-
-/* -------------------------------------------------------------------------- *
- * syscalls (aarch64, asm-generic numbering)                                   *
- * -------------------------------------------------------------------------- */
 
 #define SYS_exit	93
 #define SYS_read	63
@@ -88,9 +26,6 @@ typedef __INTPTR_TYPE__ sysarg;
 #define PROT_WRITE	2
 #define MAP_PRIVATE	2
 
-/* The only host-dependent line in this file: the actual svc on the target, a shim
- * when the ELF/kallsyms/vermagic logic is exercised off-device
- * (-DSUSFS_INSMOD_HOSTTEST; nothing else is conditional except the _start block). */
 #if defined(SUSFS_INSMOD_HOSTTEST)
 extern sysarg sys6(sysarg n, sysarg a, sysarg b, sysarg c, sysarg d, sysarg e, sysarg f);
 #else
@@ -112,20 +47,12 @@ static sysarg sys6(sysarg n, sysarg a, sysarg b, sysarg c, sysarg d, sysarg e, s
 }
 #endif
 
-/* -------------------------------------------------------------------------- *
- * output (one line at a time, so a failing load still prints its diagnostics)  *
- * -------------------------------------------------------------------------- */
-
 #define OUT_MAX 8192
 static char out_buf[OUT_MAX];
 static u64 out_len;
 
 static int verbose;
 
-/* Defined below.  o_flush() must go through it instead of calling SYS_exit directly: a failed
- * stdout write (EPIPE - `susfs_insmod x.ko | head`, a reader that went away, a closed fd)
- * would otherwise leave /proc/sys/kernel/kptr_restrict at the 0 this tool wrote, i.e. kernel
- * addresses readable by every process on the device until the next reboot. */
 static void finish(int code);
 
 static void o_flush(void)
@@ -286,10 +213,6 @@ static void die2(const char *msg, const char *what, sysarg err)
 	finish((int)(-err));
 }
 
-/* -------------------------------------------------------------------------- *
- * tiny string helpers (no libc: the build is -nostdlib)                       *
- * -------------------------------------------------------------------------- */
-
 static u64 s_len(const char *s)
 {
 	u64 n = 0;
@@ -332,10 +255,6 @@ static sysarg find_sub(const char *hay, u64 hlen, const char *needle, u64 nlen)
 	}
 	return -1;
 }
-
-/* -------------------------------------------------------------------------- *
- * ELF64 little-endian                                                     *
- * -------------------------------------------------------------------------- */
 
 #define EI_CLASS	4
 #define EI_DATA		5
@@ -391,18 +310,10 @@ struct elf64_sym {
 	u64 st_size;
 };
 
-/* The three layouts above are the ABI the kernel parses; a silent padding change
- * would move every field this tool writes, so fail the build instead. */
 typedef char assert_ehdr_size[(sizeof(struct elf64_ehdr) == 64) ? 1 : -1];
 typedef char assert_shdr_size[(sizeof(struct elf64_shdr) == 64) ? 1 : -1];
 typedef char assert_sym_size[(sizeof(struct elf64_sym) == 24) ? 1 : -1];
 
-/* -------------------------------------------------------------------------- *
- * kallsyms                                                                    *
- * -------------------------------------------------------------------------- */
-
-/* How many undefined symbols this tool is willing to carry.  The module has ~100;
- * 4096 leaves room for a much bigger module and still fits in .bss. */
 #define MAX_UNDEF 4096
 #define MAX_LISTED 10
 
@@ -423,9 +334,6 @@ static u64 ks_addr;		/* records with a real address (any type) */
 static u64 ks_dotted;		/* names with a '.' - not matchable by this tool */
 static u64 ks_abs_type;		/* type a/A: absolute symbols, not addresses */
 
-/* Save kptr_restrict and set it to 0, the way ksud does (it writes 1; root sees
- * real addresses at both values, the kernel's kallsyms_show_value() falls through
- * to the CAP_SYSLOG test).  Called before the first kallsyms read. */
 static void kptr_relax(void)
 {
 	sysarg fd;
@@ -477,12 +385,6 @@ static void kptr_relax(void)
 	}
 }
 
-/* One "<hex-address> <type> <name>" kallsyms line.  The type letter is the 2nd
- * field; 'a'/'A' means an absolute symbol whose printed value is NOT a runtime
- * address, so it is skipped.  A name containing '.' is skipped too: kallsyms is
- * full of compiler-generated names (.cold, .llvm.<hash>, $local aliases) and none
- * of them can be the undefined name of a linkable module symbol - matching is
- * exact, so a dotted undefined name would still match a dotted kallsyms name. */
 static void ks_record(const char *s, u64 len, u32 *matched, u32 *zero_addr)
 {
 	u64 i = 0;
@@ -563,9 +465,7 @@ static void ks_record(const char *s, u64 len, u32 *matched, u32 *zero_addr)
 			continue;
 		if (!s_eq_n(u->name, s + i, nlen))
 			continue;
-		/* Last occurrence wins: a name may be defined more than once (a static
-		 * inline that the compiler emitted in several TUs); the last one is the
-		 * one a module link would have taken. */
+
 		u->sym->st_shndx = SHN_ABS;
 		u->sym->st_value = addr;
 		u->resolved = 1;
@@ -574,9 +474,6 @@ static void ks_record(const char *s, u64 len, u32 *matched, u32 *zero_addr)
 	}
 }
 
-/* Stream /proc/kallsyms and rewrite the symbol entries as matches arrive.  The
- * file is ~10 MB on a GKI kernel, so it is read in chunks with a line assembler
- * instead of being slurped whole. */
 static sysarg resolve_symbols(void)
 {
 	static char rbuf[65536];
@@ -615,16 +512,10 @@ static sysarg resolve_symbols(void)
 	return (sysarg)matched;
 }
 
-/* -------------------------------------------------------------------------- *
- * kernel log (/dev/kmsg, /proc/kmsg)                                          *
- * -------------------------------------------------------------------------- */
-
 #define KMSG_MAX 32768
 static char kbuf[KMSG_MAX];
 static u64 kbuf_len;
 
-/* Open the record device *before* the load attempt: /proc/kmsg is a read-once
- * stream, and /dev/kmsg needs a seek to the end to mean "only new records". */
 static sysarg kmsg_open(void)
 {
 	sysarg fd;
@@ -713,9 +604,6 @@ static void kmsg_report(void)
 		o_put(P "kernel log: no load-related records in the new kmsg data\n");
 }
 
-/* The kernel's own message is
- *     <name>: version magic '<module magic>' should be '<kernel magic>'
- * and the value we must install is the second one.  Last occurrence wins. */
 static const char *kmsg_required_vermagic(u64 *out_len)
 {
 	static const char pfx[] = "version magic '";
@@ -747,12 +635,6 @@ static const char *kmsg_required_vermagic(u64 *out_len)
 	return hit;
 }
 
-/* -------------------------------------------------------------------------- *
- * .modinfo                                                                    *
- * -------------------------------------------------------------------------- */
-
-/* Walk the NUL-separated entries the kernel's next_string() walks.  Returns the
- * value of "vermagic=" with its own (unterminated) length. */
 static int modinfo_lookup(char *base, u64 size, const char *key, char **val, u64 *vlen)
 {
 	u64 klen = s_len(key);
@@ -776,10 +658,6 @@ static int modinfo_lookup(char *base, u64 size, const char *key, char **val, u64
 	}
 	return -1;
 }
-
-/* -------------------------------------------------------------------------- *
- * main                                                                        *
- * -------------------------------------------------------------------------- */
 
 static void usage(void)
 {
@@ -944,8 +822,7 @@ void insmod_main(long argc, char **argv)
 		undefs[nundef].len = (u32)nlen;
 		undefs[nundef].bind = (u8)(sym->st_info >> 4);
 		undefs[nundef].resolved = 0;
-		/* A duplicate name in .symtab would resolve both entries through the
-		 * same name lookup, so there is nothing to deduplicate here. */
+
 		nundef++;
 	}
 
@@ -1094,10 +971,6 @@ void insmod_main(long argc, char **argv)
 	o_put("\")\n");
 	o_flush();
 
-	/* param_values is NEVER NULL, not even with no parameters: load_module() calls
-	 * strndup_user(uargs, ...) unconditionally (5.15 kernel/module.c:4046), and
-	 * strndup_user(NULL) is -EFAULT.  ksud passes a CStr for the same reason.  The
-	 * buffer below is static and always NUL-terminated, so "" is a valid argument. */
 	ret = sys6(SYS_init_module, (sysarg)img, (sysarg)size,
 		   (sysarg)params, 0, 0, 0);
 
@@ -1124,8 +997,7 @@ void insmod_main(long argc, char **argv)
 
 		req = kmsg_required_vermagic(&vlen);
 		if (!req) {
-			/* No vermagic complaint: do not invent one.  The kernel's own
-			 * records above are the reason. */
+
 			o_put(P "no \"version magic ... should be ...\" in the kernel log: "
 			      "not patching the vermagic\n");
 			o_flush();
@@ -1166,11 +1038,7 @@ void insmod_main(long argc, char **argv)
 				for (j = vlen; j < vlen_old; j++)
 					val[j] = 0;	/* next_string() skips NUL padding */
 			} else {
-				/* The value does not fit and the section must not grow.
-				 * Keep the REQUIRED value's tail: with CONFIG_MODVERSIONS
-				 * the kernel compares only the part after the first space
-				 * (same_magic()), and the version prefix is exactly the
-				 * part that legitimately differs between builds. */
+
 				copy_n(val, req + (vlen - vlen_old), vlen_old);
 				o_put(P "warning: required vermagic is longer than the slot; "
 				      "truncated its head, kept the tail\n");

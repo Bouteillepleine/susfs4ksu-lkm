@@ -1,29 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_mntid - look at the mount ids the way a detector would.
- *
- * Hiding a line from /proc/self/mountinfo is not enough on its own: the same
- * mount id is printed by /proc/self/fdinfo/N ("mnt_id:\t<i>") and returned by
- * statx(2) (stx_mnt_id).  An app needs no root to open an fd on a path, read its
- * fdinfo, call statx and compare both numbers against the ids mountinfo lists -
- * and any id that mountinfo never mentions is a mount that was hidden.
- *
- * This tool does exactly that and prints a verdict, so a rule can be measured
- * instead of assumed:
- *
- *   mountinfo: <lines> lines, <ids> distinct ids, <big> ids >= 2000000000
- *   path=<p> fd=<n> fdinfo_mnt_id=<i> in_mountinfo=<yes|NO>
- *   path=<p> statx_mnt_id=<i> in_mountinfo=<yes|NO>
- *   summary: fdinfo_missing=<n> statx_missing=<n>
- *
- * Freestanding like the other tools (no libc, -nostdlib -static-pie):
- *
- *     clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
- *           -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
- *           -o susfs_mntid tools/susfs_mntid.c
- *
- * Usage: susfs_mntid <path> [path...]
- */
 
 typedef unsigned long u64;
 typedef long s64;

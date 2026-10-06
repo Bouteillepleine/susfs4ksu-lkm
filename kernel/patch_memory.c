@@ -16,8 +16,6 @@
 #include <asm/cacheflush.h>
 #include <asm-generic/fixmap.h>
 
-/* Translate a kernel virtual address to a physical address by walking the init_mm page tables (section/leaf
- * mappings at p4d/pud/pmd included).  Returns the physical address, or 0 and sets *err on failure. */
 unsigned long phys_from_virt(unsigned long addr, int *err)
 {
     struct mm_struct *mm = &init_mm;
@@ -68,8 +66,6 @@ fail:
     return 0;
 }
 
-/* dcache/icache flush: 5.14+ replaced __flush_dcache_area/__flush_icache_range
- * with dcache_clean_inval_poc / caches_clean_inval_pou. */
 #if KSU_NEW_DCACHE_FLUSH
 #define ksu_flush_dcache(start, sz)                                                    \
     ({                                                                                 \

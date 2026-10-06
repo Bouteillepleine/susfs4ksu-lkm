@@ -1,50 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_bench - micro-benchmark for the syscall interception layers, no libc.
- *
- * The point is to measure what the hook costs per call, which is far below what a
- * shell loop can resolve: the fp layer adds a wrapper call, one strncpy_from_user
- * and one rule match to every hooked syscall, all of it in the hundred-nanosecond
- * range.  So this is a tight loop around four syscalls with only
- * clock_gettime(CLOCK_MONOTONIC) around it - no libc, no printf, no allocation.
- *
- * Run it four times and compare:
- *
- *   no module                       -> baseline
- *   module, no rule                 -> the layers are not armed at all
- *   module, rule that does NOT hit  -> the wrapper's full path, then the original
- *   module, rule that DOES hit      -> the wrapper answers ENOENT before the original
- *
- * Android refuses non-PIE executables and the DDK container has no bionic sysroot,
- * so this is freestanding: -nostdlib -static-pie with our own _start.
- *
- * Build (in the DDK container, same clang that builds the module):
- *
- *     clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
- *           -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
- *           -o susfs_bench tools/susfs_bench.c
- *
- * Usage:
- *
- *     susfs_bench <path> [iterations]      # default 200000 iterations
- *
- * Timing side channel mode.  The question it answers is not "how much does the
- * hook cost" but "can a process tell the difference between a path that is hidden
- * and a path that is simply not there" - both answer ENOENT, so if their timings
- * separate, the denial itself is the leak.  Measuring two paths in separate runs
- * would compare thermal/scheduler drift instead of the paths, so the two are
- * measured ALTERNATELY, one batch each, and the printed statistics are of the
- * paired differences:
- *
- *     susfs_bench -p <kind> <iters-per-sample> <samples> <pathA> <pathB>
- *
- * kinds: 1=faccessat 2=fchownat 3=newfstatat 4=statx 5=openat+close
- *
- * Each sample is the average of <iters-per-sample> calls (the clock is read per
- * batch, not per call - a syscall-based clock costs more than the thing being
- * measured).  The verdict line prints YES only when the paired differences do not
- * change sign, i.e. when a checker could classify a single batch.
- */
 
 typedef unsigned long u64;
 typedef long s64;
@@ -127,8 +81,6 @@ static u64 putnum(char *dst, u64 pos, u64 v)
 	return pos;
 }
 
-/* Both of these are system calls here: the ABI passes nanoseconds in the second
- * word, which is all this needs. */
 static u64 now_ns(void)
 {
 	long ts[2];
@@ -212,8 +164,7 @@ static long one_call(int kind, const char *path)
 			sys6(SYS_close, fd, 0, 0, 0, 0, 0);
 		return fd;
 	case 6:
-		/* Directory listing: the dirent layer rewrites the buffer, so this is the
-		 * face where a per-call cost is most likely to show up. */
+
 		fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY | O_DIRECTORY, 0, 0, 0);
 		if (fd < 0)
 			return fd;
@@ -224,10 +175,6 @@ static long one_call(int kind, const char *path)
 	return -1;
 }
 
-/* Written straight into the output buffer instead of returning a literal: a switch
- * returning string literals made clang emit a table of absolute addresses in
- * .rodata, which ld.lld refuses for a static-PIE binary ("relocation
- * R_AARCH64_ABS64 cannot be used against local symbol; recompile with -fPIC"). */
 static u64 put_kind(u64 pos, int kind)
 {
 	if (kind == 1)
@@ -267,8 +214,6 @@ static long pct(const long *sorted, int n, int p)
 	return sorted[idx];
 }
 
-/* Both paths are measured alternately, one batch each, so that a frequency drop
- * or a background task hits both sides of the pair instead of one of them. */
 static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
 {
 	int i, j;
@@ -293,8 +238,7 @@ static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
 
 	isort(sa, n);
 	isort(sb, n);
-	/* The differences get sorted for percentiles; the sign test below only needs
-	 * the ends, which survive sorting. */
+
 	{
 		long dmin = sd[0], dmax = sd[0];
 
@@ -341,9 +285,7 @@ static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
 		pos = putnum_s(pos, pct(sd, n, 90));
 		pos = putstr(pos, " max=");
 		pos = putnum_s(pos, dmax);
-		/* The verdict has to be an error rate, not "did every sample agree": one
-		 * disturbed sample out of 120 is not what a checker would trip over, it
-		 * would put a threshold at zero and be right the rest of the time. */
+
 		pos = putstr(pos, "  sign(neg=");
 		{
 			int neg = 0;
@@ -392,10 +334,6 @@ void bench_main(long argc, char **argv)
 	if (argc > 2)
 		iters = parse_num(argv[2]);
 
-	/* Pin to one CPU.  Without this the loop migrates between the big and the
-	 * little cores and the per-call number moves by more than the difference
-	 * being measured - the same noise that made single-pass measurements
-	 * useless.  CPU 7 is a big core on this SoC. */
 	{
 		unsigned long mask = 1ul << 7;
 
@@ -418,19 +356,11 @@ void bench_main(long argc, char **argv)
 		return;
 	}
 
-	/* Warm up: the first pass over a cold path resolver is not what we measure,
-	 * and the rule table/matches are per-call anyway. */
 	for (i = 0; i < 1000; i++)
 		sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)statbuf, 0, 0, 0);
 
-	/* The interesting difference is a few hundred nanoseconds on a phone that is
-	 * also running Android, so a single pass is mostly noise.  Take the best of
-	 * several: the minimum is the run that was least disturbed, which is the
-	 * number the layer itself is responsible for. */
 #define ROUNDS 10
-	/* No entry of ours is involved, so this line is the cost of whatever fires on
-	 * *every* syscall - tracepoints mainly.  It is the number that shows whether a
-	 * per-syscall callback is still being paid. */
+
 	best_getpid = ~0ull;
 	for (r = 0; r < ROUNDS; r++) {
 		t0 = now_ns();
@@ -491,8 +421,6 @@ void bench_main(long argc, char **argv)
 	}
 	report("openat+close", iters, best);
 
-	/* Keep the compiler honest: rc is used so the loops cannot be optimised
-	 * away, and its value is not interesting. */
 	if (rc == 0x7fffffff)
 		sys6(SYS_write, 1, (long)"unexpected\n", 11, 0, 0, 0);
 }

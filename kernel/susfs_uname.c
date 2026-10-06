@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_uname.c - spoof uname release/version (SUSFS SPOOF_UNAME).  Upstream patches the body of
- * SYSCALL_DEFINE1(newuname) between the memcpy(utsname) and copy_to_user; the LKM equivalent hooks
- * __arm64_sys_newuname with a kretprobe and rewrites the release/version fields of the user buffer just before
- * the syscall returns - the target pages were just faulted in by the original copy_to_user, so the handler's
- * copy_to_user cannot fault, and "default" copies the device's CURRENT utsname()->release/version at runtime.
- * Upstream semantics: OFF by default, enabled by CMD_SUSFS_SET_UNAME alone, kretprobe registered lazily.
- */
+
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
@@ -40,8 +33,6 @@ static int kr_newuname_entry(struct kretprobe_instance *ri, struct pt_regs *regs
     struct uname_args *a = (struct uname_args *)ri->data;
     struct pt_regs *user = (struct pt_regs *)regs->regs[0];
 
-    /* this GKI kernel does NOT auto-adjust syscall-wrapper probe regs:
-     * regs->regs[0] is the struct pt_regs* argument, not the user arg */
     if (!user)
         return 1;   /* no return handler: ri->data would be left stale */
 

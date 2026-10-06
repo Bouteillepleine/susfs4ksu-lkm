@@ -1,28 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * sus_path.c - SUSFS SUS_PATH for the LKM, in two independent layers.
- *
- * Upstream sets AS_FLAGS_SUS_PATH on inode->i_mapping, skips the entry inside
- * filldir64() (fs/readdir.c) and hides it from path-based access by patching
- * fs/namei.c (link_path_walk returns -ENOENT; __lookup_slow/lookup_open redo the
- * lookup with the fake qstr "..5.u.S").  This LKM can touch neither - filldir64 is
- * static and LTO-inlined, namei.c is compiled into the kernel - so it reproduces
- * both effects: the getdents64 buffer is rewritten on return (layer 1, by (dev,
- * ino)), and two LSM hooks answer registered inodes with -ENOENT (layer 2:
- * inode_getattr for stat/fstatat/statx, inode_permission for
- * open/exec/chmod/truncate/...).
- *
- * Matching mirrors upstream: exact inode identity (not name substrings), any number
- * of registered paths, hidden wherever that inode is reached ('..', '//', relative
- * paths, symlinks, hard links, /proc/self/root/...), and the upstream gate - app
- * processes only and never a file owned by the caller (sus_path_gate_ok;
- * hide_from_apps=0 disables the gate for a root shell).  A path registered before it
- * exists is kept and hidden once it appears, upstream's CMD_SUSFS_ADD_SUS_PATH_LOOP /
- * LH_SUS_PATH_LOOP behaviour (sus_path_resolve_pending()).
- *
- * Upstream's FUSE_SUPER_MAGIC branch (susfs.c:71-84, :151-166, :195-212) has no
- * equivalent here on purpose - see the note above sus_path_inode_hidden().
- */
+
 #include <linux/module.h>
 #include <linux/delay.h>	/* ndelay, for the timing cover */
 #include <linux/random.h>	/* prandom_u32_max, for its jitter */
@@ -54,31 +31,15 @@
 
 #include "lsm_hook.h"
 
-/* Bounce buffer for the dirent rewrite: one record at a time, so only a single
- * record - not a whole listing - has to fit; one that does not fit is left
- * unfiltered and the rewrite stops there (counted and logged). */
 #define DIRENT_BUF_SIZE 65536
 #define SUS_PATH_MAX_ENTRIES 8192
-/* Deferred resolution of rules whose path does not exist yet - upstream's
- * CMD_SUSFS_ADD_SUS_PATH_LOOP semantics (sus_path_resolve_pending()): retry every
- * SUS_PATH_PENDING_RETRY_S seconds, stop after SUS_PATH_PENDING_TRIES timer attempts
- * (the rule itself stays registered), at most SUS_PATH_PENDING_BUDGET lookups per pass. */
+
 #define SUS_PATH_PENDING_RETRY_S 2
 #define SUS_PATH_PENDING_TRIES 60
 #define SUS_PATH_PENDING_BUDGET 128
 /* Longest registered path; 256 matches the ABI's target_pathname field. */
 #define SUS_PATH_LEN 256
 
-/* Syscall numbers, spelled out per arch/arm64/include/asm/unistd32.h (asm/unistd.h is
- * unreachable in this build) and include/uapi/asm-generic/unistd.h (native):
- *   native   61  __NR_getdents64
- *   AArch32 217  getdents64 - the SAME native body, so it shares 61's layout
- *   AArch32 141  getdents   - its own compat body (__arm64_compat_sys_getdents)
- *   native  106  __NR_getdents: the native unistd table has NO entry for it (see the
- *                note above sus_path_dirent_filter()), kept only so the dispatcher
- *                stays honest about which numbers it knows.
- * The dispatcher that reaches this file is the sys_exit tracepoint in susfs_kstat.c
- * (kernel/susfs_kstat.c: kstat_sys_exit()), which passes the caller's syscall number. */
 #define __NR_compat_getdents64 217
 #define __NR_compat_getdents 141
 #define __NR_native_getdents64 61
@@ -92,39 +53,24 @@ struct linux_dirent64 {
     char d_name[];
 };
 
-/* One registered path, kept for two independent mechanisms: the dirent filter hides
- * the entry (dev+ino+name) on every listing ABI this kernel reaches, and the LSM
- * hooks reject path-based access by the ihold'ed inode pointer - what upstream's
- * AS_FLAGS_SUS_PATH inode flag achieves.  dev is diagnostics only: the dirent filter
- * never sees the listing's fd or superblock. */
 struct sus_path_entry {
     struct list_head list;
-    /* ihold'ed once resolved, NULL while PENDING (registered for a path that does
-     * not exist yet, upstream's _LOOP variant); a pending rule pins nothing. */
+
     struct inode *inode;
     u64 dev;
     u64 ino;
     char name[NAME_MAX + 1];
-    /* The path as registered, stored without a trailing slash
-     * (path_len == strlen(path)). */
+
     char path[SUS_PATH_LEN];
     unsigned int path_len;
-    /* Resolution pass that last tried this entry (0 = never): stops one pass from
-     * retrying the same rule, without holding a pointer across kern_path(). */
+
     unsigned int pass;
-    /* One of the module's own control nodes (/proc/susfs_*): hidden from every
-     * non-root caller, not only apps - see sus_path_entry_gate_any(). */
+
     bool self_protect;
     /* Pre-relax mode, 0 = this rule did not touch it (sus_path_relax_mode()). */
     umode_t orig_mode;
 };
 
-/* Let DAC through, so that the LSM layer is the only thing that can refuse: DAC runs before the
- * LSM chain and answers EACCES for a denying mode before any hook could turn it into ENOENT.
- * Relaxing once at registration - the one moment the inode is in hand - costs nothing afterwards,
- * unlike the old per-check DAC probes.  It is not disguised back on the way out: only non-root
- * callers are hidden at all, and root can see the file anyway.  The inode is ihold'ed for the
- * rule's lifetime, so it cannot be evicted and re-read with the original mode. */
 static void sus_path_relax_mode(struct sus_path_entry *e)
 {
     umode_t mode;
@@ -155,13 +101,10 @@ static LIST_HEAD(sus_path_list);
 static DEFINE_SPINLOCK(sus_path_lock);
 static unsigned int sus_path_count;
 
-/* Rules waiting for their path to appear, counted so every fast path can bail out at
- * once; guarded by sus_path_lock. */
 static atomic_t sus_path_n_pending = ATOMIC_INIT(0);
 static unsigned int sus_path_pass_gen;      /* guarded by sus_path_lock */
 static atomic_t sus_path_pending_tries = ATOMIC_INIT(0);
-/* One resolution pass at a time: the supercall and the retry timer would race on the
- * same entries and on the per-entry pass marker. */
+
 static DEFINE_MUTEX(sus_path_pending_lock);
 
 static void sus_path_pending_work(struct work_struct *w);
@@ -172,32 +115,16 @@ static char hide_name[NAME_MAX + 1];
 module_param_string(hide_name, hide_name, sizeof(hide_name), 0644);
 
 static char *dirent_tmp;
-/* Isolation test: with no_extra=1 the LSM replacement and the dirent filter are
- * not registered at all. */
+
 static int no_extra;
 module_param(no_extra, int, 0644);
 
-/* Guards dirent_tmp, one global scratch buffer: the probes can fire concurrently, and without this
- * two listings compact into the same buffer and one process can get another directory's entries.
- * sus_path_lock cannot be reused - sus_path_is_hidden() takes it inside the traversal. */
 static DEFINE_SPINLOCK(sus_path_buf_lock);
 
-/* Dirent rewrites that stopped early (record too large for the bounce buffer, or a uaccess fault):
- * the counter and the ratelimited log make "the listing was not filtered" visible. */
 static atomic_t n_dirent_rewrite_fail = ATOMIC_INIT(0);
-/* Chunks that were entirely hidden and needed a placeholder record instead of EOF -
- * see sus_path_filter(). */
+
 static atomic_t n_dirent_all_hidden = ATOMIC_INIT(0);
 
-/* ---- the resolver's own exemption ----
- * The background resolution of a pending rule has to ask the VFS itself (kern_path), and that walk
- * passes through our own hooks once the rule HAS an inode, so it would be answered -ENOENT and
- * re-resolution could never succeed - measured on the device: without the exemption the rule stays
- * pending forever.  Upstream has no such trap (its hiding is a flag on an inode, not a refusal to
- * answer) and walks under override_creds(ksu_cred) from the workqueue (susfs.c:139, reverted at
- * susfs.c:171) - see sus_path_override_creds().  Exactly one task is exempt, the one inside the
- * resolve call, so every other process keeps being hidden for the whole window; it is cleared right
- * after kern_path() returns, on every path. */
 static struct task_struct *sus_path_resolver;
 
 static inline bool sus_path_is_resolver(void)
@@ -205,15 +132,6 @@ static inline bool sus_path_is_resolver(void)
     return READ_ONCE(sus_path_resolver) == current;
 }
 
-/* Upstream resolves its _LOOP list from a workqueue worker under
- * override_creds(ksu_cred) (susfs.c:139 ... revert_creds() at :171): a worker's creds are not the
- * ones the path should be visible to, and SELinux, DAC and our own gate can tell the difference.
- * Measured on device: a kworker walks as uid 0 in the kernel domain, so
- * kern_path("/data/local/tmp/...") comes back -EACCES and the rule stays pending forever
- * (pend: last-rc=-13).  ksu_cred lives in the `kernelsu` module and
- * find_kernel_symbol_exact() deliberately refuses module symbols ("ignore symbol ... of module
- * ..."), so the creds of whoever registered the rule are saved instead - one reference, released on
- * unload - and that process can by definition reach the path. */
 static const struct cred *sus_path_pending_cred;
 static DEFINE_MUTEX(sus_path_cred_lock);
 static atomic_t sus_path_used_caller_cred = ATOMIC_INIT(0);
@@ -232,11 +150,6 @@ static void sus_path_save_caller_cred(void)
         put_cred(old);
 }
 
-/* Returns the cred revert_creds() wants, and stores in @borrowed the reference THIS call took.
- * get_cred() is what keeps the cred alive for the walk (the table's entry can be replaced
- * meanwhile), and revert_creds() only puts the reference override_creds() itself took - so
- * @borrowed has to be put here too, or every pass leaks one cred and pins the registering
- * process' user_ns/ucounts until the module is unloaded. */
 static const struct cred *sus_path_override_creds(const struct cred **borrowed)
 {
     const struct cred *cred;
@@ -275,8 +188,6 @@ static void sus_path_drop_caller_cred(void)
         put_cred(old);
 }
 
-/* What the pending machinery did, for hide_list: "still pending" has to be
- * distinguishable from "the timer never ran" and from "the walk keeps failing". */
 static atomic_t sus_path_pend_passes = ATOMIC_INIT(0);      /* resolve passes run */
 static atomic_t sus_path_pend_ticks = ATOMIC_INIT(0);       /* timer ticks run */
 static atomic_t sus_path_pend_walks = ATOMIC_INIT(0);       /* walks that succeeded */
@@ -284,18 +195,9 @@ static atomic_t sus_path_pend_lost = ATOMIC_INIT(0);        /* walk ok, rule gon
 static atomic_t sus_path_pend_last_rc = ATOMIC_INIT(0);     /* last walk result */
 static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already reported */
 
-/* ---- gates ----
- * Defined up here because every decision layer below asks the same question. */
-
-/* Upstream gates on susfs_is_current_proc_umounted_app() && is_i_uid_not_allowed(): only app
- * processes, and never a file owned by the caller.  TIF_PROC_UMOUNTED is a SUSFS-specific thread
- * flag this LKM does not have, so uid >= 10000 is the proxy.  hide_from_apps=0 applies the hidden
- * set to every process including root - handy when testing from an adb shell. */
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
-/* UID half of the upstream gate: a PENDING rule has no inode to ask about ownership
- * (sus_path_entry_gate_any()). */
 static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
@@ -303,10 +205,6 @@ static inline bool sus_path_gate_uid_ok(void)
     return current_uid().val >= 10000;
 }
 
-/* Full upstream gate for the LSM layer: app process, and the file is not owned by the caller
- * (upstream is_i_uid_not_allowed()).  hide_from_apps=0 must bypass the WHOLE gate, ownership check
- * included - otherwise a root-owned file would still be skipped for root (0 != 0 is false) and
- * disabling the gate would silently do nothing for exactly the case it is meant for. */
 static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
@@ -316,11 +214,6 @@ static inline bool sus_path_gate_ok(struct inode *inode)
     return current_uid().val != inode->i_uid.val;
 }
 
-/* Per-rule gate.  A self_protect rule is one of this module's own control nodes, which must be
- * invisible to EVERY non-root caller: the ordinary gate is uid >= 10000, so a probe running as
- * system (1000) or shell (2000) would read /proc/susfs_kstat straight out of the listing - exactly
- * the trace this module exists to avoid.  Root keeps access to manage the module; ordinary rules
- * keep the upstream semantics untouched. */
 static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
                                              struct inode *inode)
 {
@@ -329,13 +222,6 @@ static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
     return sus_path_gate_ok(inode);
 }
 
-/* Gate for the layers that match by (ino, name) or by path string rather than by the inode being
- * accessed: the dirent filter and the path matcher.  Applying the uid half alone made them answer
- * differently from the LSM layer for the case upstream's gate is really about - a file owned by the
- * calling app disappeared from the listing while stat()/open() still succeeded, and a listing that
- * omits a file the caller can open is a far louder signal than either behaviour alone.  The rule
- * keeps its inode ihold'ed, so the ownership question is asked of that very inode: no cached uid,
- * and a chown() moves both layers together.  A rule not resolved yet falls back to the uid half. */
 static inline bool sus_path_entry_gate_any(const struct sus_path_entry *e)
 {
     if (e->self_protect)
@@ -350,15 +236,9 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
     struct sus_path_entry *e;
     bool hidden = false;
 
-    /* The one resolving task is never answered "hidden": its own walk would be
-     * refused by this very table (see the block above sus_path_resolver). */
     if (sus_path_is_resolver())
         return false;
 
-    /* A dirent is identified by (d_ino, name) and nothing else here - the filter never sees the fd
-     * or the superblock.  A rule whose inode reports 0 has no identity to match, and d_ino 0 is
-     * what some filesystems use for "unknown", so matching it by name alone would hide unrelated
-     * entries; such a rule is hidden by the by-inode layers only (sus_path_supercall()). */
     if (ino) {
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
@@ -377,26 +257,6 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
     return hidden;
 }
 
-/* ---- deferred resolution: upstream's CMD_SUSFS_ADD_SUS_PATH_LOOP ----
- * Upstream does not resolve at add time: susfs_add_sus_path_loop() (susfs.c:99-132) checks for an
- * empty string only and stores the path on LH_SUS_PATH_LOOP; susfs_run_sus_path_loop()
- * (susfs.c:134-172) walks that list with kern_path() later, triggered by susfs_run_extra_works()
- * (susfs.c:1451-1457) from ksu_handle_extra_susfs_work()
- * (KernelSU/10_enable_susfs_for_ksu.patch:1599-1607) as zygote marks an app TIF_PROC_UMOUNTED
- * (patch:1669, patch:1719), and entries are never removed, so every spawn retries all of them.
- * Semantics: "registered now, hidden as soon as the path shows up", no attempt limit, the trigger
- * is an event.
- * With no zygote hook here the rule is registered at once with inode == NULL ("pending"): nothing
- * hides it yet (the dirent filter needs (ino, name), the LSM hooks the inode) but it holds its
- * place, and sus_path_resolve_pending() retries from sus_path_supercall() (every add) and from a
- * bounded retry timer.  The resolving task is exempt from our own hiding and walks with the
- * caller's creds (sus_path_resolver, sus_path_override_creds()).  A rule still missing when the
- * timer gives up hides NOTHING until it resolves; the next add re-arms the timer.
- */
-
-/* Basename of a registered path: what the getdents64 filter compares d_name against,
- * and what the table shows while the inode is unknown.  Stored paths never have a
- * trailing slash, so the text after the last '/' is the whole name. */
 static void sus_path_basename(const char *path, char *dst, size_t size)
 {
     const char *slash = strrchr(path, '/');
@@ -454,8 +314,6 @@ static int sus_path_resolve_pending(void)
 
         name[0] = '\0';
 
-        /* Exempt THIS task only, for the walk's duration, and undo it immediately
-         * whatever the walk answers - every other process stays hidden throughout. */
         WRITE_ONCE(sus_path_resolver, current);
         saved = sus_path_override_creds(&borrowed);
         rc = kern_path(path, LOOKUP_FOLLOW, &p);
@@ -473,18 +331,12 @@ static int sus_path_resolve_pending(void)
             }
             path_put(&p);
         } else if (rc != atomic_read(&sus_path_pend_logged_rc)) {
-            /* Report each distinct answer once: a rule that never resolves has to be
-             * distinguishable from a timer that never ran, and the rc (-ENOENT,
-             * -EACCES, -ENOTDIR) says which it is without logging the hidden path. */
+
             atomic_set(&sus_path_pend_logged_rc, rc);
             SUSFS_LOGI("sus_path: pending walk rc=%d (%d pending, pass %u)\n",
                     rc, atomic_read(&sus_path_n_pending), gen);
         }
 
-        /* The entry is re-found rather than used across the sleep: the table can be
-         * changed while we are away (another add, or module exit tearing it down), so
-         * only the path string is carried over - plus a pass marker no other pass can
-         * have set on a fresh entry. */
         spin_lock(&sus_path_lock);
         slot = NULL;
         list_for_each_entry(e, &sus_path_list, list) {
@@ -502,12 +354,7 @@ static int sus_path_resolve_pending(void)
             atomic_dec(&sus_path_n_pending);
             resolved++;
             published = true;
-            /* Relax INSIDE the section that owns `slot`.  `slot` is a raw pointer into the
-             * table, and sus_path_del_path()/sus_path_command("clear") list_del() an entry
-             * under this lock but iput()+kfree() it OUTSIDE it without holding
-             * sus_path_pending_lock, so touching `slot` after the unlock is a use-after-free
-             * write into freed memory (and the freed entry's inode pointer with it).  The
-             * inode is ihold'ed here, so relaxing it needs no further lifetime argument. */
+
             sus_path_relax_mode(slot);
         }
         spin_unlock(&sus_path_lock);
@@ -527,10 +374,6 @@ static int sus_path_resolve_pending(void)
     return resolved;
 }
 
-/* A rule was registered for a path that is not there yet: try once right away (an
- * earlier add in the same batch may be what made this rule necessary), then let the
- * timer keep trying.  Called from sus_path_supercall()'s task_work, i.e. process
- * context. */
 static void sus_path_pending_arm(void)
 {
     if (!atomic_read(&sus_path_n_pending))
@@ -544,12 +387,6 @@ static void sus_path_pending_arm(void)
     schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
 }
 
-/* Retry timer, bounded on purpose: upstream's equivalent runs once per app spawn (a
- * free trigger) while this one costs a periodic work item, and a rule whose path never
- * appears must not keep it alive forever.  A tick that cannot resolve anything is not
- * silent: the walk's own rc is logged once per distinct value by
- * sus_path_resolve_pending(), and hide_list carries the pass/tick/walk counters, so
- * "the timer never ran" and "the walk keeps failing" are told apart without guessing. */
 static void sus_path_pending_work(struct work_struct *w)
 {
     int resolved;
@@ -572,52 +409,11 @@ static void sus_path_pending_work(struct work_struct *w)
     schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
 }
 
-/* ---------------------------------------------------------------------------
- * LSM hooks - make path-based access report ENOENT.
- *
- * Upstream patches fs/namei.c (link_path_walk returns -ENOENT; __lookup_slow/lookup_open redo the
- * lookup with the fake qstr "..5.u.S") - impossible for a module, so the two hooks every
- * path-based operation has to pass are replaced: inode_getattr (vfs_getattr() calls
- * security_inode_getattr() before it ever looks at the inode: stat/fstatat/statx) and
- * inode_permission (open/exec/chmod/truncate/chdir/readdir/...).  Matching on the inode pointer
- * covers '//', './', relative paths, symlinks (followed), hard links, bind mounts and
- * /proc/self/root/...; unlink/rename operate on the PARENT's inode, hence the name-based hooks.
- * ------------------------------------------------------------------------- */
-
-/* Every replacement in this file is INSERTED at the head of its hook list (KSU_LSM_HOOK_INSERT)
- * and can only ADD a denial, never suppress another LSM.  call_int_hook() returns the first
- * non-zero answer, so where nothing is hidden the replacement returns 0 and the chain continues
- * into SELinux: its decision - including the -ECHILD it answers an RCU walk with in
- * inode_permission - is still what the caller gets.
- * There is deliberately NO `orig` capture and no pass-through call below 6.12: we do not sit in
- * anyone else's slot, so there is no original to find and no NULL-original fallback to get wrong -
- * `return 0` means "no opinion" rather than "allow", and the LSM that would have refused still gets
- * its say.  (Sitting in SELinux's own slot without calling it back would be FAIL OPEN: an operation
- * SELinux denies would be allowed while every rule still looked installed.) */
 static int sus_path_inode_getattr(const struct path *path);
 static int sus_path_inode_permission(struct inode *inode, int mask);
 
-/* The signatures MUST match the LSM hook types exactly and must NOT be __nocfi: this kernel uses
- * kCFI with cross-module checks, so a mismatched signature panics, and __nocfi panics just as hard
- * because the function then emits no hash at all.  These assertions turn any mistake into a build
- * failure instead of a reboot.  The address-of is required - typeof(fn) is the function type while
- * the hook field is a function pointer.
- * They cover BOTH mechanisms: below 6.12 the dispatcher calls our node through this exact type, and
- * on >= 6.12 our replacement sits in SELinux's static-call slot (same type) AND makes an indirect
- * call back to the stolen original through a pointer of this type, checked against the hook's own
- * hash there. */
 #define LSM_HOOK_FN_TYPE(member) typeof(((union security_list_options *)0)->member)
 
-/* ---- >= 6.12: the pass-through call to the stolen original ----
- * 6.12 replaced the hook list with static calls, so the insert path takes over the slot SELinux was
- * dispatched through and the call that used to reach SELinux now reaches us.  A bare `return 0`
- * would then NOT mean "no opinion, the chain continues" the way it does for a list node (< 6.12,
- * where our node is simply first and SELinux is still walked): there is no chain here, each hook
- * has one slot per LSM, so SELinux's function would silently never run again - a fail-open in the
- * one place it must not happen.  The stored original is called instead, and the -ENOENT above
- * short-circuits it exactly like a head node would.
- * The call goes through a pointer typed by the hook declaration (the static_asserts above guarantee
- * that type is right), hence the non-__nocfi rule: this call site is itself subject to kCFI. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #define SUS_LSM_PASS_ORIG(hook, member, ...)						\
 	do {										\
@@ -646,17 +442,6 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
 					   typeof(&sus_path_inode_permission)),
 	      "inode_permission hook signature mismatch");
 
-/* ---- name-based operations ----
- *
- * unlink/rmdir/rename/link never permission-check the FILE, only the PARENT directory
- * (may_delete/may_create), so inode_permission never sees the target and an app that can write the
- * containing directory can delete or rename a hidden file straight out of hiding.  Each operation has
- * a hook carrying the target's dentry: security_inode_unlink/rmdir(dir, dentry),
- * security_inode_rename(old_dir, old_dentry, new_dir, new_dentry),
- * security_inode_link(old_dentry, dir, new_dentry).  Upstream does this earlier, inside namei, which
- * also covers a parent directory that itself denies the caller; being after DAC is enough for the case
- * that matters here (a writable parent).  The create family (inode_create/mkdir/mknod/symlink) is
- * deliberately not here: the target does not exist yet, so there is no inode to match against. */
 static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry);
 static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry);
 static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
@@ -689,28 +474,6 @@ static struct ksu_lsm_hook sus_path_rename_hook =
 static struct ksu_lsm_hook sus_path_link_hook =
 	KSU_LSM_HOOK_INSERT(inode_link, (void *)sus_path_inode_link);
 
-/* ---- metadata and attribute operations ----
- *
- * These syscalls stop before any check we otherwise hook, so a hidden file could still be probed - in
- * the setattr case modified - while answering "permission denied" rather than "no such file".  Each has
- * an LSM hook carrying the dentry (or the path): sb_statfs for statfs/fstatfs; inode_setattr for
- * chmod/chown/truncate/utimes; inode_getxattr/_listxattr and inode_setxattr/_removexattr for the xattr
- * calls; path_notify for inotify_add_watch and fanotify_mark.  inode_setattr is the one that also
- * closes the error-code leak: without it an app got EPERM or EACCES from the owner check, which says
- * the file exists. */
-/* ---- the setxattr/removexattr FIRST argument, per kernel version ----
- *
- * These two are the only hooks here whose first parameter is not a dentry/inode/path: it is the
- * id-mapping the syscall came in through, and its type moved twice (upstream
- * include/linux/lsm_hook_defs.h): no first argument before v5.12; `struct user_namespace *mnt_userns`
- * from v5.12 (added with idmapped mounts), replaced by `struct mnt_idmap *idmap` in v6.3 ("fs: add
- * mnt_idmap").
- * The trees this module builds against agree: android12-5.10 declares no first argument,
- * android13-5.15/android14-6.1 declare mnt_userns, android15-6.6 declares idmap.  Three spellings are
- * needed because the macro has to work in a parameter list (with a name), in a function-pointer type
- * (no name) and as the leading call argument - and before 5.12 all three vanish.  The static_asserts
- * below make a wrong branch a build failure, never a silently mis-typed hook (a mismatched signature
- * is a kCFI panic at load time). */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 #define SUS_XATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
 #define SUS_XATTR_MNT_ID_TYPE	struct mnt_idmap *,
@@ -725,19 +488,6 @@ static struct ksu_lsm_hook sus_path_link_hook =
 #define SUS_XATTR_MNT_ID_ARG
 #endif
 
-/* ---- inode_setattr's FIRST argument, which followed later ----
- *
- * inode_setattr is the one hook of our 13 whose prototype moved between the trees this module
- * supports (per variant, from include/linux/lsm_hook_defs.h): android15-6.6 declares
- * LSM_HOOK(int, 0, inode_setattr, struct dentry *dentry, struct iattr *attr), android16-6.12 adds a
- * leading `struct mnt_idmap *idmap` (android17-6.18 is line-for-line the same).  Upstream the
- * parameter arrived earlier (v6.8 has the dentry/iattr pair only, v6.9 has the idmap), but the ACK
- * 6.6 tree is LTS-frozen and kept the old KMI, so the gate is on the 6.12 tree boundary - the only
- * two mount-id-relevant trees that exist as GKI, each compiled here.  The idmap is unused by the
- * replacement (it matches on the dentry's inode) but the parameter has to be there: the static_assert
- * below turns a missing one into a build failure, and a missing one at RUNTIME would be a kCFI panic
- * on the pass-through call.  Both spellings are needed for the same three positions as the xattr
- * pair. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #define SUS_SETATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
 #define SUS_SETATTR_MNT_ID_ARG	idmap,
@@ -811,8 +561,6 @@ static struct ksu_lsm_hook sus_path_perm_hook =
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
 
-/* Store the registered path without a trailing slash, so "path/" and "path" both match
- * "path" and "path/child". */
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
 {
     size_t n = strnlen(path, SUS_PATH_LEN - 1);
@@ -824,39 +572,6 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
     e->path_len = (unsigned int)n;
 }
 
-/*
- * Inode identity is the whole criterion here: deliberately NO FUSE branch, so do not "port"
- * upstream's (susfs.c:71-84 in add, :151-166 in susfs_run_sus_path_loop(), :195-212 in
- * susfs_is_inode_sus_path()).  It is a no-op: get_fuse_inode() is container_of(inode, struct
- * fuse_inode, inode) (fs/fuse/fuse_i.h) over an inode embedded in that struct and upstream's `inode`
- * comes from d_backing_inode() (include/linux/dcache.h), so it flags fi->inode.i_mapping and
- * inode->i_mapping - the same word twice; only an i_mapping NULL check identical to the generic one
- * above it (susfs.c:65-69) and a log line remain.  Our ihold'ed `struct inode *` is just as
- * object-scoped and cannot be recycled, so FUSE and CONFIG_FUSE_BPF=y passthrough (this kernel's
- * gki_defconfig) need nothing special.
- * The dirent filter is where FUSE costs both implementations something: ilookup(buf->sb, d_ino)
- * upstream and our (d_ino, name) match both fail when a FUSE inode is hashed by nodeid while
- * inode->i_ino is the daemon's attr.ino and d_ino whatever the daemon replied (fs/fuse/inode.c) -
- * upstream then skips the entry unfiltered (patch:1752-1760).  A name-only fallback would hide
- * same-named entries elsewhere in the superblock, so none is added.
- */
-/* The key is IDENTITY, not the object: the inode pointer is only a cache in front of it.  A pointer
- * hit cannot be wrong, so it answers immediately; everything else is decided by (dev, i_ino), the
- * same key the mount layer uses for its identity records (s_dev + root inode number), and the
- * slow-path hit counter tells an operator whether the cache is doing its job and, when it is not,
- * that the rule's object is not the object readers get.
- * Why the object alone is not enough (both measured on hardware): after a quick rmmod + insmod a rule
- * can hold an inode no reader ever sees again while a NEW object carries the same (dev, i_ino) - seen
- * as ptr_equal=0 in sus_path_probe with this module's control nodes readable by uid 2000 again; and
- * ihold() keeps an inode alive but NOT hashed, so it can be unhashed while its number is handed out
- * again.  (dev, i_ino) is sound because a rule holds its inode from registration until del / clear /
- * unload: while that inode is the hashed one, its number cannot be reused.
- * One tier more, for this module's own control nodes only: another INSTANCE of the same filesystem
- * keeps the inode number but has its own s_dev (measured, a container's /proc: the same 4026535268
- * with dev 1048754 against the main /proc's 20), so their identity is (filesystem type, i_ino) -
- * procfs numbers come from a global allocator (proc_alloc_inum), so that pair can only be this
- * module's node while it is loaded.  Ordinary rules do not get that tier: across two mounts of one
- * type the same number can stand for two different files. */
 static atomic_t n_identity_hits = ATOMIC_INIT(0);
 
 static bool sus_path_inode_hidden(struct inode *inode)
@@ -868,8 +583,6 @@ static bool sus_path_inode_hidden(struct inode *inode)
     if (!inode || !READ_ONCE(sus_path_count))
         return false;
 
-    /* See sus_path_resolver: the resolving task must not be answered by its own table,
-     * or its walk of that very path is refused. */
     if (sus_path_is_resolver())
         return false;
 
@@ -885,8 +598,7 @@ static bool sus_path_inode_hidden(struct inode *inode)
             }
             continue;
         }
-        /* Pending rules have no identity yet (ino == 0) and are the LSM layer's blind
-         * spot by construction: nothing exists at their path to be accessed. */
+
         if (!e->ino || e->ino != (u64)inode->i_ino)
             continue;
         if (e->dev == dev) {
@@ -926,8 +638,7 @@ static int sus_path_inode_getattr(const struct path *path)
             return -ENOENT;
         }
     }
-    /* Not hidden: no opinion - SELinux's answer (and its AVC record) is what the caller
-     * gets, on >= 6.12 by calling it since we hold the static-call slot it used. */
+
     SUS_LSM_PASS_ORIG(sus_path_getattr_hook, inode_getattr, path);
     return 0;
 }
@@ -938,15 +649,11 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
         atomic_inc(&n_enoent_perm);
         return -ENOENT;
     }
-    /* Not hidden: 0, so SELinux still decides.  This matters most here: for an RCU walk
-     * SELinux answers -ECHILD and the ref-walk retry in inode_permission() depends on
-     * that answer reaching the caller unchanged. */
+
     SUS_LSM_PASS_ORIG(sus_path_perm_hook, inode_permission, inode, mask);
     return 0;
 }
 
-/* Shared counter: the name-based ops answer one question, and the interesting fact is
- * that they fire at all. */
 static atomic_t n_enoent_nameop = ATOMIC_INIT(0);
 
 /* A negative dentry has no inode, which is exactly the "not hidden" answer. */
@@ -985,8 +692,7 @@ static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry)
 static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
 				 struct inode *new_dir, struct dentry *new_dentry)
 {
-    /* Both ends matter: moving a hidden file out of hiding, and overwriting a hidden
-     * file through its target name. */
+
     if (sus_path_dentry_hidden(old_dentry) || sus_path_dentry_hidden(new_dentry))
         return sus_path_nameop_hit();
     SUS_LSM_PASS_ORIG(sus_path_rename_hook, inode_rename, old_dir, old_dentry,
@@ -997,18 +703,14 @@ static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentr
 static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
 			       struct dentry *new_dentry)
 {
-    /* A hard link is a second name for the same inode: creating one while the file is
-     * hidden leaves the new name unhidden, so it is refused too. */
+
     if (sus_path_dentry_hidden(old_dentry))
         return sus_path_nameop_hit();
     SUS_LSM_PASS_ORIG(sus_path_link_hook, inode_link, old_dentry, dir, new_dentry);
     return 0;
 }
 
-/* Counted apart from the name operations: "the object cannot be probed or changed" and
- * "the name is not usable" fail for different reasons (see the block above). */
 static atomic_t n_enoent_meta = ATOMIC_INIT(0);
-
 
 static int sus_path_meta_hit(void)
 {
@@ -1073,57 +775,20 @@ static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
 
 static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int obj_type)
 {
-    /* inotify_add_watch and fanotify_mark arrive here; their callers do not run an
-     * inode permission check on the target. */
+
     if (path && sus_path_dentry_hidden(path->dentry))
         return sus_path_meta_hit();
     SUS_LSM_PASS_ORIG(sus_path_notify_hook, path_notify, path, mask, obj_type);
     return 0;
 }
 
-/* The LSM slots go in with the module (pointer swaps, cost-free) and this flag only marks that the
- * layer as a whole is up, plus the one-time arming the kstat layer reports.  It used to gate the
- * dirent kretprobes, which are gone: they cost a brk trap per listing, and the rewrite now rides
- * kstat's already-registered sys_exit tracepoint instead (see above sus_path_dirent_filter()). */
 static bool hooks_armed;
-/* Secondary LSM hooks that could not be registered: the core two are fatal, these only mean one
- * class of operation is uncovered - reported through hide_list as well as the log. */
+
 static int n_lsm_ext_fail;
 static const char *first_lsm_ext_fail;
-/* Serialises the first rule's arming: two rules arriving at once (a supercall task_work and a
- * module_init caller) would both pass the hooks_armed check, and the second arm would stack a
- * second layer on top of the first one's. */
+
 static DEFINE_MUTEX(sus_path_arm_lock);
 
-/* ---- the listing filter ----
- *
- * The filter has to run AFTER the kernel has built the directory chain, and no LSM hook can do
- * it: the chain is built inside the filesystem, entry by entry, with no per-entry callback a
- * module can reach.  That leaves the syscall body itself.  WHICH bodies are reachable was read
- * off this kernel's tables (include/uapi/asm-generic/unistd.h,
- * arch/arm64/include/asm/unistd32.h): getdents64 native 61 -> __arm64_sys_getdents64 ->
- * __do_sys_getdents64; getdents64 AArch32 217 -> the SAME native wrapper (that table maps 217 to
- * sys_getdents64, not to a compat one); getdents AArch32 141 -> __arm64_compat_sys_getdents ->
- * __do_compat_sys_getdents.  __do_sys_getdents (the native table has no __NR_getdents) and
- * __arm64_compat_sys_old_readdir ("89 was sys_readdir", no AArch32 entry either) are covered
- * upstream through its fill callbacks but reachable from no table here, so nothing is filtered
- * for them.
- *
- * WHERE it runs: the ONE global sys_exit tracepoint that kernel/susfs_kstat.c already registers
- * (kstat_sys_exit()).  Both kernels it was measured on pay for that tracepoint on every syscall
- * already, so one more number in its whitelist costs one more compare (measured: no
- * per-syscall change), while the two getdents kretprobes this replaces cost a trap per listing -
- * measured 906 ns on top of the 23 ns the tracepoint itself adds, i.e. the whole +929 ns the
- * paired bench used to report for a listing.  A kretprobe also carries maxactive (64 here) and
- * silently DROPS a return once 64 are nested, which the tracepoint cannot: it is synchronous
- * with the syscall.
- *
- * The tracepoint handler calls sus_path_dirent_filter() below, i.e. this file still owns the
- * rewrite (the bounce buffer, the per-ABI record layout, the (ino, name) match and the gate);
- * susfs_kstat.c owns only "which syscall number, which user pointer". */
-
-/* Record layouts: both reachable ABIs are NUL-terminated with an explicit d_reclen, so nothing
- * needs the d_namlen/computed-length variant old_readdir would have needed. */
 struct sus_dirent64_compat {
     u32 d_ino;
     u32 d_off;
@@ -1158,24 +823,13 @@ static const struct sus_dirent_layout sus_dirent_compat = {
     .reclen_off = offsetof(struct sus_dirent64_compat, d_reclen),
 };
 
-/* "Did this ABI reach us at all" is a different claim from "did we hide something": only the pair
- * can tell a dead path from a working one, and the AArch32 layout is the one a 64-bit test tool
- * cannot exercise.  Incremented in sus_path_filter() and sus_path_dirent_filter() only, i.e.
- * AFTER the tracepoint's whitelist has already matched - an ordinary syscall still pays one
- * add-immediate in the handler and nothing here. */
 static atomic_t n_dirent_calls[SUS_DIRENT_N];
 
-/* Every early-out of this layer, counted per reason: "calls(l64=N) and the entry still showed
- * up" is otherwise indistinguishable from "nothing was registered", and the reasons have
- * different fixes (a dead pointer, a full buffer, a rule that does not match, a gate).  Same
- * reasoning as the kstat per-number counters in susfs_kstat.c. */
 static atomic_t n_dirent_no_filter[SUS_DIRENT_N];   /* sus_path_filter() found no buffer/knows the layout not */
 static atomic_t n_dirent_syscall_bad[SUS_DIRENT_N]; /* return <= 0: error, or an empty listing  */
 static atomic_t n_dirent_buf_null[SUS_DIRENT_N];    /* NULL user buffer: nothing to rewrite      */
 static atomic_t n_dirent_no_rule[SUS_DIRENT_N];     /* count==0 and hide_name unset: nothing to hide */
 
-/* The numbers this layer answers for - the same list the tracepoint whitelists.  Kept as a
- * function of its own so the log line and the dispatcher cannot drift apart. */
 static const char *sus_path_dirent_abi_name(int lay_id)
 {
     return lay_id == SUS_DIRENT_COMPAT ? "getdents (AArch32 141)"
@@ -1185,25 +839,10 @@ static const char *sus_path_dirent_abi_name(int lay_id)
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay);
 
-/* Called by the sys_exit tracepoint in susfs_kstat.c, which is the ONLY caller of this file's
- * dirent layer now.
- *
- * Contract:
- *   @syscall_nr  the caller's number (native or AArch32; the tracepoint passes it through)
- *   @buf         the already-converted USER pointer of the listing buffer (the tracepoint does
- *                compat_ptr() for a 32-bit caller - a compat pointer is a zero-extended u32 and
- *                must not be passed raw)
- *   @ret         the syscall's return value
- * Return: what the syscall should now return.  @ret itself whenever nothing was filtered, or
- * when the number is not one this layer handles - so the caller only has to assign it back.
- *
- * Non-sleeping, and it must stay that way: it runs in tracepoint context, which is exactly the
- * constraint the kretprobes it replaces had (see the block above). */
 long sus_path_dirent_filter(long syscall_nr, unsigned long buf, long ret)
 {
     if (ret <= 0) {
-        /* -errno, or 0 = end of directory: nothing to filter either way.  A zero return is
-         * normal and constant, so it is counted apart from a negative one. */
+
         if (syscall_nr == __NR_native_getdents64 || syscall_nr == __NR_compat_getdents64 ||
             syscall_nr == __NR_compat_getdents) {
             int id = (syscall_nr == __NR_compat_getdents) ? SUS_DIRENT_COMPAT : SUS_DIRENT_L64;
@@ -1220,17 +859,13 @@ long sus_path_dirent_filter(long syscall_nr, unsigned long buf, long ret)
     case __NR_compat_getdents:
         return sus_path_filter(buf, ret, &sus_dirent_compat);
     case __NR_native_getdents:
-        /* No native table entry in this kernel; if one ever appears it is the same record
-         * layout as linux_dirent64. */
+
         return sus_path_filter(buf, ret, &sus_dirent_l64);
     default:
         return ret;
     }
 }
 
-/* One line for the kstat counter block, next to the kstat per-number counters: which listing
- * ABIs actually reached the filter, and why a listing that should have been filtered was not.
- * Written with scnprintf so it cannot overrun; the caller passes a PAGE_SIZE buffer. */
 int sus_path_dirent_stat_line(char *buf, size_t size)
 {
     return scnprintf(buf, size,
@@ -1262,16 +897,6 @@ static void sus_path_hooks_arm(void)
 
     hooks_armed = true;
 
-    /* Two layers, and neither of them is a syscall entry: the LSM slots (registered with the
-     * module above) decide every path-based access by inode - ABI-independent, so 32-bit callers
-     * are covered too, and undodgeable through a different spelling, a symlink, a hard link or a
-     * bind mount; the dirent rewrite does the listing filter, which no LSM hook can do, and it
-     * rides the ONE sys_exit tracepoint susfs_kstat.c registers (no probe of its own, so there is
-     * nothing to arm here - see the block above sus_path_dirent_filter()).
-     * Nothing else is needed: entry-layer hooks matched the caller's path STRING, which the LSM
-     * match already covers more thoroughly, and a hook that cannot fire reads as coverage - so
-     * those layers are DELETED, not disabled (see the note above sus_path_init()).
-     * no_extra is the isolation switch: no LSM, no dirent filter. */
     if (no_extra)
         pr_warn("sus_path: no_extra - dirent filter off\n");
 
@@ -1279,17 +904,6 @@ static void sus_path_hooks_arm(void)
     mutex_unlock(&sus_path_arm_lock);
 }
 
-/* Rewrite the dirent chain the kernel just produced, dropping the entries whose
- * (d_ino, name) pair is registered; returns the byte count the caller may parse.
- * Records move one at a time through dirent_tmp, from `offset` to `written`, always to an
- * address at or before their own, so nothing unread is overwritten and the listing does not
- * have to fit in the buffer at all (the old code gave up once the 64 KB scratch was full).
- * The return value always describes what is really in the caller's buffer: the compacted
- * length on success (0 if every entry was hidden, `count` if none was); on a uaccess failure
- * the bytes handed back whole, which is still a valid record chain the caller re-reads on its
- * next getdents64; and `count` when nothing was written back, i.e. "nothing was filtered" -
- * the old behaviour returned `count` with a *partially* compacted buffer, telling the caller
- * to parse bytes that were no longer records. */
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay)
 {
@@ -1305,15 +919,11 @@ static long sus_path_filter(unsigned long buf, long count,
 
     atomic_inc(&n_dirent_calls[id]);
 
-    /* The traced syscall names the buffer, and a NULL one reaches here: getdents64(fd, NULL, n)
-     * is a legal call that answers -EFAULT, so a positive return with a NULL buffer is not
-     * something to rewrite - but it used to be neither filtered nor reported. */
     if (!buf) {
         atomic_inc(&n_dirent_buf_null[id]);
         return count;
     }
-    /* Nothing registered, nothing to hide (hide_name is the legacy single-name debug switch):
-     * the buffer is left exactly as the kernel wrote it. */
+
     if (!READ_ONCE(sus_path_count) && !hide_name[0]) {
         atomic_inc(&n_dirent_no_rule[id]);
         return count;
@@ -1321,9 +931,6 @@ static long sus_path_filter(unsigned long buf, long count,
 
     spin_lock(&sus_path_buf_lock);
 
-    /* uaccess under a spinlock may not fault: if the page is not resident the copy would
-     * sleep here.  Disabled, a faulting copy fails, and every failure path answers "no
-     * filtering" rather than guessing. */
     pagefault_disable();
 
     tmp = dirent_tmp;
@@ -1346,8 +953,7 @@ static long sus_path_filter(unsigned long buf, long count,
             failed = true;
             break;
         }
-        /* d_reclen is filesystem-supplied: bound it before it is used as a copy length, as
-         * a step and before the bounce buffer is indexed. */
+
         if (reclen < lay->name_off + 1 ||
             offset + reclen > count ||
             reclen > DIRENT_BUF_SIZE) {
@@ -1355,9 +961,6 @@ static long sus_path_filter(unsigned long buf, long count,
             break;
         }
 
-        /* The ino is the only fixed-width, ABI-dependent field: 8 bytes in linux_dirent64, 4 in the
-         * AArch32 compat record.  A 32-bit record exists only when the number fit
-         * (compat_filldir answers -EOVERFLOW otherwise), so the low 4 bytes are the whole value. */
         if (lay->ino_size == 8) {
             if (copy_from_user(&ino, (void __user *)(buf + offset), sizeof(u64))) {
                 failed = true;
@@ -1396,14 +999,11 @@ static long sus_path_filter(unsigned long buf, long count,
         hide = sus_path_is_hidden((u64)ino, name);
 
         if (hide) {
-            /* Dropped.  Every record after it moves down by its length, so the
-             * remaining records can no longer stay where they are. */
+
             offset += reclen;
             continue;
         }
 
-        /* A record only needs the bounce buffer once something ahead of it was
-         * dropped; until then written == offset and it is already in place. */
         if (written != offset) {
             if (copy_from_user(tmp, (void __user *)(buf + offset), reclen)) {
                 failed = true;
@@ -1429,26 +1029,17 @@ static long sus_path_filter(unsigned long buf, long count,
             return count;       /* nothing was written back: claim no filtering */
     }
 
-        /* Everything in this chunk was hidden, and returning 0 here would be read as
-         * end-of-directory: the caller stops and never sees the visible entries of the next
-         * chunk.  So one record is left behind as a placeholder - d_ino = 0 with an empty
-         * name.  readdir() skips records whose d_ino is 0 (bionic does), which makes the
-         * caller ask again; a hand-written parser sees an entry without a name, still better
-         * than a directory that ends early.  The hidden name is gone either way. */
     if (!failed && count > 0 && written == 0) {
         char zero_ino[8] = {0};
         char nul = '\0';
 
-        /* head_reclen is the first record's own length, read above with this ABI's layout; the
-         * buffer still holds it untouched because written == 0 means nothing was moved. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
             !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
             atomic_inc(&n_dirent_all_hidden);
             return head_reclen;
         }
-        /* Could not build the placeholder: filtering would be worse than not filtering, because the
-         * caller would lose the chunk entirely. */
+
         atomic_inc(&n_dirent_rewrite_fail);
         return count;
     }
@@ -1456,14 +1047,6 @@ static long sus_path_filter(unsigned long buf, long count,
     return written;
 }
 
-
-/* Appending to a sysfs .get buffer is bounded HERE, not at each call site: the kernel hands
- * such a callback ONE page and no length at all (fs/sysfs/file.c: sysfs_kf_seq_show() ->
- * seq_get_buf() + memset(buf, 0, PAGE_SIZE) + ops->show(kobj, priv, buf)), so
- * "n += scnprintf(buf + n, PAGE_SIZE - n, ...)" is a heap overflow waiting for the first
- * listing that fills the page: once n passes PAGE_SIZE the expression PAGE_SIZE - n is a
- * size_t underflow (about 2^64), scnprintf believes it has unlimited room, and read(2) hands
- * the caller whatever followed the page in the heap.  About 50 ordinary rules are enough. */
 #define SUS_PATH_LIST_SLACK 400		/* longest line below (two names, 2x20 digits) */
 static int sus_path_list_puts(char *buf, int n, bool *trunc, const char *fmt, ...)
 {
@@ -1486,12 +1069,6 @@ static int sus_path_list_puts(char *buf, int n, bool *trunc, const char *fmt, ..
     return n + written;
 }
 
-
-/* Remove every rule whose registered path is @path (normalised as sus_path_entry_set_path()
- * stores it), undoing what those rules changed; returns how many were removed, so 0 is
- * "nothing was registered under that path".  Process context: sus_path_restore_mode() writes
- * inode->i_mode and iput() can sleep and evict - both outside the spinlock, and no matcher can
- * still be holding an entry (matchers walk the list only while holding the lock). */
 int sus_path_del_path(const char *path)
 {
     struct sus_path_entry *e, *tmp;
@@ -1533,22 +1110,6 @@ int sus_path_del_path(const char *path)
     return removed;
 }
 
-/* View of the registered paths, for verification.  Writable so a rule can be taken back: before
- * this, rules could only be removed by unloading the module, so one mistyped `add_sus_path /data`
- * hid that path machine-wide - and left the target's mode relaxed (sus_path_relax_mode()) for just
- * as long.  Deliberately NOT a new CMD_SUSFS_* command: this node is ours, while the supercall
- * command space has to stay compatible with KernelSU/ksud.
- *
- *   echo clear        > .../hide_list     all rules
- *   echo "del /path"  > .../hide_list     one rule (exact path, trailing / ignored)
- *
- * One command layer for both front ends - /proc/susfs_path and the hide_list parameter - so the two
- * cannot drift apart: add <path> (resolved now, the caller learns the errno), del <path> (restores
- * whatever sus_path_relax_mode() relaxed), clear (every ORDINARY rule).  `clear` and `del` refuse to
- * touch this module's own control nodes (the self_protect rules): those are what makes a non-root
- * caller see ENOENT instead of the control surface at all, and the documented way to expose the
- * nodes is expose_proc=0.  Returns 0 or a negative errno; @removed_out (optional) gets the number of
- * rules dropped. */
 static bool sus_path_path_is_ours(const char *path)
 {
     struct sus_path_entry *e;
@@ -1597,8 +1158,7 @@ static int sus_path_command(const char *val, int *removed_out)
             arg++;
         if (!*arg)
             return -EINVAL;
-        /* Normalise exactly like sus_path_del_path() does, or `del /proc/susfs_kstat/`
-         * would slip past the guard below and remove the module's own protection. */
+
         {
             size_t alen = strlen(arg);
 
@@ -1643,8 +1203,6 @@ static int sus_path_store_list(const char *val, const struct kernel_param *kp)
     return sus_path_command(val, NULL);
 }
 
-/* The listing, into a caller-supplied buffer; shared by /proc/susfs_path and hide_list so the
- * two views cannot say different things.  Returns the bytes written, clamped to the buffer. */
 static int sus_path_format_list(char *buf, size_t size)
 {
     struct sus_path_entry *e;
@@ -1656,10 +1214,7 @@ static int sus_path_format_list(char *buf, size_t size)
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
                    atomic_read(&n_enoent_meta));
-    /* The dirent counters moved next to the kstat ones (/proc/susfs_kstat), because the dirent
-     * rewrite is now carried by the tracepoint that file registers: `cat /proc/susfs_kstat` shows
-     * that layer's per-number counters followed by the listing filter's.  What stays here is what
-     * belongs to this table alone - how many rules are waiting for their path. */
+
     n = sus_path_list_puts(buf, n, &trunc,
                    "dirent: pending=%d (counters: /proc/susfs_kstat)\n",
                    atomic_read(&sus_path_n_pending));
@@ -1667,16 +1222,12 @@ static int sus_path_format_list(char *buf, size_t size)
         n = sus_path_list_puts(buf, n, &trunc,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
                        n_lsm_ext_fail, first_lsm_ext_fail);
-    /* A normal, expected number rather than an alarm: how often a lookup had to fall through
-     * to (dev, ino) because the rule's object was not the one being accessed.  Printed only
-     * when non-zero; a steadily growing value is the interesting case. */
+
     if (atomic_read(&n_identity_hits))
         n = sus_path_list_puts(buf, n, &trunc,
                        "identity: %d hit(s) where the inode pointer did not match and (dev,ino) or (fs type,ino) answered instead\n",
                        atomic_read(&n_identity_hits));
-    /* passes/ticks == 0 means the retry never ran; walks > 0 with pending > 0 means the walk
-     * kept failing (last-rc says how); lost > 0 means a walk succeeded with no rule to
-     * publish it. */
+
     n = sus_path_list_puts(buf, n, &trunc,
                    "pend: passes=%d ticks=%d walks=%d lost=%d last-rc=%d caller-cred=%d\n",
                    atomic_read(&sus_path_pend_passes),
@@ -1713,11 +1264,6 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     return sus_path_format_list(buf, PAGE_SIZE);
 }
 
-/* ---- /proc/susfs_path: the same table and the same command layer as hide_list ----
- * cat it for the listing; add <path> / del <path> / clear as above.  Same contract as the other
- * control nodes: mode 0777 so DAC does not answer EACCES first, root-only through the uid check
- * in open() AND write() (an fd opened before privileges were dropped is not a way in either),
- * and registered in the self-protected set so everyone else gets ENOENT. */
 static struct proc_dir_entry *sus_path_node_entry;
 
 static int sus_path_proc_show(struct seq_file *m, void *v)
@@ -1736,8 +1282,7 @@ static int sus_path_proc_show(struct seq_file *m, void *v)
 
 static int sus_path_proc_open(struct inode *inode, struct file *file)
 {
-    /* 0777 node + this check: a restrictive mode would answer EACCES (advertising that the
-     * node exists) before sus_path could answer ENOENT. */
+
     if (current_uid().val != 0)
         return -ENOENT;
     return single_open(file, sus_path_proc_show, NULL);
@@ -1749,8 +1294,6 @@ static ssize_t sus_path_proc_write(struct file *file, const char __user *buf,
     char cmd[SUS_PATH_LEN + 16];
     int rc;
 
-    /* Same reason as the open check: an fd opened before the process dropped
-     * privileges must not become a way in. */
     if (current_uid().val != 0)
         return -ENOENT;
     if (len == 0)
@@ -1779,16 +1322,9 @@ static const struct kernel_param_ops sus_path_list_ops = {
     .get = sus_path_show_list,
     .set = sus_path_store_list,
 };
-/* 0600, not 0444: this listing names every hidden path, so an app must not be able to read it -
- * that would hand a detector the exact answer it looks for.  The write bit is what makes a
- * mistaken rule removable (see sus_path_store_list). */
+
 module_param_cb(hide_list, &sus_path_list_ops, NULL, 0600);
 
-/* ---- diagnostic: why does a registered rule not match? ----
- * echo /proc/susfs_kstat > .../parameters/sus_path_probe, then cat it: resolves the path as
- * sus_path_add_hidden_ex() does and reports the identity a reader would see next to the rule meant
- * to match it - the one question the counters cannot answer, which otherwise needs a kernel
- * debugger.  Process context only (kern_path sleeps); 0600 for the same reason hide_list is. */
 static char sus_path_probe_report[640];
 
 static int sus_path_probe_set(const char *val, const struct kernel_param *kp)
@@ -1859,10 +1395,6 @@ static const struct kernel_param_ops sus_path_probe_ops = {
 };
 module_param_cb(sus_path_probe, &sus_path_probe_ops, NULL, 0600);
 
-/* Add a path to the hidden set from kernel code, bypassing the supercall; used by susfs_init() to
- * self-hide the /proc control nodes.  Same entry shape and ihold discipline as
- * sus_path_supercall(): the inode pointer is what the LSM layer matches on and it must outlive
- * path_put() below. */
 static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 {
 	struct path p;
@@ -1880,16 +1412,6 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 		return -ENOENT;
 	}
 
-	/* kzalloc, NOT kmalloc: the entry has two fields these add paths never set -
-	 * `self_protect` (a gate: a garbage non-zero value turns an ordinary app-only rule
-	 * into "hidden from every non-root caller") and `orig_mode` (written back into
-	 * inode->i_mode by sus_path_restore_mode() at unload).  With kmalloc both held
-	 * whatever the slab last contained, and the common case made it certain:
-	 * sus_path_relax_mode() returns early - recording nothing - when the target is
-	 * already 0777, so unloading wrote uninitialized heap bytes into a real inode mode.
-	 * Zero is the right initial value for both: false is the ordinary gate, and
-	 * orig_mode == 0 means "this rule did not touch the mode", which is exactly what
-	 * restore_mode() tests for. */
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e) {
 		path_put(&p);
@@ -1937,8 +1459,6 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 	return 0;
 }
 
-/* Register one of the module's own control nodes: same table, flagged so the gate hides it from
- * every non-root caller rather than only from apps (sus_path_entry_gate_any()). */
 int sus_path_add_self_hidden(const char *path)
 {
 	return sus_path_add_hidden_ex(path, true);
@@ -1949,8 +1469,6 @@ int sus_path_add_hidden(const char *path)
 	return sus_path_add_hidden_ex(path, false);
 }
 
-/* Whether the path-based layer actually installed: both hooks must be patched, or stat and open
- * would disagree with each other. */
 bool sus_path_lsm_active(void)
 {
 	return sus_path_getattr_hook.entry && sus_path_perm_hook.entry;
@@ -1960,20 +1478,10 @@ int sus_path_init(void)
 {
     int rc;
 
-    /* kvmalloc, not kmalloc: 64 KB of physically contiguous order-4 memory is not available on a
-     * phone that has been up for a while (measured: MemFree 394 MB, and kmalloc_order failed with a
-     * WARN in its call trace), while vmalloc memory is just as usable here - the buffer is only
-     * touched from the getdents64 filter, which never faults on it.  A failure is not fatal: listings
-     * then go unfiltered and the other layers still come up. */
     dirent_tmp = kvmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
     if (!dirent_tmp)
         pr_warn("sus_path: dirent scratch buffer unavailable, listings will not be filtered\n");
 
-    /* No probe of our own is registered here any more: the dirent rewrite is called from kstat's
-     * sys_exit tracepoint, which exists from module load on (it is what spoofs stat), so the
-     * rewrite is reachable as soon as this buffer is.  With no rule registered it returns before
-     * touching the buffer, which is the "no rules, no cost" property the kretprobes used to get
-     * from being armed late. */
     SUSFS_LOGI("sus_path: dirent rewrite rides the shared sys_exit tracepoint (no probe of its own)\n");
 
     if (no_extra) {
@@ -1981,15 +1489,10 @@ int sus_path_init(void)
         return 0;
     }
 
-    /* LSM hooks: reject path-based access to registered inodes outright.  These two ARE the
-     * mechanism - a registered path is hidden only because this layer answers ENOENT.  A failure
-     * here used to be a warning with a zero return, so add_sus_path() reported success while
-     * nothing was hidden; loading now fails instead. */
     rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
     if (rc) {
         pr_err("sus_path: getattr hook failed %d - nothing would be hidden, refusing to load\n", rc);
-        /* The scratch buffer is already allocated; the caller is about to fail the load, and a
-         * vmalloc'd buffer is not part of the module's own memory, so nobody else would free it. */
+
         kvfree(dirent_tmp);
         dirent_tmp = NULL;
         return rc;
@@ -2008,9 +1511,6 @@ int sus_path_init(void)
     SUSFS_LOGI("sus_path: perm hook inserted ahead of the chain (node %px)\n",
             (void *)sus_path_perm_hook.entry);
 
-    /* Name-based and metadata operations: without these an app that can write the parent directory
-     * can delete or rename a hidden file, and a hidden file can still be probed or modified through
-     * statfs/xattr/inotify - or answered with EPERM/EACCES, which says it exists. */
     {
         struct ksu_lsm_hook *extra[] = {
             &sus_path_unlink_hook, &sus_path_rmdir_hook,
@@ -2025,9 +1525,7 @@ int sus_path_init(void)
         for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
             rc = ksu_register_lsm_hook(extra[i]);
             if (rc) {
-                /* Not fatal - the core two hooks are up, so a hidden path is still hidden -
-                 * but one class of operation is NOT covered, so it is counted and named in
-                 * hide_list rather than only logged. */
+
                 if (!n_lsm_ext_fail)
                     first_lsm_ext_fail = extra[i]->head_name;
                 n_lsm_ext_fail++;
@@ -2043,16 +1541,6 @@ int sus_path_init(void)
                     n_lsm_ext_fail, (int)ARRAY_SIZE(extra), first_lsm_ext_fail);
     }
 
-    /* The DAC probes, the syscall-entry kprobes and the path-string probes are DELETED, not
-     * merely disabled: the mode relax in sus_path_relax_mode() covers the case where DAC
-     * answers EACCES before any LSM hook runs, and a hook that cannot fire reads as coverage.
-     * Their history, including the FPAC panic one of them caused, is in TECHNICAL_NOTES.md. */
-
-    /* The control node goes up LAST, and only when the layer that hides it is really installed
-     * (susfs_control_node_allowed()): a 0777 world-writable node without the thing that answers
-     * ENOENT for it must not exist.  It has to be created before susfs_self_hide_nodes() runs,
-     * which is why it is here and not in susfs_main.c - that list is registered after every
-     * layer's own init, so paths resolve. */
     if (susfs_control_node_allowed()) {
         sus_path_node_entry = proc_create("susfs_path", 0777, NULL, &sus_path_proc_ops);
         if (!sus_path_node_entry)
@@ -2069,21 +1557,11 @@ void sus_path_exit(void)
     struct sus_path_entry *e, *tmp;
     LIST_HEAD(doomed);
 
-    /* Our own node goes down first, while the LSM layer that hides it is still armed: the
-     * reverse order would expose a 0777 control surface for the duration of the unload. */
     if (sus_path_node_entry) {
         proc_remove(sus_path_node_entry);
         sus_path_node_entry = NULL;
     }
 
-    /* Unregister the hooks FIRST: after this nothing can match, so the entries (and their inode
-     * references) can be torn down safely.  The dirent layer needs no teardown of its own: it is
-     * called from kstat's sys_exit tracepoint, which susfs_kstat_exit() unregisters, and kstat's
-     * exit runs after this one (susfs_main.c's layer table teardown order). */
-
-    /* The retry timer must be off and no resolution pass may be in flight while the table is
-     * emptied below: a pass re-finds its entry under the lock and never frees anything, but it
-     * may not run past the teardown either.  The pass uses trylock, so this cannot deadlock. */
     cancel_delayed_work_sync(&sus_path_pending_wq);
     mutex_lock(&sus_path_pending_lock);
     mutex_unlock(&sus_path_pending_lock);
@@ -2119,9 +1597,6 @@ void sus_path_exit(void)
     atomic_set(&sus_path_n_pending, 0);
     spin_unlock(&sus_path_lock);
 
-    /* iput outside the lock (it can sleep and evict), and the mode each rule relaxed is put
-     * back first and before the inode is released: the relaxed value only lives in memory, so
-     * once the last reference is gone there is no telling a relaxed mode from a real one. */
     list_for_each_entry_safe(e, tmp, &doomed, list) {
         list_del(&e->list);
         sus_path_restore_mode(e);
@@ -2131,18 +1606,6 @@ void sus_path_exit(void)
     }
 }
 
-/* supercall: CMD_SUSFS_ADD_SUS_PATH (0x55550) / CMD_SUSFS_ADD_SUS_PATH_LOOP (0x55553)
- * Upstream keeps the two apart: susfs_add_sus_path() needs the path to exist and the lookup
- * error IS the command's answer (susfs.c:58-62), while susfs_add_sus_path_loop() checks for an
- * empty string only, stores the path on LH_SUS_PATH_LOOP and resolves it later (susfs.c:99-132,
- * susfs_run_sus_path_loop() susfs.c:134-172).  The dispatcher therefore says which command
- * arrived: treating both as pending made the plain command answer 0 for a path that does not
- * exist, so a caller other than the stock tool (which realpath()s first) believed a rule was
- * installed that upstream would have rejected.
- * A pending rule is not dead weight: it holds its place in the table, so the path is hidden from
- * the moment the background walk resolves its inode; what the pending state delays is every
- * layer - the LSM hooks (by inode) and the dirent filter ((ino, name)) - because none of them can
- * match an inode that does not exist yet. */
 void sus_path_supercall(unsigned int cmd, void __user **arg)
 {
     struct st_susfs_sus_path info = {0};
@@ -2163,8 +1626,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         info.err = -EINVAL;
         goto out;
     }
-    /* The field is char[256] and need not be NUL-terminated; kern_path() on an
-     * unterminated one reads off the end of our stack copy of the struct. */
+
     if (!susfs_abi_path_ok(info.target_pathname, sizeof(info.target_pathname))) {
         info.err = -ENAMETOOLONG;
         goto out;
@@ -2183,10 +1645,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         info.err = rc;
         goto out;
     }
-/* Upstream's plain ADD_SUS_PATH reports a missing path: its `err = kern_path(...)` IS the answer
- * (fs/susfs.c:58-62).  Only the _LOOP variant accepts "not there yet".  (This kern_path() also
- * runs into our own rule when the path is already hidden - upstream is no different, its
- * rejection lives in walk_component(), so both implementations answer the same -ENOENT.) */
+
     if (rc == -ENOENT && !pending_ok) {
         SUSFS_LOGI("sus_path: '%s' does not exist and this is ADD_SUS_PATH (not _LOOP): reporting -ENOENT like upstream\n",
                 info.target_pathname);
@@ -2194,8 +1653,6 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         goto out;
     }
 
-    /* kzalloc, NOT kmalloc: `self_protect` and `orig_mode` must start at zero or unloading
-     * writes uninitialized heap bytes into a real inode mode - see sus_path_add_hidden_ex(). */
     e = kzalloc(sizeof(*e), GFP_KERNEL);
     if (!e) {
         if (inode)
@@ -2216,17 +1673,13 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         e->dev = dev;
         e->ino = ino;
         e->inode = inode;
-        /* Hold the inode: the LSM hooks match on this pointer, and the dentry is
-         * about to be released by path_put(), which would otherwise be free to
-         * evict it and let the address be reused. */
+
         ihold(inode);
         strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
     }
     sus_path_entry_set_path(e, info.target_pathname);
     if (!inode)
-        /* No dentry to take the name from yet: the basename of the registered path is what the
-         * table shows until the lookup succeeds, and it is then replaced by the real dentry name,
-         * which is what the dirent filter has to compare (following a symlink changes it). */
+
         sus_path_basename(e->path, e->name, sizeof(e->name));
     INIT_LIST_HEAD(&e->list);
     if (inode)
@@ -2245,8 +1698,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         struct sus_path_entry *cur;
 
         list_for_each_entry(cur, &sus_path_list, list) {
-            /* Same inode: upstream's set_bit() is idempotent.  Same still-unresolved path:
-             * nothing to add but the retry marker. */
+
             if ((inode && cur->inode == inode) ||
                 (!inode && !cur->inode && !strcmp(cur->path, e->path))) {
                 spin_unlock(&sus_path_lock);
@@ -2256,10 +1708,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
                 info.err = 0;   /* already registered, upstream is idempotent */
                 goto out;
             }
-            /* The rule is there as a pending one and this add is what resolved it: complete that
-             * entry instead of registering a second one for the same path (a boot script that
-             * runs twice would otherwise leave one resolved and one pending entry behind), so
-             * re-adding a path is also the manual way to force the resolution. */
+
             if (inode && !cur->inode && !strcmp(cur->path, e->path)) {
                 cur->dev = dev;
                 cur->ino = ino;
@@ -2286,37 +1735,27 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
     spin_unlock(&sus_path_lock);
 
     if (inode && !ino) {
-        /* Stay factual about what an ino-0 filesystem costs: neither implementation filters
-         * the listing here (upstream hides by a flag and its ilookup(sb, d_ino) finds nothing
-         * for ino 0 either), the by-inode layers still hide the path, and a name-based
-         * fallback would hide unrelated entries that report d_ino 0 as well. */
+
         pr_warn("sus_path: '%s' reports ino 0 - hidden by inode, but a directory listing cannot be filtered for it\n",
                 info.target_pathname);
     }
 
     if (!dirent_tmp) {
-        /* Retry once: the first attempt may have run before the system was settled.  Still not
-         * fatal - the rule is registered either way, and the by-inode layers answer the access. */
+
         dirent_tmp = kvmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
         if (!dirent_tmp)
             pr_warn("sus_path: dirent scratch buffer still unavailable, listing for '%s' stays unfiltered\n",
                     info.target_pathname);
     }
 
-    /* First rule: arm the hooks (the LSM slots are up from init; this is the one that reports
-     * the layer as a whole).  Idempotent, safe with a rule already in the list. */
     sus_path_hooks_arm();
 
     if (!inode) {
         SUSFS_LOGI("sus_path: hide '%s' (pending: the path does not exist yet - it is hidden once the background walk resolves its inode)\n",
                 info.target_pathname);
-        /* The walk happens later, in a worker whose own creds cannot reach a path under /data
-         * (measured: -EACCES), so remember the creds of the process that registered the rule. */
+
         sus_path_save_caller_cred();
-        /* This add is itself the first retry opportunity (an earlier add in the same batch may
-         * be what the rule waits for), then the bounded timer keeps trying.  Upstream
-         * re-resolves on every zygote-spawned app instead, an event this kernel does not hand
-         * us. */
+
         sus_path_pending_arm();
     } else {
         SUSFS_LOGI("sus_path: hide '%s' (dev=%llu ino=%llu)\n",

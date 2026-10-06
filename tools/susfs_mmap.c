@@ -1,30 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_mmap - mmap a file, touch it, then report what the kernel tells this very
- * process about that mapping: the pagemap entry of its first page, the
- * process-wide Rss from /proc/self/smaps_rollup, and whether the file is still
- * named in /proc/self/[maps|smaps].
- *
- * Why it has to be one process: /proc/self/pagemap and /proc/self/smaps_rollup
- * describe the *caller's* mm, and a shell cannot read a file without forking -
- * the child that runs dd/od gets its own mm, so an address the shell learned from
- * /proc/self/maps is not an address in that child.  This tool does the mapping,
- * the touching and both reads itself, which is what makes the numbers below
- * meaningful for a rule that hides the mapped file.
- *
- * Android refuses non-PIE executables and the DDK container has no bionic sysroot,
- * so this is freestanding: -nostdlib -static-pie with our own _start.
- *
- * Build (in the DDK container, same clang that builds the module):
- *
- *     clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
- *           -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
- *           -o susfs_mmap tools/susfs_mmap.c
- *
- * Usage:
- *
- *     susfs_mmap <path> [bytes]      # default: whole file
- */
 
 typedef unsigned long u64;
 typedef long s64;
@@ -149,10 +123,7 @@ static u64 pagemap_entry(u64 addr)
 	fd = sys6(SYS_openat, AT_FDCWD, (long)"/proc/self/pagemap", O_RDONLY, 0, 0, 0);
 	if (fd < 0)
 		return 0;
-	/* pread64(fd, &e, 8, page * 8) - skipped pages are simply not written by a
-	 * walk that did not run, so a zero here can mean "absent" or "not shown to
-	 * an unprivileged caller"; the module's walk_skipped counter is the real
-	 * observable, this line is the second opinion. */
+
 	sys6(SYS_pread64, fd, (long)&e, 8, (long)((addr / PAGE) * 8), 0, 0);
 	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
 	return e;
@@ -206,20 +177,6 @@ static const char *basename_of(const char *p)
 	return b;
 }
 
-/* ---- the maps line itself, and the numbers a real file would put in it ----
- *
- * The columns after the permission flags are "pgoff major:minor ino".  For an
- * open_redirect rule those last two numbers come from the file the redirection
- * really opened, while the NAME on the same line is the target's - so printing the
- * line verbatim is what makes the two comparable: a line whose name and numbers
- * come from different files is a contradiction no real file can produce.
- *
- * stat(2) is not part of open_redirect's disguise (upstream leaves dev/ino to
- * sus_kstat), so the target path's st_dev/st_ino are the real target values, i.e.
- * exactly what the maps line has to agree with.  st_dev as userspace sees it is
- * the kernel's ENCODED dev_t (cp_new_stat -> new_encode_dev), so major/minor have
- * to be decoded from it: major = enc >> 8, minor = (enc & 0xff) | ((enc >> 20) << 8)
- * - the same numbers the kernel prints as "%02x:%02x". */
 static u64 hexval(char c)
 {
 	if (c >= '0' && c <= '9')
@@ -229,8 +186,6 @@ static u64 hexval(char c)
 	return (u64)(c - 'A' + 10);
 }
 
-/* lowercase hex, no prefix and no padding - the width the kernel's own %02x uses
- * for major and minor */
 static u64 puthex2(char *dst, u64 pos, u64 v)
 {
 	static const char d[] = "0123456789abcdef";
@@ -299,8 +254,7 @@ static u64 emit_stat(char *out, u64 pos, const char *label, const char *path)
 	if (r < 0) {
 		pos = put(out, pos, "(stat failed)");
 	} else {
-		/* st_dev at 0, st_ino at 8 - the first two fields of struct stat, which
-		 * is all this needs; byte-wise for the same reason the dirent reader is */
+
 		for (i = 7; i >= 0; i--)
 			enc = (enc << 8) | (u64)st[i];
 		for (i = 15; i >= 8; i--)
@@ -317,10 +271,6 @@ static u64 emit_stat(char *out, u64 pos, const char *label, const char *path)
 	return pos;
 }
 
-/* /proc/self/map_files/<start>-<end> is a symlink per mapping, and resolving it
- * names the mapped file - which is how the a4 tests located a mapping the maps
- * listing had already dropped.  Count the entries, how many of them still NAME
- * the file this tool mapped, and how many answer ENOENT (the disguise). */
 struct linux_dirent64_min {
 	u64 d_ino;
 	s64 d_off;

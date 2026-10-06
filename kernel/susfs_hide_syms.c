@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_hide_syms.c - hide ksu/susfs symbols from /proc/kallsyms (SUSFS HIDE_KSU_SUSFS_SYMBOLS feature), LKM port.
- * Upstream patches kernel/kallsyms.c s_show() to skip symbols whose name starts with ksu_/__ksu_/susfs_/ksud/...  s_show is
- * static but sits in the kallsyms_op.show seq_operations pointer, so LTO keeps an out-of-line copy and a kprobe can hang
- * on it.  A matching prefix returns early (regs->regs[0] = 0, regs->pc = x30), so the line is never printed - covering
- * BOTH core-kernel and module symbols, since the whole body is skipped before it branches on module_name.  On by default
- * like upstream (a build-time CONFIG there, no runtime toggle).
- */
+
 #include <linux/module.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the kallsym_iter mirror below is version-gated */
 #include <linux/kprobes.h>
@@ -21,20 +14,6 @@
 #include "susfs.h"		/* sus_path_add_self_hidden / sus_path_del_path */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
 
-/* ---- hide_modules: filter other kernel modules out of /proc/modules ----
- * /proc/modules is world-readable (0444) and lists every loaded module, so a checker that greps it sees the whole set
- * including the module doing the hiding.  The feature keeps a list of module NAMES and removes them from: (1)
- * /proc/modules - the m_show() line, for EVERY reader, root included, since a checker may well run as root and this
- * listing is what it compares against; (2) /sys/module/<name> - registered in sus_path with self_protect, so
- * stat/open/readdir answer ENOENT for non-root callers while root keeps access (that is where a module's parameters
- * live) - the one asymmetry to know; (3) /proc/kallsyms lines whose module_name matches, also for every reader.
- * Two frontends over one list: /proc/susfs_hide_modules (`add <name> | del <name> | clear | <name> [<name> ...]`, root
- * only, ENOENT for everyone else) and .../parameters/hide_modules (same commands, settable at insmod).  Both follow the
- * house pattern of the control nodes: 0777 so DAC passes and sus_path's hidden set is the only answer (ENOENT,
- * indistinguishable from "no such file"), plus a uid check in open() AND write() so a passed-on fd is not a way in.  The
- * default list holds just this module, because a built-in SUSFS has no module entry; `clear` is the debugging mode.
- * Not a new CMD_SUSFS_* command: that id space is shared with KernelSU's own copy of SUSFS and a new id there is a
- * compatibility risk that buys nothing. */
 #define HIDE_MODULES_MAX 16
 #define HIDE_MODULES_CMDLINE (HIDE_MODULES_MAX * (MODULE_NAME_LEN + 1) + 96)
 
@@ -106,9 +85,6 @@ static void hide_modules_sync_sysfs(void)
 	}
 }
 
-/* Parse @val into @dst and return the count, or a negative errno.  Separators are spaces, commas and tabs, so both the
- * insmod form (hide_modules=a,b) and the /proc form (a b) work.  @buf is 1136 bytes and the caller below is checked against
- * the same 2048-byte frame limit, so it is allocated rather than kept on the stack (see hide_modules_command). */
 static int hide_modules_parse(const char *val, char dst[][MODULE_NAME_LEN], int max)
 {
 	char *buf;
@@ -165,18 +141,6 @@ static void hide_modules_commit(char dst[][MODULE_NAME_LEN], int n)
 	spin_unlock_irqrestore(&hide_modules_lock, flags);
 }
 
-/* One implementation for both frontends.  Commands: `clear`, `add <name>`, `del <name>`, `set <name> [<name>...]`.
- *
- * @bare_list is the one difference: insmod hands the parameter a bare value (`hide_modules=a,b`), so its setter accepts a
- * command-less list; the /proc node does NOT - a typo there would otherwise silently *replace* the list with whatever was
- * typed (measured on the first device test, where a bogus command discarded the list and the next read showed a name
- * nobody meant).
- *
- * The two staging buffers (1136 + 1024 bytes) are heap-allocated: as locals they made this function's frame 3024 bytes once
- * the inliner folded hide_modules_parse() (and its own 1136-byte buffer) into it, which the 5.10/5.15 builds reported every
- * build - "ld.lld: warning: stack frame size (3024) exceeds limit (2048) in function 'hide_modules_command'", and
- * 5.15/android14-5.15 as "susfs_hide_syms.c:197:0: stack frame size (3024) exceeds limit (2048)".  6.x turns that warning
- * into an error.  Both callers are proc/module_param setters - process context - so GFP_KERNEL is fine. */
 static int hide_modules_command(const char *val, bool bare_list)
 {
 	char *cmd;
@@ -234,9 +198,6 @@ static int hide_modules_command(const char *val, bool bare_list)
 		memcpy(staged, hide_modules, (size_t)n * MODULE_NAME_LEN);
 		spin_unlock(&hide_modules_lock);
 
-		/* `found` is kept separate from `i` on purpose: after a del the index and the new count coincide whenever the
-		 * removed entry was the last one, and reusing `i` for both questions answered -ENOENT for a name that was right
-		 * there (measured: `del <last entry>` always failed). */
 		{
 			bool found = false;
 
@@ -341,8 +302,7 @@ static int hide_modules_proc_show(struct seq_file *m, void *v)
 
 static int hide_modules_proc_open(struct inode *inode, struct file *file)
 {
-	/* 0777 node + this check, exactly like the other control nodes: a restrictive mode would answer EACCES (which
-	 * advertises that the node exists) before sus_path could answer ENOENT. */
+
 	if (current_uid().val != 0)
 		return -ENOENT;
 	return single_open(file, hide_modules_proc_show, NULL);
@@ -382,15 +342,6 @@ static const struct proc_ops hide_modules_proc_ops = {
 
 static struct proc_dir_entry *hide_modules_entry;
 
-/* Local mirror of kernel/kallsyms.c struct kallsym_iter; only the name field matters here.
- *
- * It is a MIRROR, so the compiler cannot check it against the kernel's own struct, and the
- * layout is not KMI-frozen across the versions this module builds against: v6.5 removed
- * `pos_arch_end` (measured against upstream: v5.10/v5.15/v6.1 have it, v6.6/v6.12/v6.18 do
- * not).  Getting this wrong shifts `name`/`module_name` by 8 bytes, which makes every prefix
- * and module-name test miss while all the counters still report "armed" - a silent no-op, not
- * a crash.  Hence the gate below for the drift that is known, and the plausibility check in
- * hide_syms_s_show_pre() for the drift that is not. */
 struct kallsym_iter_local {
 	loff_t pos;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
@@ -425,9 +376,6 @@ static bool name_should_hide(const char *name)
 		if (!strncmp(name, hide_prefixes[i], strlen(hide_prefixes[i])))
 			return true;
 
-	/* Substring form for the names whose prefix differs from the list above.  Measured: with the prefix rules alone a
-	 * 257 -> 7 sweep left anon_ksu_fops, anon_ksu_ioctl(.cfi_jt), anon_ksu_release(.cfi_jt), setup_ksu_cred and
-	 * is_task_ksu_domain visible - each a plain "KernelSU is loaded here" tell in /proc/kallsyms. */
 	if (strstr(name, "ksu") || strstr(name, "susfs"))
 		return true;
 
@@ -438,13 +386,6 @@ static atomic_t hide_hit_count = ATOMIC_INIT(0);
 static atomic_t hide_enter_count = ATOMIC_INIT(0);
 static atomic_t hide_layout_bad = ATOMIC_INIT(0);
 
-/* Is this really a kernel struct kallsym_iter?  Two facts are always true of one: kallsyms
- * fills `type` from its own alphabet, and `name` is NUL-terminated within the field.  The
- * check exists because this kprobe is registered BY NAME and `s_show` is not unique in a
- * kernel that has both kernel/kallsyms.c's and kernel/trace/trace.c's (and mm/vmalloc.c's);
- * if it lands on the wrong one, m->private is some other object and walking it with strncmp
- * and strstr reads whatever is there.  With this gate the string walk below is bounded either
- * way, and a mismatch is counted and reported instead of silently mis-hiding. */
 static bool hide_syms_iter_plausible(const struct kallsym_iter_local *it)
 {
 	if (!it->type || !strchr("aAbBdDgGijNnRrSsTtUuVvWw", it->type))
@@ -473,9 +414,6 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!iter->name[0])
 		return 0;
 
-	/* Two different features, counted apart: the prefix list is upstream's HIDE_KSU_SUSFS_SYMBOLS (KernelSU's names),
-	 * while the module_name test is hide_modules, which filters the lines of whichever modules the operator listed -
-	 * module symbols carry their own spelling (e.g. __kstrtab_foo) with the module's name in module_name. */
 	if (name_should_hide(iter->name)) {
 		atomic_inc(&hide_hit_count);
 		regs->regs[0] = 0;              /* s_show returns 0 */
@@ -491,21 +429,11 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
-/* Registered by name, which is what was measured to work: with this in place `grep -cE 'susfs_|ksu_' /proc/kallsyms` goes 257
- * -> 0.  An audit pointed out that this tree has three different `s_show` functions (kernel/kallsyms.c, kernel/trace/trace.c,
- * mm/vmalloc.c) and that name-based registration gets whichever kallsyms lists first - a real hazard, since the handler reads
- * m->private as struct kallsym_iter *.  Taking the address out of the kallsyms_op table instead and registering with .addr
- * CRASHED the device on the first read of /proc/kallsyms, so the table's .show is not the address a kprobe can be hung on
- * (most likely the arm64 CFI jump-table thunk, which a table's function pointer holds under this config).  So: keep the
- * working registration, and log both addresses so a mismatch is visible. */
 static struct kprobe kp_s_show = {
 	.symbol_name = "s_show",
 	.pre_handler = hide_syms_s_show_pre,
 };
 
-/* /proc/modules is 0444 - any app can read it - and nothing in a built-in SUSFS is listed there.  Our own line is printed
- * by m_show(m, p) with p = &module->list; answering success without emitting anything leaves the listing exactly as it
- * would be without the module.  struct module's layout is what this module was built against (RANDSTRUCT is off here). */
 static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct module *mod;
@@ -559,9 +487,7 @@ int susfs_hide_syms_init(void)
 	hide_registered = true;
 
 	table_show = hide_syms_table_show();
-	/* The two addresses differ by design: a function pointer inside a table holds the CFI jump-table thunk
-	 * (bti c ; b func), while the kprobe lands on the function itself.  The check that matters is the one on device -
-	 * /proc/kallsyms going from 257 ksu_/susfs_ matches to none - and that is what the line is for. */
+
 	SUSFS_LOGI("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
 		(void *)kp_s_show.addr, (void *)table_show,
 		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
@@ -575,9 +501,6 @@ int susfs_hide_syms_init(void)
 	else
 		m_show_registered = true;
 
-	/* hide_modules starts with just this module in its list: a built-in SUSFS has no module entry, so leaving ours visible
-	 * would be a trace upstream does not have.  The sysfs rule can only be registered now, because sus_path is up (this
-	 * layer is last in the init table) - hence the default list is seeded here and not from the parameter's value. */
 	{
 		char staged[HIDE_MODULES_MAX][MODULE_NAME_LEN] = { { 0 } };
 
@@ -586,8 +509,6 @@ int susfs_hide_syms_init(void)
 	}
 	hide_modules_sync_sysfs();
 
-	/* The runtime control node: created only when the LSM layer that hides it is installed, so an unprotected
-	 * world-writable node cannot exist (same shape as the other control nodes - see susfs_control_node_allowed()). */
 	if (susfs_control_node_allowed()) {
 		hide_modules_entry = proc_create("susfs_hide_modules", 0777, NULL,
 						 &hide_modules_proc_ops);

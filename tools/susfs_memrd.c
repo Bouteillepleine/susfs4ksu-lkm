@@ -1,34 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_memrd - can another process' view of a hidden mapping still be read?
- *
- * sus_map hides a mapped file from /proc/<pid>/maps, /smaps, /smaps_rollup,
- * /pagemap and /map_files, but the CONTENT of that mapping has a second door:
- *
- *   /proc/<pid>/mem       -> mem_rw() -> access_remote_vm() -> __access_remote_vm()
- *   process_vm_readv(2)   -> process_vm_rw_single_vec() -> pin_user_pages_remote()
- *
- * Upstream SUSFS closes the first one (its __access_remote_vm hunk breaks the
- * transfer loop) and, measured from this kernel's mm/process_vm_access.c, does NOT
- * close the second - process_vm_readv never goes through __access_remote_vm.
- *
- * This tool reports both doors from the reading process' own point of view, so the
- * module's hook can be judged by what a caller actually gets:
- *
- *   direct_first  - read straight from the mapping (control: the owner always can)
- *   mem_read      - bytes returned by pread() on /proc/self/mem at that address
- *   mem_first     - the first bytes that came back (0 bytes -> nothing transferred)
- *   pvm_readv     - the return value of process_vm_readv() on the same range
- *   pvm_errno     - its errno when it failed (EFAULT is the expected refusal)
- *
- * Build (see .github/workflows/build-ddk.yml):
- *
- *   clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie
- *         -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start
- *         -o susfs_memrd tools/susfs_memrd.c
- *
- * Usage: susfs_memrd <path> [len]
- */
 
 typedef unsigned long long u64;
 typedef long long s64;
@@ -159,8 +129,6 @@ void memrd_main(long argc, char **argv)
 		return;
 	}
 
-	/* One page is enough: the question is whether THIS page can be read through
-	 * /proc/self/mem, not how much of the file was mapped. */
 	map = (char *)sys6(SYS_mmap, 0, PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
 	if ((long)map < 0) {
 		pos = put(out, pos, "mmap failed\n");
@@ -193,12 +161,6 @@ void memrd_main(long argc, char **argv)
 		pos = put(out, pos, "\n");
 	}
 
-	/* Door 2: process_vm_readv on ourselves - the same address, another reader.
-	 *
-	 * The pid must be real: this kernel's process_vm_rw_core() calls
-	 * find_get_task_by_vpid(pid) unconditionally (no "pid 0 means current"
-	 * shortcut), so 0 answers -ESRCH - which is exactly what the first version of
-	 * this tool measured in every state, rule or no rule. */
 	liov.iov_base = rd;
 	liov.iov_len = len;
 	riov.iov_base = map;

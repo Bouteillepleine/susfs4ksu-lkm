@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_main.c - SUSFS LKM entry point: the layer table plus this module's control nodes.
- * Loaded via `ksud insmod`, with unexported symbols relocated via kallsyms.
- */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -14,22 +11,7 @@
 #include "susfs.h"
 
 #define SUSFS_LKM_VERSION "2.3.0-gki"
-/* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
- * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree. */
 
-/* The /proc/susfs_* control nodes are created by default and are 0777 on purpose.
- * Measured on device, 0600 plus sus_path hiding does not work: `ls -l /proc/susfs_kstat`
- * -> ENOENT (the inode_getattr hook fired) but `cat` -> Permission denied (it did not), with
- * sus_path's perm counter stuck at 0 - inode_permission() runs the DAC check BEFORE
- * security_inode_permission(), so a 0600 root-owned node fails DAC first, the LSM hook is
- * never reached, and EACCES advertises that the node exists.  General to sus_path's path
- * layer: it can only turn an ENOENT-shaped answer out of files DAC would have ALLOWED.
- * Hence 0777: DAC passes, the LSM layer is the only thing that answers (ENOENT for every
- * non-root caller).
- * The nodes exist only when the layer that hides them is installed
- * (susfs_control_node_allowed()), so an unprotected world-writable node cannot happen, and
- * root-only access is enforced by the handlers' uid checks, not by the mode.  expose_proc=0
- * removes the nodes entirely. */
 bool susfs_expose_proc = true;
 module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
 
@@ -40,16 +22,11 @@ static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_avc_spoof",
     SUSFS_HIDE_MODULES_NODE,
     SUSFS_HIDE_MOUNTS_NODE,
-    /* sus_path's own interface (the rule listing): it goes through the same table it
-     * prints, so a broken rule table is visible in the very view that reports it. */
+
     SUSFS_PATH_NODE,
-    /* The module's own sysfs directory is NOT here: it belongs to hide_module
-     * (susfs_hide_syms.c), which adds and drops that rule at runtime. */
+
 };
 
-/* Register our control nodes in sus_path's hidden set: probing them must answer ENOENT,
- * not EACCES.  Runs after every feature init (the nodes must exist for kern_path() to
- * resolve them) and after sus_path_init(), so the hooks are already patched. */
 static void susfs_self_hide_nodes(void)
 {
     int i;
@@ -66,18 +43,6 @@ static void susfs_self_hide_nodes(void)
     }
 }
 
-/* ---- layer table: arming order IS the teardown order, reversed --------------
- * A failed load must leave NOTHING armed: when module_init() returns an error the kernel
- * frees this module's memory, so anything still installed - a patched security_hook_heads
- * slot above all - becomes a function pointer into freed memory that the next syscall goes
- * through.  Hence the exits of the already-armed layers run before failing.
- * Teardown runs in the exact reverse of arming, in one place, and the order matters:
- * sus_path's LSM layer is what answers ENOENT for this module's own 0777 control nodes (see
- * the expose_proc note), so unhooking it before the nodes are removed would expose them to
- * every process during the unload - here the nodes go first and the LSM layer last.
- * `fatal` marks the two layers whose absence makes the module useless or silent: sus_path
- * and the supercall hook; the rest log their own failure and degrade to "off".  The exits
- * are idempotent, which lets one path serve rollback and unload alike. */
 static int layer_lsm_hook_init(void)
 {
     ksu_lsm_hook_init();
@@ -106,13 +71,9 @@ static struct {
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, false },
 };
 
-/* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
- * on the device - a `fatal` layer failing must leave the load with nothing armed. */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
 
-/* Not __init/__exit: it is called from both, and an __exit callee in __init code is a
- * modpost section mismatch. */
 static void susfs_layers_down(int upto)
 {
     int i;
@@ -161,19 +122,8 @@ static int __init susfs_init(void)
                 susfs_layers[i].name, ret);
     }
 
-    /* Registered last and undone implicitly: these are entries in sus_path's table, which
-     * sus_path_exit() empties while its LSM layer still answers ENOENT for the nodes. */
     susfs_self_hide_nodes();
 
-    /* Operator note.  The module hides its own traces from EVERY caller, root included (a
-     * built-in SUSFS has no module entry, so hiding it only from non-root would leave a
-     * trace upstream does not have): `lsmod | grep susfs` stays empty and a second `insmod`
-     * fails with -EEXIST, which reads like a broken module.
-     * THE ONE LINE THAT IGNORES THE LOG SWITCH: everything else follows enable_log
-     * (susfs_log.h), but this is the only evidence the module came up and the one thing an
-     * operator greps for, so it stays unconditional even for a silent load - otherwise
-     * "loaded but logging off" is indistinguishable from "not loaded".  The prefix comes
-     * from pr_fmt (susfs_log.h), so the message must not repeat it. */
     pr_info("loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
             SUSFS_LKM_MODULE_NAME);
 
@@ -190,29 +140,6 @@ module_init(susfs_init);
 module_exit(susfs_exit);
 MODULE_LICENSE("GPL");
 
-/* The VFS symbol namespace of this kernel's GKI builds.
- * kern_path, ihold (fs/) and override_creds/revert_creds (kernel/cred.c) are exported as
- * EXPORT_SYMBOL_NS(sym, ANDROID_GKI_VFS_EXPORT_ONLY); the Android build maps that name to
- * the long string below with a per-directory ccflag before the compiler stringifies it
- * (fs/Makefile subdir-ccflags-y, plus kernel/Makefile for cred.o on some releases).  A
- * module that does not import the RESULTING string is refused with "module uses symbol
- * (kern_path) from namespace VFS_internal_... but does not import it" -> "Unknown symbol
- * kern_path (err -22)" - why plain insmod failed on the phone before this line existed.
- * 6.13 changed the SPELLING ("module: convert symbol namespace to string literal"):
- *   <= 6.12  #define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, __stringify(ns))
- *   >= 6.13  #define MODULE_IMPORT_NS(ns) MODULE_INFO(import_ns, ns)
- * so a BARE identifier is required before that and a QUOTED string after - MODULE_IMPORT_NS
- * stringifies its argument up to 6.12, which is also why the long form here has to be
- * literal (measured: passing the macro name left the built .ko's .modinfo with no import_ns
- * entry at all).  Wrong is silent one way (<= 6.12 stringifies the quotes too, importing a
- * namespace no kernel creates) and a hard error the other (>= 6.13 rejects a bare
- * identifier: 'expected ; after top level declarator', measured on android17-6.18).  Both
- * spellings emit the same .modinfo entry, checked per variant by the CI step that fails a
- * .ko with no import_ns entry.
- * Necessary but NOT sufficient for plain insmod: nine further symbols are not in the export
- * table in any of the six GKI variants (kallsyms_lookup_name and friends, saved_boot_config,
- * task_work_add, init_mm, __set_fixmap, copy_to_kernel_nofault, dcache_clean_inval_poc), so
- * tools/susfs_insmod.c rewrites undefined symbols to absolute addresses, as ksud does. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
 #else

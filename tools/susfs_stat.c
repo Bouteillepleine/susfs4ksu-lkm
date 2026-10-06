@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_stat - a 64-bit client that PRINTs what newfstatat(79), fstat(80) and statx(291) return.
- *
- * Why this exists.  The kstat spoofing is verified with `ls -li` and `toybox stat` on the device, and
- * both of those go through newfstatat(79) only.  fstat(80) fills the same struct stat but from an fd,
- * and statx(291) fills a DIFFERENT struct (struct statx) with a mask contract that says which fields
- * the kernel actually filled - neither is reachable from a shell, and there is no strace on the
- * device.  `ls`, `toybox stat` and a 32-bit compat client therefore cannot tell "fstat/statx are
- * spoofed" from "they are not", which is how a feature can look broken (or look fine) without anyone
- * having measured it.
- *
- * Same freestanding shape as tools/susfs_sc.c and tools/susfs_compat_stat.c: no libc, its own
- * _start, static-pie, syscalls through inline asm.  Android rejects non-PIE executables and the DDK
- * container has no bionic sysroot, so this is the only way it can be built there.
- *
- * Build (see .github/workflows/build-ddk.yml):
- *
- *   clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie -fno-stack-protector \
- *         -fno-builtin -fuse-ld=lld -Wl,-e,_start -o susfs_stat tools/susfs_stat.c
- *
- * Usage:
- *
- *   susfs_stat <path> [mask_hex]
- *
- *     <path>      the path to stat (fstat()/statx(AT_EMPTY_PATH) use it via an open fd)
- *     [mask_hex]  statx's request mask, e.g. 7ff (STATX_BASIC_STATS, the default) or 7fff
- *
- * Every line is `key=value` and printed with one syscall, so a test script can grep/compare:
- *
- *   newfstatat: rc=0 ino=... dev=... nlink=... size=... blocks=... blksize=... mtime=...
- *   fstat     : rc=0 ino=... ...                       (same fields, fd-based)
- *   statx     : rc=0 mask=0x7ff blksize=4096 nlink=1 ino=... size=... blocks=... dev=maj:min atime=... mtime=... ctime=...
- *
- * The statx mask is printed because "the field is spoofed but the mask does not say so" (or the
- * reverse) is exactly the inconsistency a checker looks for, and it is also what tells this tool
- * whether the kernel filled a field the caller asked for.
- */
 
 #include <stddef.h>
 
-/* stddef.h for size_t only (the static_asserts below need it); clang's freestanding headers
- * provide it, and it pulls in no libc code. */
 #include <stddef.h>
 
 typedef unsigned long long u64;
@@ -326,8 +287,6 @@ void stat_main(long argc, char **argv)
 		}
 	}
 
-	/* One CPU, so the values do not depend on which core the process landed on (the spoofing is
-	 * per-caller-uid, but the inode numbers printed by a filesystem can differ per mount view). */
 	{
 		unsigned long mask = 1ul << 7;
 
@@ -343,8 +302,6 @@ void stat_main(long argc, char **argv)
 	rc = sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)&st, 0, 0, 0);
 	show_stat("newfstatat", rc, &st);
 
-	/* 80: the fd-based one.  Same struct, but the buffer is argument 1 and the kernel reaches it
-	 * through vfs_fstat() - a different chain, which is why it needed its own whitelist entry. */
 	fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
 	if (fd < 0) {
 		pos = 0;
@@ -358,9 +315,6 @@ void stat_main(long argc, char **argv)
 		sys6(SYS_close, fd, 0, 0, 0, 0, 0);
 	}
 
-	/* 291: struct statx, with the caller's mask.  Run it twice so the buffer's own stx_mask can be
-	 * compared between a request that names the basic set and one that names almost nothing - the
-	 * mask is part of what a reader trusts. */
 	rc = sys6(SYS_statx, AT_FDCWD, (long)path, 0, (long)req_mask, (long)&sx, 0);
 	show_statx(rc, req_mask);
 	if (req_mask != STATX_BASIC_STATS) {

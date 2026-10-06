@@ -1,19 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * symbol_resolver.c - kernel symbol lookup (ported from KernelSU/SukiSU
- * infra/symbol_resolver.c).
- *
- * No kallsyms_* entry point is an ELF import: on a 6.1 device with KernelSU as a module,
- * kallsyms_lookup_name/lookup/lookup_size_offset/on_each_symbol/on_each_match_symbol all
- * come from kernelsu.ko, so an extern reference to any of them silently makes this module
- * depend on KernelSU.  They are bootstrapped at runtime instead - register_kprobe()
- * resolves a NAME through the kernel's own kallsyms, never the export table - and the
- * "Verify sections" build step fails if any of the five names returns to the .ko's
- * undefined list.
- * GKI does not export kallsyms_lookup_name, so resolution walks kallsyms via
- * kallsyms_on_each_symbol; under LLVM CFI (< 6.1) a function-table slot holds the
- * ".cfi_jt" variant, which ksu_resolve_symbol_for_functable_hook() prefers.
- */
+
 #include "symbol_resolver.h"
 #include "susfs_log.h"
 #include <linux/kallsyms.h>
@@ -41,25 +27,16 @@ static const size_t cfi_suffix_len = sizeof(cfi_suffix) - 1;
 #define ALWAYS_HAVE_ON_EACH_SYMBOL 0
 #endif
 
-/* kallsyms_on_each_match_symbol() is NOT in 6.1 (measured against upstream: absent in v6.1,
- * present from v6.5, so 6.6/6.12/6.18 have it).  Gating at 6.1 only bought a spurious
- * "cannot bootstrap" warning on the android14-6.1 variant and then fell back to the
- * kallsyms_lookup_name() path that every other build uses anyway. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 #define HAVE_ON_EACH_MATCH_SYMBOL 1
 #else
 #define HAVE_ON_EACH_MATCH_SYMBOL 0
 #endif
 
-/* ---- the four entry points, all runtime-bootstrapped: NULL until
- * ksu_init_symbol_resolver(), each called through a __nocfi function because CFI checks
- * indirect call sites - a wrong type panics there on a kCFI kernel (6.1+). */
 static unsigned long (*kallsyms_lookup_name_fn)(const char *name) = NULL;
 static const char *(*kallsyms_lookup_fn)(unsigned long addr, unsigned long *symbolsize, unsigned long *offset,
                                          char **modname, char *namebuf) = NULL;
 
-/* The walker lost its `struct module *` argument in 6.6, so the POINTER's type is
- * version-gated like the callbacks below (that argument carried module ownership). */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 typedef int (*ksu_on_each_symbol_fn_t)(int (*fn)(void *, const char *, unsigned long), void *data);
 #else
@@ -77,10 +54,6 @@ static int find_kernel_symbol_exact_cb(void *data, unsigned long addr)
 }
 #endif
 
-/* Resolve a symbol NAME at runtime: register_kprobe() looks it up in the kernel's own
- * kallsyms and never touches the export table - which is why nothing here imports a
- * kallsyms_* symbol.  __nocfi because the address is stored in a function pointer and
- * called indirectly, which CFI checks; NULL is a degradation, never a load failure. */
 static __nocfi void *ksu_bootstrap_symbol(const char *name)
 {
     struct kprobe kp;
@@ -106,8 +79,6 @@ struct ksu_lookup_symbol_ctx {
     void *match;
 };
 
-/* Exact-name lookup through the walker - reachable only when kallsyms_lookup() did not
- * bootstrap; before 6.6 it is also the module-ownership check (see ksu_exact_name_cb()). */
 struct ksu_exact_name_ctx {
     const char *symbol_name;
     unsigned long addr;
@@ -183,8 +154,6 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
     }
 #endif
 
-    /* Graceful degradation, decided here: with no bootstrapped kallsyms_lookup_name there
-     * is no name lookup at all, so features needing one stay off; the module still loads. */
     if (unlikely(!kallsyms_lookup_name_fn))
         return 0;
 
@@ -193,9 +162,7 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
         return 0;	/* walking kallsyms for address 0 answers nothing */
 
     if (likely(kallsyms_lookup_fn)) {
-        /* PATH IN USE on every kernel this module builds against: name -> address through
-         * the bootstrapped kallsyms_lookup_name(), ownership check through the bootstrapped
-         * kallsyms_lookup() - a non-NULL modname means another module owns it, refused. */
+
         char *module_name = NULL;
         char buf[KSYM_SYMBOL_LEN];
 
@@ -207,10 +174,6 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
         return addr;
     }
 
-    /* kallsyms_lookup() is unavailable, so the owner has to come from the walker: before
-     * 6.6 its callback is handed the owning `struct module *` and ksu_exact_name_cb()
-     * refuses a non-NULL mod.  The walk must also confirm the address, or we would be
-     * trusting a symbol we could not check. */
     if (kallsyms_on_each_symbol_fn) {
         struct ksu_exact_name_ctx ctx = { .symbol_name = symbol_name };
 
@@ -222,31 +185,10 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
         return addr;
     }
 
-    /* Neither kallsyms_lookup() nor the walker bootstrapped, and from 6.6 the walker does
-     * not carry the owner either: fail closed rather than take a symbol whose owner cannot
-     * be verified. */
     pr_warn("ignore symbol %s: its owner cannot be checked on this kernel\n", symbol_name);
     return 0;
 }
 
-/* Collect EVERY vmlinux symbol with this exact name, not just the first one.
- *
- * find_kernel_symbol_exact() returns one address, which is all most callers need; but a
- * name is not always unique in kallsyms, and register_kprobe(.symbol_name=...) takes
- * whichever match kallsyms lists first - measured: `seq_show` is one symbol on 5.10/5.15
- * and FOUR on android14-6.1 / android15-6.6 / android16-6.12 / android17-6.18 (fs/proc/fd.c's
- * is only one of them).  A caller that must hook a specific function therefore has to hook
- * all of them and decide at run time; this is the enumeration it needs.
- *
- * Module-owned symbols are dropped (they are not the kernel's function of that name), which
- * is the same ownership rule find_kernel_symbol_exact() applies.  Returns the number of
- * addresses written (0 = unknown/not found); the walker paths are bounded by @max.  __nocfi
- * because it calls the walker through a function pointer, like every other resolved-address
- * call in this file: without it the compiler instruments the call, and under LLVM CFI
- * (< 6.1) the check runs against the kernel's type hash and panics on the first call -
- * measured on a 5.15 device: "Kernel panic - not syncing: CFI failure (target:
- * kallsyms_on_each_symbol+0x0/0x1e4)" with this function inlined into
- * susfs_sus_mount_supercall (the fdinfo arm is on the mount-enable path). */
 int __nocfi ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
 {
     int n = 0;
@@ -262,8 +204,7 @@ int __nocfi ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
     }
 
     if (n == 0) {
-        /* No walker (pre-5.19) or no match: the single-address lookup is the fallback, and
-         * on the kernels where a name is ambiguous the walker exists. */
+
         unsigned long one = find_kernel_symbol_exact(name);
 
         if (one) {
@@ -365,14 +306,6 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 #endif
 }
 
-/* The NAME of the function at @addr, through the same bootstrapped kallsyms_lookup() the
- * export check above uses.  The static-call takeover in lsm_hook.c holds the address the
- * kernel registered for SELinux's slot and must confirm it is the implementation of the
- * hook it takes over; comparing against a name-resolved symbol would be weaker, because
- * with LTO the registered function can be a clone (".constprop.0").
- * Returns the length written into @buf (KSYM_SYMBOL_LEN bytes), -ENOSYS when
- * kallsyms_lookup() is unavailable, -ENOENT when the address cannot be named.  @module_out
- * gets the owning module's name or NULL for a vmlinux symbol (refused by the caller). */
 int ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out)
 {
     char *modname = NULL;

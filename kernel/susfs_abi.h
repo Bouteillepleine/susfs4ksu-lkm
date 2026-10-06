@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_abi.h - SUSFS kernel<->userspace ABI (supercall via reboot(2)).  Mirrors upstream
- * susfs_def.h + susfs.h layouts exactly, so the prebuilt ksu_susfs tool (and SukiSU's ksud
- * bindings) can drive this LKM unmodified; field order/types/sizes MUST match [repr(C)] there.
- * Wire protocol: syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id, &mut payload); the
- * kernel writes payload.err back (0 = ok, else errno-style).
- */
+
 #ifndef __SUSFS_ABI_H
 #define __SUSFS_ABI_H
 
@@ -15,9 +9,6 @@
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
 #define SUSFS_MAGIC        0xFAFAFAFA
 
-/* command IDs (shared with ksu_susfs / ksud; identical to upstream susfs_def.h, including the
- * ids upstream marks *deprecated* - defined for ABI completeness only, no handler wired,
- * exactly like upstream kernels, which no longer dispatch them either. */
 #define CMD_SUSFS_ADD_SUS_PATH                  0x55550
 #define CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH    0x55551 /* deprecated */
 #define CMD_SUSFS_SET_SDCARD_ROOT_PATH          0x55552 /* deprecated */
@@ -42,15 +33,6 @@
 #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING       0x60010
 #define CMD_SUSFS_ADD_SUS_MAP                   0x60020
 
-/* 126 is a USERSPACE-side sentinel the kernel never produces: the ksu_susfs C tool pre-seeds payload.err with it and
- * prints "SUSFS operation not supported, please enable it in kernel" when the field is STILL 126 after the syscall,
- * i.e. when the kernel never wrote err back -
- *   ksu_susfs/jni/includes/susfs_defs.h:16   #define ERR_CMD_NOT_SUPPORTED 126
- *   ksu_susfs/jni/includes/susfs_defs.h:18   PRT_MSG_IF_CMD_NOT_SUPPORTED(err, cmd)
- *   ksu_susfs/jni/features/sus_map.c:51-53   info.err = ERR_CMD_NOT_SUPPORTED; syscall(...); PRT
- *   KernelSU/10_enable_susfs_for_ksu.patch:2925-2926  default: return -EINVAL, payload untouched
- * The kernel half of the contract is only "do not write err for a command you do not handle"; susfs_supercall.c mirrors
- * it (the kprobe does not hijack a command susfs_cmd_handled() rejects and writes nothing).  Userspace defines it only. */
 #define ERR_CMD_NOT_SUPPORTED 126
 
 #define SUSFS_MAX_LEN_PATHNAME                  256
@@ -62,8 +44,6 @@
 #define SUSFS_VERSION_STR "v2.3.0"
 #define SUSFS_VARIANT_STR "GKI"
 
-/* uid_scheme values of struct st_susfs_open_redirect (upstream enum UID_SCHEME, declared in
- * susfs.h next to the structs) */
 enum UID_SCHEME {
 	UID_NON_APP_PROC = 0,
 	UID_ROOT_PROC_EXCEPT_SU_PROC,
@@ -84,16 +64,6 @@ struct st_susfs_sus_map {
 	int err;
 };
 
-/* KSTAT_SPOOF_* bits of struct st_susfs_sus_kstat's `flags` field (upstream declares these in
- * susfs.h right above that struct).  Intentional deviation from upstream, correcting an earlier
- * note here that got this wrong:
- *   upstream KERNEL    kernel_patches/include/linux/susfs.h:71  #define ..._CTIME_TV_SEC (1 < 8) -> 1
- *   upstream USERSPACE ksu_susfs/jni/features/sus_kstat.c:25    #define ..._CTIME_TV_SEC (1 < 8) -> 1
- *   SukiSU ksud (Rust) userspace/ksud/src/susfs/abi/consts.rs:52 uses the intended (1 << 8) -> 256
- * i.e. the typo lives on BOTH upstream sides, so bit 8 is really an alias of bit 0 (INO) there and
- * upstream's ctime spoof never fires from either side.  We keep the corrected value so bit 8 really
- * does spoof ctime.tv_sec, which also matches what ksud sends; a caller that follows the typo simply
- * spoofs ino, so both sides stay self-consistent.  If upstream ever fixes the typo, the two converge. */
 #define KSTAT_SPOOF_INO           (1 << 0)
 #define KSTAT_SPOOF_DEV           (1 << 1)
 #define KSTAT_SPOOF_NLINK         (1 << 2)

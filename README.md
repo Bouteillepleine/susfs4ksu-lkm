@@ -59,6 +59,16 @@ adb shell "su -c 'mkdir -p /data/adb/loader && cp /data/local/tmp/susfs_guard_lk
 adb shell "su -c 'sh /data/local/tmp/verify-gki.sh'"
 ```
 
+## 技术说明
+
+源码里只留贴着代码的短注释（约 3%），其余注释全部原样搬进了 **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**：
+按文件、按源码顺序排列，每条以它所注释的那行代码为标题，`grep -n "<标题>" <文件>` 就能回到原处。
+里面是各内核版本（5.10–6.18）与厂商内核上的实测数据、ABI/布局结论、每个 hook 是怎么定位的，以及踩过一次的坑。
+
+> The sources keep only short notes next to the code (about 3%). Every other comment
+> lives in **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**, in source order, each entry
+> headed by the code line it documented.
+
 ## 发布
 
 所有 GitHub release(**含 pre-release**)的描述一律用**英文**书写(自 `v2.3.0-r10` 起的规定)。

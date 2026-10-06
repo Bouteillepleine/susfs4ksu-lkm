@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * susfs_avc_spoof.c - hide the KernelSU su domain from SELinux AVC audit logs (SUSFS AVC_LOG_SPOOFING), LKM port: upstream
- * prints a priv_app context in place of the su domain, hiding the "denied { ... } tcontext=u:r:su:s0" lines that root-hiding
- * detectors grep for.  Rewriting tsid in place makes the hooked function's own security_sid_to_context() emit the priv_app
- * context - equivalent to upstream's string swap.  The sids are resolved at init time (process context) via EXPORT_SYMBOL
- * security_secctx_to_secid(), with module_param overrides; interface is /proc/susfs_avc_spoof (write "1"/"0", read to query).
- */
+
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/security.h>
@@ -18,8 +12,6 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 
-/* module_param overrides for the two domains: the default su domain is the SukiSU variant ("ksu"), stock
- * KernelSU uses "su".  The sid is resolved at init time via security_secctx_to_secid(). */
 static char avc_su_ctx[128] = "u:r:ksu:s0";
 static char avc_priv_app_ctx[128] = "u:r:priv_app:s0:c512,c768";
 module_param_string(avc_su_ctx, avc_su_ctx, sizeof(avc_su_ctx), 0644);
@@ -30,10 +22,6 @@ static u32 avc_priv_app_sid;
 static bool avc_spoof_enabled;
 static bool avc_registered;
 
-/* slow_avc_audit(state, ssid, tsid, tclass, requested, audited, denied, result, a): tsid is arg #3
- * (regs->regs[2]), a u32 in the low bits.  avc_audit_post_callback is static and LTO-inlined into
- * slow_avc_audit (noinline), so its kallsyms symbol is a leftover; slow_avc_audit has a real out-of-line copy.
- * This handler runs in interrupt context (no sleep), so it only rewrites the register. */
 static atomic_t avc_hit_count = ATOMIC_INIT(0);
 static atomic_t avc_enter_count = ATOMIC_INIT(0);
 
@@ -42,8 +30,7 @@ static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 	u32 tsid = (u32)regs->regs[2];
 
 	atomic_inc(&avc_enter_count);
-	/* avc_su_sid == 0 means security_secctx_to_secid() failed (see init); a failed resolution must not
-	 * turn "sid 0" into a match. */
+
 	if (!avc_su_sid || tsid != avc_su_sid)
 		return 0;
 	atomic_inc(&avc_hit_count);
@@ -89,8 +76,7 @@ static int avc_proc_show(struct seq_file *m, void *v)
 
 static int avc_proc_open(struct inode *inode, struct file *file)
 {
-	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set, not from the mode), so
-	 * refuse non-root callers here too - see the note in susfs_enable_log.c's log_proc_open(). */
+
 	if (current_uid().val != 0)
 		return -ENOENT;
 	return single_open(file, avc_proc_show, NULL);
@@ -156,8 +142,6 @@ int susfs_avc_spoof_init(void)
 	SUSFS_LOGI("avc_spoof: su_sid=%u (%s), priv_app_sid=%u (%s)\n",
 		avc_su_sid, avc_su_ctx, avc_priv_app_sid, avc_priv_app_ctx);
 
-	/* Only the /proc node is optional: avc_register() installs the hook whenever the feature is switched
-	 * on, supercall included.  0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT. */
 	if (susfs_control_node_allowed()) {
 		avc_proc_entry = proc_create("susfs_avc_spoof", 0777, NULL,
 					     &avc_proc_ops);
