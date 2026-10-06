@@ -15,6 +15,10 @@ was developed against (OPPO PJA110, Android 12-16, kernels 5.10-6.18 and vendor 
 kernel-version facts, ABI contracts, layout probes, and the traps that were hit once and
 should not be hit again.  Numbers are observed values, not estimates.
 
+## Contents
+
+`kernel/lsm_hook.c`, `kernel/patch_memory.c`, `kernel/spoof_cmdline.c`, `kernel/sus_map.c`, `kernel/sus_mount.c`, `kernel/sus_path.c`, `kernel/susfs_avc_spoof.c`, `kernel/susfs_enable_log.c`, `kernel/susfs_hide_syms.c`, `kernel/susfs_kstat.c`, `kernel/susfs_main.c`, `kernel/susfs_open_redirect.c`, `kernel/susfs_supercall.c`, `kernel/susfs_uname.c`, `kernel/symbol_resolver.c`, `kernel/lsm_hook.h`, `kernel/susfs.h`, `kernel/susfs_abi.h`, `kernel/susfs_log.h`, `kernel/symbol_resolver.h`, `tools/susfs_bench.c`, `tools/susfs_compat_stat.c`, `tools/susfs_insmod.c`, `tools/susfs_memrd.c`, `tools/susfs_mmap.c`, `tools/susfs_mntid.c`, `tools/susfs_sc.c`, `tools/susfs_stat.c`
+
 ## `kernel/lsm_hook.c`
 
 ### `(file header)`
