@@ -38,9 +38,7 @@ art/
 
 # internal working documents: audit findings, subagent reports, implementation
 # notes.  Publishing them would describe exactly how the module hides itself and
-# what it is checked against - the opposite of the point.  They stay on disk,
-# and since 2026-10-06 they are mirrored to the private notes repository instead
-# of being tracked here.  No note of any kind is published from this repository.
+# what it is checked against - the opposite of the point.  They stay on disk.
 *.md
 !README.md
 # 接口文档是要给使用者的，与 README 同级发布；其余 *.md 仍是内部文档（会写清隐藏手法本身）。
