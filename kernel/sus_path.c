@@ -428,8 +428,10 @@ static int sus_path_inode_permission(struct inode *inode, int mask);
 		 * dmb ishld and only on the non-hidden path. */				\
 		smp_rmb();								\
 		__susfs_orig = (LSM_HOOK_FN_TYPE(member))READ_ONCE((hook).original);	\
+		/* Through the trampoline, never directly: a checked indirect call into	\
+		 * the kernel panics instead of failing (see SUS_LSM_ORIG_CALL above). */	\
 		if (__susfs_orig)							\
-			return __susfs_orig(__VA_ARGS__);				\
+			return sus_path_orig_##member(__susfs_orig, __VA_ARGS__);	\
 	} while (0)
 #else
 #define SUS_LSM_PASS_ORIG(hook, member, ...) do { } while (0)
@@ -495,6 +497,103 @@ static struct ksu_lsm_hook sus_path_link_hook =
 #define SUS_SETATTR_MNT_ID_DECL
 #define SUS_SETATTR_MNT_ID_ARG
 #endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* A hook that TAKEN OVER SELinux's slot still has to run SELinux's decision, which it does by
+ * calling the saved original through `hook.original` (SUS_LSM_PASS_ORIG below).  That call
+ * goes through these trampolines instead of being made at the call site, and they are
+ * __nocfi, because an INSTRUMENTED indirect call into the kernel panics here rather than
+ * failing: the type id this module expects and the one the kernel emitted for its own
+ * function do not agree.  Measured on a 5.15 device - the first call through a
+ * kallsyms-resolved pointer died with
+ *
+ *     Kernel panic - not syncing: CFI failure (target: kallsyms_on_each_symbol+0x0/0x1e4)
+ *
+ * `noinline` is not decoration either.  LTO treats the attribute as a property of the
+ * function it was written on, so it inlines an unchecked call back into a caller that lacks
+ * it and the check reappears THERE - which is how that panic ended up in
+ * susfs_sus_mount_supercall() instead of in the function that made the call.
+ *
+ * One trampoline per hook member, because each has to be called through its own prototype
+ * (and the two idmap arguments are version-dependent, hence the DECL/ARG macros); the macro
+ * only saves repeating the cast and the two attributes.  tools/cfi_sites.py asserts on the
+ * built .ko that no other function in this module carries a checked call. */
+#define SUS_LSM_ORIG_CALL(member, ...)						\
+	static __nocfi noinline int sus_path_orig_##member(			\
+		LSM_HOOK_FN_TYPE(member) fn, __VA_ARGS__)
+
+SUS_LSM_ORIG_CALL(inode_getattr, const struct path *path)
+{
+	return fn(path);
+}
+
+SUS_LSM_ORIG_CALL(inode_permission, struct inode *inode, int mask)
+{
+	return fn(inode, mask);
+}
+
+SUS_LSM_ORIG_CALL(inode_unlink, struct inode *dir, struct dentry *dentry)
+{
+	return fn(dir, dentry);
+}
+
+SUS_LSM_ORIG_CALL(inode_rmdir, struct inode *dir, struct dentry *dentry)
+{
+	return fn(dir, dentry);
+}
+
+SUS_LSM_ORIG_CALL(inode_rename, struct inode *old_dir, struct dentry *old_dentry,
+		  struct inode *new_dir, struct dentry *new_dentry)
+{
+	return fn(old_dir, old_dentry, new_dir, new_dentry);
+}
+
+SUS_LSM_ORIG_CALL(inode_link, struct dentry *old_dentry, struct inode *dir,
+		  struct dentry *new_dentry)
+{
+	return fn(old_dentry, dir, new_dentry);
+}
+
+SUS_LSM_ORIG_CALL(sb_statfs, struct dentry *dentry)
+{
+	return fn(dentry);
+}
+
+SUS_LSM_ORIG_CALL(inode_setattr, SUS_SETATTR_MNT_ID_DECL
+		  struct dentry *dentry, struct iattr *attr)
+{
+	return fn(SUS_SETATTR_MNT_ID_ARG dentry, attr);
+}
+
+SUS_LSM_ORIG_CALL(inode_getxattr, struct dentry *dentry, const char *name)
+{
+	return fn(dentry, name);
+}
+
+SUS_LSM_ORIG_CALL(inode_listxattr, struct dentry *dentry)
+{
+	return fn(dentry);
+}
+
+SUS_LSM_ORIG_CALL(inode_setxattr, SUS_XATTR_MNT_ID_DECL
+		  struct dentry *dentry, const char *name, const void *value,
+		  size_t size, int flags)
+{
+	return fn(SUS_XATTR_MNT_ID_ARG dentry, name, value, size, flags);
+}
+
+SUS_LSM_ORIG_CALL(inode_removexattr, SUS_XATTR_MNT_ID_DECL
+		  struct dentry *dentry, const char *name)
+{
+	return fn(SUS_XATTR_MNT_ID_ARG dentry, name);
+}
+
+SUS_LSM_ORIG_CALL(path_notify, const struct path *path, u64 mask,
+		  unsigned int obj_type)
+{
+	return fn(path, mask, obj_type);
+}
+#endif	/* >= 6.12: the slot-takeover path is the only one that calls an original */
 
 static int sus_path_sb_statfs(struct dentry *dentry);
 static int sus_path_inode_setattr(SUS_SETATTR_MNT_ID_DECL

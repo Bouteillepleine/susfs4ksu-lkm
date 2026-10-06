@@ -306,7 +306,13 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 #endif
 }
 
-int ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out)
+/* __nocfi like every other function here that reaches a resolved symbol: the call to
+ * kallsyms_lookup() goes through a function pointer, so an instrumented call site would be
+ * checked against the kernel's type id - and that check panics when it does not match.
+ * 6.12/6.18 reach this through the static-call takeover (lsm_hook.c), i.e. it is on a real
+ * path, not a debug one; tools/cfi_sites.py now fails the build if it is ever un-annotated
+ * again. */
+int __nocfi ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out)
 {
     char *modname = NULL;
 
