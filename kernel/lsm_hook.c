@@ -84,13 +84,156 @@ static int ksu_lsm_hook_patch_slot(void **slot, void *value)
     return ret;
 }
 
+/* Both version paths below read kernel pointers they did not place themselves: the >= 6.12 one
+ * walks static_calls_table, the < 6.12 one walks security_hook_heads.  A pointer that is not a
+ * kernel address is refused, and every read goes through copy_from_kernel_nofault(), so a damaged
+ * structure is skipped rather than faulted on. */
+#define KSU_LSM_KPTR_MIN	0xff00000000000000UL
+
+static bool ksu_lsm_kptr_plausible(const void *p)
+{
+    return (unsigned long)p >= KSU_LSM_KPTR_MIN;
+}
+
+static int ksu_lsm_read_ptr(const void *addr, void *out)
+{
+    memset(out, 0, sizeof(void *));
+    return (int)copy_from_kernel_nofault(out, addr, sizeof(void *));
+}
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 
+/* How many entries of a list are looked at while identifying it; a list is short and this only
+ * bounds the walk. */
+#define KSU_LSM_HEAD_SCAN_ENTRIES	64
+
+/* Find the list head for @hook by IDENTITY instead of by the build-time offset: the offset is
+ * only this hook's list when the kernel's hook order matches the tree this module was compiled
+ * against, and the offset path below cannot tell - a list belonging to ANOTHER hook reports the
+ * computed address back, because its entries were linked to it.  Inserting the replacement there
+ * means the kernel calls it with another hook's prototype.  What identifies a list is which
+ * implementation of `selinux_<member>` its entries hold.  A second matching list is reported
+ * through @ambiguous_out: the name then does not identify one list, and guessing is not allowed. */
+static int ksu_lsm_hook_head_by_identity(unsigned long heads_addr, struct ksu_lsm_hook *hook,
+                                        struct hlist_head **out, struct hlist_head **ambiguous_out)
+{
+    unsigned long addrs[8];
+    char want[64];
+    int n_addrs, i;
+    unsigned long off;
+    void *functable;
+
+    *out = NULL;
+    *ambiguous_out = NULL;
+
+    snprintf(want, sizeof(want), "selinux_%s", hook->head_name);
+
+    n_addrs = ksu_find_symbol_all(want, addrs, (int)ARRAY_SIZE(addrs));
+    if (n_addrs == (int)ARRAY_SIZE(addrs))
+        pr_warn("lsm_hook: %s: more than %d addresses are named %s - only the first %d are considered\n",
+                hook->head_name, (int)ARRAY_SIZE(addrs), want, n_addrs);
+
+    /* The funtable spelling of the same name as well: under LLVM CFI (< 6.1) a hook table slot
+     * holds the ".cfi_jt" stub rather than the function body, so the exact name alone would never
+     * match on 5.10/5.15.  kCFI has no such stub, and there the two resolve to one address. */
+    functable = ksu_resolve_symbol_for_functable_hook(want);
+    if (functable) {
+        for (i = 0; i < n_addrs; i++) {
+            if ((void *)addrs[i] == functable)
+                break;
+        }
+        if (i == n_addrs && n_addrs < (int)ARRAY_SIZE(addrs))
+            addrs[n_addrs++] = (unsigned long)functable;
+    }
+
+    if (!n_addrs) {
+        pr_warn("lsm_hook: %s: kallsyms has no address named %s, so its list cannot be identified\n",
+                hook->head_name, want);
+        return -ENOENT;
+    }
+
+    for (off = 0; off + sizeof(struct hlist_head) <= sizeof(struct security_hook_heads);
+         off += sizeof(struct hlist_head)) {
+        struct hlist_head *head = (struct hlist_head *)(heads_addr + off);
+        struct security_hook_list *e =
+            hlist_entry_safe(READ_ONCE(head->first), struct security_hook_list, list);
+        int seen = 0;
+
+        for (; e && seen < KSU_LSM_HEAD_SCAN_ENTRIES; seen++) {
+            void *fn = NULL;
+
+            if (!ksu_lsm_kptr_plausible(e))
+                break;			/* not a kernel address: stop instead of dereferencing */
+            if (ksu_lsm_read_ptr((const char *)e + hook->hook_offset, &fn))
+                break;
+
+            for (i = 0; i < n_addrs; i++) {
+                if (fn != (void *)addrs[i])
+                    continue;
+                if (*out) {
+                    *ambiguous_out = head;
+                    return 0;
+                }
+                *out = head;
+                break;
+            }
+            e = hlist_entry_safe(READ_ONCE(e->list.next), struct security_hook_list, list);
+        }
+    }
+
+    SUSFS_LOGI("lsm_hook: %s: %d address(es) named %s (functable spelling included) - %s\n",
+            hook->head_name, n_addrs, want, *out ? "list identified" : "no list found");
+
+    return *out ? 0 : -ENOENT;
+}
+
+/* Locate the list head for hook->head_name: by identity first (above), then - and only then - by
+ * offsetof(struct security_hook_heads, member), a __randomize_layout struct (RANDSTRUCT is off in
+ * every GKI build this module targets).  The offset path also cross-checks that the first entry at
+ * that address points back at it, and an offset that lands on no list is -ENOENT (as in replace);
+ * what it cannot see is an offset that lands on ANOTHER hook's list, which is why identity goes
+ * first and says so when the two disagree. */
 static int ksu_lsm_hook_head_at(unsigned long heads_addr, struct ksu_lsm_hook *hook,
                                 struct hlist_head **out)
 {
-    struct hlist_head *head;
+    struct hlist_head *head = NULL;
+    struct hlist_head *ambiguous = NULL;
     struct security_hook_list *first;
+    int ret;
+
+    ret = ksu_lsm_hook_head_by_identity(heads_addr, hook, &head, &ambiguous);
+    if (ambiguous) {
+        pr_err("lsm_hook: %s: the lists at %px and %px both hold a function named selinux_%s - the name does not identify one list on this kernel, so inserting could put the replacement in another hook's list, refusing\n",
+                hook->head_name ?: "unknown", head, ambiguous, hook->head_name);
+        return -EINVAL;
+    }
+    if (ret == 0 && head) {
+        first = hlist_entry_safe(READ_ONCE(head->first), struct security_hook_list, list);
+        if (!first) {
+            pr_err("lsm_hook: %s: the list identified by identity (%px) is empty - refusing\n",
+                    hook->head_name ?: "unknown", head);
+            return -ENOENT;
+        }
+        if (first->head != head) {
+            pr_err("lsm_hook: %s: identified head %px but its first entry reports %px - refusing\n",
+                    hook->head_name ?: "unknown", head, first->head);
+            return -EINVAL;
+        }
+        if ((unsigned long)head != heads_addr + hook->head_offset) {
+            pr_warn("lsm_hook: %s: its list is at offset %#lx of security_hook_heads while offsetof() names %#lx - this kernel's hook order differs from the tree this module was built against\n",
+                    hook->head_name ?: "unknown",
+                    (unsigned long)((char *)head - (char *)heads_addr),
+                    (unsigned long)hook->head_offset);
+        }
+        SUSFS_LOGI("lsm_hook: %s: list head found by identity at offset %#lx\n",
+                hook->head_name ?: "unknown",
+                (unsigned long)((char *)head - (char *)heads_addr));
+        *out = head;
+        return 0;
+    }
+
+    pr_warn("lsm_hook: %s: no list in security_hook_heads could be identified for it - falling back to the offsetof() slot, which is what this module always used and which does not check the list's identity\n",
+            hook->head_name ?: "unknown");
 
     if (hook->head_offset + sizeof(struct hlist_head) > sizeof(struct security_hook_heads)) {
         pr_err("lsm_hook: %s: head offset %#lx is outside security_hook_heads\n",
@@ -220,20 +363,7 @@ static int ksu_lsm_hook_update_scall(struct lsm_static_call *scall, void *value)
 
 #define KSU_LSM_SLOTS_PER_HOOK	MAX_LSM_COUNT
 
-#define KSU_LSM_KPTR_MIN	0xff00000000000000UL
-
 static unsigned long ksu_lsm_scalls_addr;
-
-static bool ksu_lsm_kptr_plausible(const void *p)
-{
-    return (unsigned long)p >= KSU_LSM_KPTR_MIN;
-}
-
-static int ksu_lsm_read_ptr(const void *addr, void *out)
-{
-    memset(out, 0, sizeof(void *));
-    return (int)copy_from_kernel_nofault(out, addr, sizeof(void *));
-}
 
 /* Same implementation as @want?  Allows the ".clone"/".constprop.0" suffix a compiler adds. */
 static bool ksu_lsm_name_is(const char *name, const char *want)
