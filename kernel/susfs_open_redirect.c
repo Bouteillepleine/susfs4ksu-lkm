@@ -806,6 +806,11 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -ENOSPC;
 	}
 	e = &or_entries[nor++];
+	/* nor++ takes the slot before a single field is in it, and a never-used slot is already
+	 * dead == false, so the clear at the end cannot keep a reader out - a reader keyed on the
+	 * real (ino, dev) would hand vfs_open() a path whose dentry is still NULL.  Dead first. */
+	WRITE_ONCE(e->dead, true);
+	smp_wmb();
 	strscpy(e->target_pathname, target, OR_PATH_MAX);
 
 	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
