@@ -518,12 +518,19 @@ int susfs_hide_syms_init(void)
 	else
 		m_show_registered = true;
 
-	{
-		char staged[HIDE_MODULES_MAX][MODULE_NAME_LEN] = { { 0 } };
-
-		strscpy(staged[0], SUSFS_LKM_MODULE_NAME, MODULE_NAME_LEN);
-		hide_modules_commit(staged, 1);
-	}
+	/* hide_modules starts with just this module in its list: a built-in SUSFS has no module entry, so
+	 * leaving ours visible would be a trace upstream does not have.  The sysfs rule can only be
+	 * registered here, because sus_path is up (this layer is last in the init table).
+	 *
+	 * A list that is already populated came from the insmod parameter: module_param_cb()'s setter runs
+	 * during load_module()'s parse_args(), i.e. before module_init, so the operator's names are already
+	 * committed.  Seeding the default over them here dropped every name the operator gave (and
+	 * unregistered the /sys/module rule the setter had just added).  Append our own name instead, and
+	 * only seed the default when nothing did. */
+	if (n_hide_modules == 0)
+		hide_modules_command(SUSFS_LKM_MODULE_NAME, true);
+	else
+		hide_modules_command("add " SUSFS_LKM_MODULE_NAME, false);
 	hide_modules_sync_sysfs();
 
 	if (susfs_control_node_allowed()) {
