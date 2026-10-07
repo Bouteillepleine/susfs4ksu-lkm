@@ -310,6 +310,14 @@ struct elf64_sym {
 	u64 st_size;
 };
 
+/* Is this section's [sh_offset, sh_offset + sh_size) inside the mapped image?  Bounding the
+ * offset first keeps `sh_offset + sh_size` from wrapping in u64 and reporting a section far
+ * past the end of the file as "inside". */
+static int sec_in_image(const struct elf64_shdr *s, u64 size)
+{
+	return s->sh_offset <= size && s->sh_size <= size - s->sh_offset;
+}
+
 typedef char assert_ehdr_size[(sizeof(struct elf64_ehdr) == 64) ? 1 : -1];
 typedef char assert_shdr_size[(sizeof(struct elf64_shdr) == 64) ? 1 : -1];
 typedef char assert_sym_size[(sizeof(struct elf64_sym) == 24) ? 1 : -1];
@@ -748,14 +756,15 @@ void insmod_main(long argc, char **argv)
 	if (eh->e_shentsize != sizeof(struct elf64_shdr) || eh->e_shnum == 0 ||
 	    eh->e_shoff == 0)
 		die2("no usable section table", path, -8);
-	if (eh->e_shoff + (u64)eh->e_shnum * sizeof(struct elf64_shdr) > (u64)size)
+	if (eh->e_shoff > (u64)size ||
+	    (u64)eh->e_shnum > ((u64)size - eh->e_shoff) / sizeof(struct elf64_shdr))
 		die2("section table outside the image", path, -8);
 	shdrs = (struct elf64_shdr *)(img + eh->e_shoff);
 
 	if (eh->e_shstrndx < eh->e_shnum) {
 		struct elf64_shdr *s = &shdrs[eh->e_shstrndx];
 
-		if (s->sh_offset + s->sh_size <= (u64)size) {
+		if (sec_in_image(s, (u64)size)) {
 			shstr = img + s->sh_offset;
 			shstr_size = s->sh_size;
 		}
@@ -783,10 +792,9 @@ void insmod_main(long argc, char **argv)
 	strtab = &shdrs[symtab->sh_link];
 	if (strtab->sh_type != SHT_STRTAB)
 		die2(".symtab's sh_link is not a string table", path, -8);
-	if (strtab->sh_offset + strtab->sh_size > (u64)size ||
-	    symtab->sh_offset + symtab->sh_size > (u64)size)
+	if (!sec_in_image(strtab, (u64)size) || !sec_in_image(symtab, (u64)size))
 		die2("symbol table outside the image", path, -8);
-	if (modinfo && modinfo->sh_offset + modinfo->sh_size > (u64)size)
+	if (modinfo && !sec_in_image(modinfo, (u64)size))
 		die2(".modinfo outside the image", path, -8);
 
 	nsyms = symtab->sh_size / sizeof(struct elf64_sym);
