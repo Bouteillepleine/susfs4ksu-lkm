@@ -159,6 +159,16 @@ static unsigned long sus_mount_min_mnt_id(void)
 
 static bool mount_registered;
 
+/* Serialises the enable/disable control surface.  The supercall handler runs from the caller's
+ * task_work, i.e. in process context, so two tasks can enter sus_mount_register()/
+ * sus_mount_unregister() at the same time.  Both do check-then-act on `mount_registered` and
+ * then call register_kprobe()/register_kretprobe(), which sleep - and registering the same probe
+ * object twice is not harmless: an address-registered kretprobe goes through warn_kprobe_rereg()
+ * (a WARN_ON_ONCE with a stack trace naming this module), while a name-registered one fails and
+ * the caller reports -EINVAL to userspace even though the other task armed it.  sus_path.c
+ * (sus_path_arm_lock) and susfs_kstat.c (kstat_lock) already serialise their arm paths this way. */
+static DEFINE_MUTEX(sus_mount_ctl_lock);
+
 #define SUS_MOUNT_IDMAP_MAX 64
 
 /* sus_id == 0 marks a free slot; mnt ids are never 0. */
@@ -1424,7 +1434,8 @@ static struct proc_dir_entry *sus_mount_keep_entry;
 static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long min)
 {
     int batch[SUS_MOUNT_ID_BATCH];
-    int n_batch = 0, used = 0;
+    int replaced[SUS_MOUNT_ID_BATCH];
+    int n_batch = 0, used = 0, n_replaced = 0;
     SUS_MOUNT_ITER_TYPE pos;
     unsigned int seen = 0;
     int scan_logged = 0;
@@ -1523,6 +1534,8 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         SUSFS_LOGI("sus_mount: marked mnt_id %d -> %d (%s, devname %s)\n",
                 r->mnt_id, new_id, shown,
                 r->mnt_devname ? r->mnt_devname : "none");
+        if (n_replaced < (int)ARRAY_SIZE(replaced))
+            replaced[n_replaced++] = r->mnt_id;
         r->mnt_id = new_id;
 
         sus_mount_idmap_add(new_id, sus_mount_shown_id(r), r->mnt.mnt_sb->s_dev);
@@ -1539,6 +1552,11 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
     /* Hand back whatever the batch did not use. */
     for (i = used; i < n_batch; i++)
         sus_mount_ida_release(batch[i]);
+
+    /* ... and the ids the marked mounts used to own: the kernel frees r->mnt_id at teardown,
+     * which is now the new id, so without this the original id is lost for good. */
+    for (i = 0; i < n_replaced; i++)
+        sus_mount_ida_release(replaced[i]);
 
     if (hit_cap)
         pr_warn("sus_mount: walk of ns %p stopped after %u entries (cap %d), result may be incomplete\n",
@@ -1731,8 +1749,11 @@ static void sus_mount_unregister(void)
 {
     int i;
 
-    if (!mount_registered)
+    mutex_lock(&sus_mount_ctl_lock);
+    if (!mount_registered) {
+        mutex_unlock(&sus_mount_ctl_lock);
         return;
+    }
 
     for (i = 0; i < SUS_MOUNT_SHOW_N; i++) {
         if (!sus_mount_show_armed[i])
@@ -1764,6 +1785,7 @@ static void sus_mount_unregister(void)
         kr_newmnt_ok = false;
     }
     mount_registered = false;
+    mutex_unlock(&sus_mount_ctl_lock);
 }
 
 void susfs_sus_mount_exit(void)
@@ -1792,8 +1814,11 @@ static int sus_mount_register(void)
 {
     int rc, i;
 
-    if (mount_registered)
+    mutex_lock(&sus_mount_ctl_lock);
+    if (mount_registered) {
+        mutex_unlock(&sus_mount_ctl_lock);
         return 0;
+    }
 
     for (i = 0; i < SUS_MOUNT_SHOW_N; i++) {
         rc = register_kprobe(sus_mount_show_probes[i]);
@@ -1807,6 +1832,7 @@ static int sus_mount_register(void)
     }
     if (!n_show_probes) {
         pr_err("sus_mount: none of show_vfsstat/show_mountinfo/show_vfsmnt could be hooked - not reporting the feature as enabled\n");
+        mutex_unlock(&sus_mount_ctl_lock);
         return -EINVAL;
     }
 
@@ -1847,6 +1873,7 @@ static int sus_mount_register(void)
     else
         kr_newmnt_ok = true;
     mount_registered = true;
+    mutex_unlock(&sus_mount_ctl_lock);
     return 0;
 }
 
