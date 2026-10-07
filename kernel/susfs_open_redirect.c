@@ -793,6 +793,15 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -EINVAL;
 	}
 
+	/* Capacity is checked before the rewrite retires anything: with a full table, failing after
+	 * the WRITE_ONCE(e->dead, ...) below would return -ENOSPC *and* silently kill the
+	 * redirection that was working. */
+	if (nor >= SUS_OR_MAX) {
+		path_put(&rp);
+		path_put(&tp);
+		return -ENOSPC;
+	}
+
 	if (e) {
 
 		WRITE_ONCE(e->dead, true);
@@ -800,11 +809,6 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		e = NULL;
 	}
 
-	if (nor >= SUS_OR_MAX) {
-		path_put(&rp);
-		path_put(&tp);
-		return -ENOSPC;
-	}
 	e = &or_entries[nor++];
 	/* nor++ takes the slot before a single field is in it, and a never-used slot is already
 	 * dead == false, so the clear at the end cannot keep a reader out - a reader keyed on the
