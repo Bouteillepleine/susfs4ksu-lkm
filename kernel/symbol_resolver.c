@@ -27,6 +27,10 @@ static const size_t cfi_suffix_len = sizeof(cfi_suffix) - 1;
 #define ALWAYS_HAVE_ON_EACH_SYMBOL 0
 #endif
 
+/* Only used from 6.6 up, and that gate is empirical rather than a version fact: gating this path
+ * at 6.1 was measured to produce a spurious "cannot bootstrap" warning on the android14-6.1
+ * variant (a load-time warning, not a build one), after which the code fell back to the
+ * kallsyms_lookup_name() path every other build uses anyway. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 #define HAVE_ON_EACH_MATCH_SYMBOL 1
 #else
@@ -37,7 +41,9 @@ static unsigned long (*kallsyms_lookup_name_fn)(const char *name) = NULL;
 static const char *(*kallsyms_lookup_fn)(unsigned long addr, unsigned long *symbolsize, unsigned long *offset,
                                          char **modname, char *namebuf) = NULL;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+/* The walker lost the callback's `struct module *` in v6.4, so both the POINTER's type and the
+ * callbacks below are gated at 6.4 - the argument carried module ownership. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 typedef int (*ksu_on_each_symbol_fn_t)(int (*fn)(void *, const char *, unsigned long), void *data);
 #else
 typedef int (*ksu_on_each_symbol_fn_t)(int (*fn)(void *, const char *, struct module *, unsigned long), void *data);
@@ -84,7 +90,7 @@ struct ksu_exact_name_ctx {
     unsigned long addr;
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static int ksu_exact_name_cb(void *data, const char *name, unsigned long addr)
 #else
 static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, unsigned long addr)
@@ -92,8 +98,8 @@ static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, u
 {
     struct ksu_exact_name_ctx *ctx = data;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-    /* OWNERSHIP before 6.6: a non-NULL `mod` means another module provides the symbol. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+    /* OWNERSHIP before 6.4: a non-NULL `mod` means another module provides the symbol. */
     if (mod)
         return 0;
 #endif
@@ -113,7 +119,7 @@ struct ksu_all_names_ctx {
     int n;
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
 #else
 static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
@@ -122,7 +128,7 @@ static int ksu_all_names_cb(void *data, const char *name, struct module *mod, un
     struct ksu_all_names_ctx *ctx = data;
     int i;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
     if (mod)
         return 0;
 #endif
@@ -221,7 +227,7 @@ static inline bool ksu_symbol_has_suffix(const char *name, size_t name_len, cons
     return name_len >= suffix_len && strcmp(name + name_len - suffix_len, suffix) == 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static int lookup_symbol_variant_cb(void *data, const char *name, unsigned long addr)
 #else
 static int lookup_symbol_variant_cb(void *data, const char *name, struct module *mod, unsigned long addr)
