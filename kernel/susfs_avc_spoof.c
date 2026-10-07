@@ -8,6 +8,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/cred.h>	/* current_uid(), control-node gate */
+#include <linux/version.h>	/* LINUX_VERSION_CODE: slow_avc_audit() lost its leading `state` in 6.4 */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -27,14 +28,22 @@ static atomic_t avc_enter_count = ATOMIC_INIT(0);
 
 static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	u32 tsid = (u32)regs->regs[1];
+#else
 	u32 tsid = (u32)regs->regs[2];
+#endif
 
 	atomic_inc(&avc_enter_count);
 
 	if (!avc_su_sid || tsid != avc_su_sid)
 		return 0;
 	atomic_inc(&avc_hit_count);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	regs->regs[1] = avc_priv_app_sid;
+#else
 	regs->regs[2] = avc_priv_app_sid;
+#endif
 	return 0;
 }
 
