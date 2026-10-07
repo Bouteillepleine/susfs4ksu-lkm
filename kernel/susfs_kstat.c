@@ -1238,6 +1238,11 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 	};
 	const char *path = argv[1];
 
+	/* argv[2 + i] below reaches argv[13], so this needs argv[14]: assert it here and not only at
+	 * the call site, whose `argc == 14` check is against a 16-slot argv. */
+	if (argc < 2 + (int)ARRAY_SIZE(f_flags))
+		return -EINVAL;
+
 	if (strlen(path) >= KSTAT_PATH_MAX)
 		return -ENAMETOOLONG;
 
