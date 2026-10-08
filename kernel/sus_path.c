@@ -1147,11 +1147,14 @@ static long sus_path_filter(unsigned long buf, long count,
 
     if (!failed && count > 0 && written == 0) {
         char zero_ino[8] = {0};
-        char nul = '\0';
 
+        /* The WHOLE name field, not just a terminator: writing one NUL left the rest of the
+         * hidden name where it was, and a parser that reads the record's bytes instead of
+         * treating d_name as a C string recovered it ("ksu_x" -> "\0su_x"). */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
-            !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
+            !clear_user((void __user *)(buf + lay->name_off),
+                        (unsigned long)head_reclen - lay->name_off)) {
             atomic_inc(&n_dirent_all_hidden);
             return head_reclen;
         }
