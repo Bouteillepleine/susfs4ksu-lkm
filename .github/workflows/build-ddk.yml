@@ -22,7 +22,7 @@ jobs:
   # There is no android14-6.6: Android 14 is 5.15/6.1 and Android 15 is 6.6.  The image tag is pinned to a date on
   # purpose, so the same commit rebuilt later produces the same module.
   module:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -77,7 +77,7 @@ jobs:
           done
 
       - name: Checkout module
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # kCFI/CFI checks the callee's type at every indirect call site and the LSM dispatch calls our replacements
       # indirectly, so a replacement MUST match the hook type EXACTLY and must not be __nocfi.  Printing this tree's
@@ -216,7 +216,10 @@ jobs:
           ml=$(nm -u "$f" | grep -c 'module_layout' || true)
           echo "__versions size=${vs:-?} srcversion=${sv} module_layout=${ml}"
           if [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
-            echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
+            # A notice, not a warning: the DDK trees ship Module.symvers without CRCs, so this
+            # is true of every variant here and always will be. It is on the record so nobody
+            # reads a clean run as "the KMI was checked"; it is not something to fix.
+            echo "::notice::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
           fi
 
           echo "--- symbol namespace imports ---"
@@ -459,20 +462,59 @@ jobs:
               hardmiss=$((hardmiss + 1))
             fi
           done
-          # --- reported: everything else the module resolves by name.  A 0 means the feature
-          #     that needs it degrades on this variant (the module logs which one at load).
+          # --- capabilities the module can reach by more than one spelling.  Which spelling a
+          #     tree carries is decided by its version, so a missing HALF is the normal case and
+          #     says nothing: 6.12+ has static_calls_table and no security_hook_heads, 5.10 has
+          #     __flush_dcache_area and neither of its successors, and so on.  Warning per symbol
+          #     made every variant noisy enough to hide a real absence, so warn per CAPABILITY:
+          #     only when no alternative is complete does the module actually lose the feature.
+          check_group() {
+            _label="$1"; shift
+            _ok=""; _detail=""
+            for _alt in "$@"; do
+              _complete=1
+              for _m in $(echo "$_alt" | tr '+' ' '); do
+                _n=$(sym_count "$_m")
+                [ "$_n" = "0" ] && _complete=0
+                _detail="$_detail $_m=$_n"
+              done
+              if [ "$_complete" = "1" ]; then _ok="$_alt"; break; fi
+            done
+            if [ -n "$_ok" ]; then
+              printf '  %-34s via %s\n' "$_label" "$_ok"
+            else
+              printf '  %-34s NONE\n' "$_label"
+              echo "::warning::$_label: $S (variant $V) carries none of its spellings ($(echo $_detail)) - this feature cannot arm on this kernel"
+            fi
+          }
+          check_group "LSM hook table"      "static_calls_table+lsm_active_cnt" "security_hook_heads"
+          check_group "mount id allocator"  "mnt_id_xa+__xa_alloc+__xa_erase" "mnt_id_ida+ida_alloc_range+ida_free"
+          check_group "cache maintenance"   "dcache_clean_inval_poc+caches_clean_inval_pou" "__flush_dcache_area"
+          check_group "kallsyms by name"    "kallsyms_on_each_match_symbol" "kallsyms_lookup_name" "kallsyms_on_each_symbol"
+
+          # __static_call_update is resolved by name but is NOT required: lsm_hook.c:1242-1245
+          # falls back to the compiled-in macro and logs which path it took.  arm64 builds without
+          # HAVE_STATIC_CALL_INLINE, where the symbol does not exist at all, so 0 is the normal
+          # answer here and a warning would be wrong.
+          n=$(sym_count __static_call_update)
+          if [ "$n" = "0" ]; then
+            printf '  %-34s %s   (absent: falls back to the compiled-in macro)\n' "__static_call_update" "$n"
+          else
+            printf '  %-34s %s\n' "__static_call_update" "$n"
+          fi
+
+          # --- reported: the rest, each with no alternative.  A 0 means the feature that needs it
+          #     degrades on this variant (the module logs which one at load).
+          #     arch_static_call_transform, __do_sys_getdents64, __do_compat_sys_getdents,
+          #     __arm64_sys_getdents64 and __arm64_compat_sys_getdents used to be checked here and
+          #     are not any more: grep says the module resolves none of them, so their absence was
+          #     never evidence of anything.
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
-                   mnt_id_ida ida_alloc_range ida_free namespace_sem mnt_id_xa __xa_alloc __xa_erase \
-                   kallsyms_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
-                   kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
+                   namespace_sem kallsyms_op kallsyms_lookup \
+                   synchronize_rcu_tasks task_work_add \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
-                   security_hook_heads static_calls_table lsm_active_cnt \
-                   __static_call_update arch_static_call_transform cpus_read_lock \
-                   smaps_walk_ops smaps_shmem_walk_ops pagemap_ops \
-                   dcache_clean_inval_poc caches_clean_inval_pou __flush_dcache_area \
-                   __arm64_sys_getdents64 __arm64_compat_sys_getdents \
-                   __do_sys_getdents64 __do_compat_sys_getdents; do
+                   cpus_read_lock smaps_walk_ops smaps_shmem_walk_ops pagemap_ops; do
             n=$(sym_count "$s"); printf '  %-34s %s\n' "$s" "$n"
             if [ "$n" = "0" ]; then
               echo "::warning::$s is not in $S (variant $V) - the feature that resolves it by name cannot arm on this kernel"
@@ -491,7 +533,7 @@ jobs:
           echo "the three mount show callbacks are present in $S"
 
       - name: Upload .ko
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_guard_lkm.ko-${{ matrix.variant }}
           path: kernel/susfs_guard_lkm.ko
@@ -502,13 +544,13 @@ jobs:
   # evidence-gathering half of this project, and a tool that cannot compile or that reads
   # the ABI wrong is how "verified" becomes wrong.
   tools:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: ghcr.io/ylarod/ddk-min:android14-6.1-20260828
       options: --privileged
     steps:
       - name: Checkout module
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Not part of the module: a freestanding aarch64 client for the supercall commands
       # ksu_susfs does not expose (hide_sus_mnts_for_non_su_procs, add_sus_path_loop).
@@ -523,7 +565,7 @@ jobs:
 
       - name: Upload userspace client
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_sc
           path: /tmp/susfs_sc
@@ -541,7 +583,7 @@ jobs:
 
       - name: Upload micro-benchmark
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_bench
           path: /tmp/susfs_bench
@@ -560,7 +602,7 @@ jobs:
 
       - name: Upload mmap/pagemap probe
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_mmap
           path: /tmp/susfs_mmap
@@ -579,7 +621,7 @@ jobs:
 
       - name: Upload remote-memory probe
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_memrd
           path: /tmp/susfs_memrd
@@ -597,7 +639,7 @@ jobs:
 
       - name: Upload mnt_id cross-check
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_mntid
           path: /tmp/susfs_mntid
@@ -617,7 +659,7 @@ jobs:
 
       - name: Upload 32-bit compat stat client
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_compat_stat
           path: /tmp/susfs_compat_stat
@@ -638,7 +680,7 @@ jobs:
 
       - name: Upload 64-bit stat/statx/fstat client
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_stat
           path: /tmp/susfs_stat
@@ -660,7 +702,7 @@ jobs:
 
       - name: Upload module loader
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: susfs_insmod
           path: /tmp/susfs_insmod
