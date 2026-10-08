@@ -82,11 +82,28 @@ struct sus_path_entry {
     umode_t orig_mode;
 };
 
+/* The relax is what lets DAC through so this module's LSM layer can answer ENOENT where DAC
+ * would have answered EACCES first - but it really does make the inode world-accessible to
+ * every caller the gate does not hide from, and if anything else dirties the inode the
+ * filesystem can write 0777 back to disk.  relax_mode=0 is for an operator who would rather
+ * take EACCES for files DAC already denied; the by-inode hiding keeps working either way. */
+static int relax_mode_enabled = 1;
+module_param_named(relax_mode, relax_mode_enabled, int, 0644);
+
+/* Rules currently holding a relaxed mode.  One atomic read is what keeps the restore below
+ * off the stat fast path when nothing was ever relaxed. */
+static atomic_t sus_path_n_relaxed = ATOMIC_INIT(0);
+
+bool sus_path_has_relaxed(void)
+{
+    return atomic_read(&sus_path_n_relaxed) != 0;
+}
+
 static void sus_path_relax_mode(struct sus_path_entry *e)
 {
     umode_t mode;
 
-    if (!e->inode)
+    if (!e->inode || !relax_mode_enabled)
         return;
 
     mode = READ_ONCE(e->inode->i_mode);
@@ -94,6 +111,7 @@ static void sus_path_relax_mode(struct sus_path_entry *e)
         return;                 /* already open, or another rule did it */
 
     e->orig_mode = mode;
+    atomic_inc(&sus_path_n_relaxed);
     WRITE_ONCE(e->inode->i_mode, (mode & ~(umode_t)(S_IRWXU | S_IRWXG | S_IRWXO)) | 0777);
 }
 
@@ -104,6 +122,7 @@ static void sus_path_restore_mode(struct sus_path_entry *e)
 
     WRITE_ONCE(e->inode->i_mode, e->orig_mode);
     e->orig_mode = 0;
+    atomic_dec(&sus_path_n_relaxed);
 }
 
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
@@ -111,6 +130,30 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
 static LIST_HEAD(sus_path_list);
 static DEFINE_SPINLOCK(sus_path_lock);
 static unsigned int sus_path_count;
+
+/* The permission bits the rule for (@dev, @ino) replaced, so a caller that IS allowed to see
+ * the file is not shown 0777 where the real mode is 0700 - the relax is otherwise a louder
+ * fingerprint than the path it hides (`ls -ld /data/adb` as root).  Callers hold no lock. */
+bool sus_path_relaxed_bits(u64 dev, u64 ino, umode_t *bits)
+{
+    struct sus_path_entry *e;
+    bool found = false;
+
+    if (!ino || !atomic_read(&sus_path_n_relaxed))
+        return false;
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (!e->orig_mode || e->ino != ino || e->dev != dev)
+            continue;
+        *bits = e->orig_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
+        found = true;
+        break;
+    }
+    spin_unlock(&sus_path_lock);
+    return found;
+}
+
 
 static atomic_t sus_path_n_pending = ATOMIC_INIT(0);
 static unsigned int sus_path_pass_gen;      /* guarded by sus_path_lock */

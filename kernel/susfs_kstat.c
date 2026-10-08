@@ -98,6 +98,7 @@ static void kstat_snapshot(const struct sus_kstat_entry *e,
 /* arm64 asm-generic struct stat offsets (native 64-bit) */
 #define ST_DEV_OFF          0
 #define ST_INO_OFF          8
+#define ST_MODE_OFF         16
 #define ST_NLINK_OFF        20
 #define ST_SIZE_OFF         48
 #define ST_BLKSIZE_OFF      56
@@ -111,6 +112,7 @@ static void kstat_snapshot(const struct sus_kstat_entry *e,
 
 static_assert(offsetof(struct stat, st_dev) == ST_DEV_OFF, "stat.st_dev");
 static_assert(offsetof(struct stat, st_ino) == ST_INO_OFF, "stat.st_ino");
+static_assert(offsetof(struct stat, st_mode) == ST_MODE_OFF, "stat.st_mode");
 static_assert(offsetof(struct stat, st_nlink) == ST_NLINK_OFF, "stat.st_nlink");
 static_assert(offsetof(struct stat, st_size) == ST_SIZE_OFF, "stat.st_size");
 static_assert(offsetof(struct stat, st_blksize) == ST_BLKSIZE_OFF, "stat.st_blksize");
@@ -423,6 +425,67 @@ static void kstat_note_unlisted(long nr)
 	atomic_inc(&n_kstat_unlisted);
 	slot = atomic_inc_return(&kstat_unlisted_next) - 1;
 	kstat_unlisted_seen[slot % KSTAT_UNLISTED_SEEN] = nr;
+}
+
+/* ---- undo sus_path's mode relax in the result ----
+ *
+ * sus_path_relax_mode() sets a registered inode to 0777 because inode_permission() runs DAC
+ * before security_inode_permission(), so a 0700 file would fail DAC with EACCES and the LSM
+ * layer would never get to answer ENOENT.  The cost is that every caller the hide gate does
+ * NOT apply to - root, shell, system - then stats 0777 where the real mode is 0700, which is
+ * a plainer "something is managing this path" signal than the path itself.
+ *
+ * These two put the recorded bits back on the way out.  Deliberately NOT behind
+ * susfs_kstat_gate_ok(): a caller that reaches here was already allowed to stat the file, and
+ * the ones that are hidden never get a result to correct.  Not wired for the compat stat64
+ * layout, for the same reason its stat/lstat/fstat siblings are not (see the note there). */
+static void susfs_kstat_unrelax_stat(unsigned long statbuf)
+{
+	unsigned long ino = 0, dev = 0;
+	unsigned int mode = 0;
+	umode_t bits = 0;
+
+	if (!sus_path_has_relaxed())
+		return;
+	if (copy_from_user(&ino, (void __user *)(statbuf + ST_INO_OFF), sizeof(ino)) ||
+	    copy_from_user(&dev, (void __user *)(statbuf + ST_DEV_OFF), sizeof(dev)))
+		return;
+	/* st_dev is what cp_new_stat() encoded; the rule table holds the raw s_dev. */
+	if (!sus_path_relaxed_bits((u64)new_decode_dev((u32)dev), (u64)ino, &bits))
+		return;
+	if (copy_from_user(&mode, (void __user *)(statbuf + ST_MODE_OFF), sizeof(mode)))
+		return;
+	mode = (mode & ~0777u) | bits;
+	if (copy_to_user((void __user *)(statbuf + ST_MODE_OFF), &mode, sizeof(mode)))
+		pr_warn_ratelimited("susfs_kstat: could not restore a relaxed mode in a statbuf\n");
+}
+
+static void susfs_kstat_unrelax_statx(unsigned long ubuf)
+{
+	u64 ino = 0;
+	u32 maj = 0, min = 0;
+	u16 mode = 0;
+	umode_t bits = 0;
+
+	if (!sus_path_has_relaxed())
+		return;
+	/* statx reports the device as a major/minor pair, not an encoded st_dev. */
+	if (copy_from_user(&ino, (void __user *)(ubuf + offsetof(struct statx, stx_ino)),
+			   sizeof(ino)) ||
+	    copy_from_user(&maj, (void __user *)(ubuf + offsetof(struct statx, stx_dev_major)),
+			   sizeof(maj)) ||
+	    copy_from_user(&min, (void __user *)(ubuf + offsetof(struct statx, stx_dev_minor)),
+			   sizeof(min)))
+		return;
+	if (!sus_path_relaxed_bits((u64)MKDEV(maj, min), ino, &bits))
+		return;
+	if (copy_from_user(&mode, (void __user *)(ubuf + offsetof(struct statx, stx_mode)),
+			   sizeof(mode)))
+		return;
+	mode = (mode & ~(u16)0777) | bits;
+	if (copy_to_user((void __user *)(ubuf + offsetof(struct statx, stx_mode)), &mode,
+			 sizeof(mode)))
+		pr_warn_ratelimited("susfs_kstat: could not restore a relaxed mode in a statx buffer\n");
 }
 
 struct kstat_call_state {
@@ -1042,6 +1105,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 			return;
 		}
 		susfs_kstat_spoof_statbuf(&st, args[2]);
+		susfs_kstat_unrelax_stat(args[2]);
 		return;
 	case __NR_fstat:
 		syscall_get_arguments(current, regs, args);
@@ -1050,6 +1114,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 			return;
 		}
 		susfs_kstat_spoof_statbuf(&st, args[1]);
+		susfs_kstat_unrelax_stat(args[1]);
 		return;
 	case __NR_statx:
 
@@ -1061,6 +1126,8 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		susfs_kstat_spoof_statx(&st,
 			st.compat ? (unsigned long)compat_ptr((u32)args[4]) : args[4],
 			(u32)args[3]);
+		susfs_kstat_unrelax_statx(st.compat
+					  ? (unsigned long)compat_ptr((u32)args[4]) : args[4]);
 		return;
 	case COMPAT_FSTATAT64_NR:
 

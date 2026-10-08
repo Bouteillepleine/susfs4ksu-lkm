@@ -32,6 +32,13 @@ int susfs_imports_guard(void);
  * pointers); the attribute belongs on the definition, so it is not repeated here. */
 int susfs_imports_crosscheck(void);
 
+/* sus_path relaxes a registered inode's permission bits to 0777 so DAC cannot answer EACCES
+ * before the LSM layer answers ENOENT.  These two put the recorded bits back in a stat result
+ * for the callers that are allowed to see the file at all (susfs_kstat.c does it on the
+ * sys_exit path); has_relaxed() is the one-load fast-path test. */
+bool sus_path_has_relaxed(void);
+bool sus_path_relaxed_bits(u64 dev, u64 ino, umode_t *bits);
+
 /* Wait until no task can still be inside a window it entered before this call - a kprobe
  * handler, or boot_config_proc_show()'s seq_puts().  synchronize_rcu() is NOT enough for
  * either (neither runs in an RCU read-side section); see lsm_hook.c.  Sleeps. */
