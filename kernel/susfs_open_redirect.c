@@ -299,6 +299,7 @@ static atomic_t or_rev_maps_names = ATOMIC_INIT(0);	/* the name column */
 struct or_maps_args {
 	struct seq_file *m;
 	struct vm_area_struct *vma;
+	size_t count0;		/* m->count before the record was printed */
 };
 
 static int or_maps_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -307,18 +308,28 @@ static int or_maps_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	a->m = (struct seq_file *)regs->regs[0];
 	a->vma = (struct vm_area_struct *)regs->regs[1];
+	a->count0 = susfs_ptr_plausible(a->m) ? a->m->count : 0;
 	return 0;
 }
 
-static bool or_buf_replace(struct seq_file *m, const char *old, size_t old_len,
+/* @from is where show_map_vma() started writing THIS record: three probes sit on that one
+ * function - sus_map's skipping kprobe and these two kretprobes - and the aggregate
+ * pre_handler chain short-circuits on the first non-zero return, so whether a kretprobe
+ * entry handler has already run when sus_map skips the body depends on registration order
+ * (i.e. on which feature got its first rule first).  When the body is skipped, arm64's
+ * kretprobe still routes x30 through the trampoline, so this return handler runs on a
+ * record that was never printed; scanning from 0 would then rewrite a PREVIOUS line's
+ * numbers.  Bounding the search to this record's own bytes makes that impossible, and an
+ * empty record (count == from) is left alone entirely. */
+static bool or_buf_replace(struct seq_file *m, size_t from, const char *old, size_t old_len,
 			   const char *new, size_t new_len)
 {
 	char *buf = m->buf;
 	size_t count = m->count, i, pos = 0;
 
-	if (!old_len || !new_len || old_len > count)
+	if (!old_len || !new_len || from > count || old_len > count - from)
 		return false;
-	for (i = 0; i + old_len <= count; i++) {
+	for (i = from; i + old_len <= count; i++) {
 		if (!memcmp(buf + i, old, old_len)) {
 			pos = i;
 			break;
@@ -348,6 +359,12 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!susfs_ptr_plausible(m) || !susfs_ptr_plausible(vma) ||
 	    !m->buf || !m->count || !vma->vm_file)
 		return 0;
+
+	/* Nothing was printed, so there is no record of ours in the buffer: the body was
+	 * skipped (sus_map's kprobe) or it produced no output.  Counting a hit here would
+	 * report a rewrite that cannot happen. */
+	if (m->count <= a->count0)
+		return 0;
 	if (!or_reverse_visible())
 		return 0;
 	inode = file_inode(vma->vm_file);
@@ -372,14 +389,14 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	while (new_len < old_len && new_len < (int)sizeof(new) - 1)
 		new[new_len++] = ' ';
 	if (old_len > 0 && new_len > 0 &&
-	    or_buf_replace(m, old, (size_t)old_len, new, (size_t)new_len))
+	    or_buf_replace(m, a->count0, old, (size_t)old_len, new, (size_t)new_len))
 		atomic_inc(&or_rev_maps_rewrites);
 
 	if (e->redirected_pathname[0] && e->target_pathname[0]) {
 		size_t rlen = strlen(e->redirected_pathname);
 		size_t tlen = strlen(e->target_pathname);
 
-		if (or_buf_replace(m, e->redirected_pathname, rlen,
+		if (or_buf_replace(m, a->count0, e->redirected_pathname, rlen,
 				   e->target_pathname, tlen))
 			atomic_inc(&or_rev_maps_names);
 	}
