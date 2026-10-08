@@ -78,7 +78,7 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
 
 static bool sus_map_gate_ok(void)
 {
-    return current_uid().val >= 10000;
+    return susfs_uid_is_hidden_target();
 }
 
 static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)

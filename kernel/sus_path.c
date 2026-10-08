@@ -256,14 +256,14 @@ static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
         return true;
-    return current_uid().val >= 10000;
+    return susfs_uid_is_hidden_target();
 }
 
 static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
-    if (current_uid().val < 10000)
+    if (!susfs_uid_is_hidden_target())
         return false;
     return current_uid().val != inode->i_uid.val;
 }

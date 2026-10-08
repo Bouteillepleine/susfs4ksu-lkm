@@ -123,7 +123,7 @@ static_assert(offsetof(struct stat, st_ctime) == ST_CTIME_OFF, "stat.st_ctime");
 
 static bool susfs_kstat_gate_ok(void)
 {
-	return current_uid().val >= 10000;
+	return susfs_uid_is_hidden_target();
 }
 
 static bool susfs_kstat_table_empty(void)

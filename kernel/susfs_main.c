@@ -5,6 +5,7 @@
 #include <linux/init.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling below */
 
+#include <linux/cred.h>		/* current_uid(), for the hide gate below */
 #include "symbol_resolver.h"
 #include "susfs_log.h"
 #include "lsm_hook.h"
@@ -15,6 +16,74 @@
 
 bool susfs_expose_proc = true;
 module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
+
+/* ---- the hide gate ---------------------------------------------------------
+ * Upstream SUSFS hides from susfs_is_current_proc_umounted_app(), which is
+ * (test_thread_flag(TIF_PROC_UMOUNTED) && uid >= 10000): only the apps KernelSU has
+ * already umounted modules for.  An LKM cannot read that thread flag, so every feature
+ * here used "uid >= 10000" alone - which hides from EVERY app, the KernelSU manager
+ * included.  Measured on device: under that proxy, hiding /data/adb makes the manager's
+ * own module list unreadable, so the one rule that has any effect is the one you cannot
+ * use.
+ *
+ * KernelSU answers the same question itself.  ksu_uid_should_umount() is the function
+ * its UID_SHOULD_UMOUNT ioctl wraps, and it folds in all of it: the manager excluded,
+ * allow_su apps excluded, the per-app umount_modules flag, and the global default.
+ * That is what TIF_PROC_UMOUNTED records, so following it makes this gate faithful to
+ * upstream instead of an approximation of it.
+ *
+ * It is resolved from kallsyms, which finds it only when KernelSU is built into the
+ * kernel - the resolver answers from vmlinux and refuses module-owned symbols on the
+ * kernels where it can tell the difference.  A KernelSU-as-LKM (or no KernelSU) setup
+ * therefore falls back to the old uid test and behaves exactly as before.  The fallback
+ * is logged, because "also hides from the manager" is not a difference anyone should
+ * have to discover from behaviour. */
+#define SUSFS_PER_USER_RANGE		100000
+#define SUSFS_FIRST_APPLICATION_UID	10000
+#define SUSFS_FIRST_ISOLATED_UID	99000
+#define SUSFS_LAST_ISOLATED_UID		99999
+
+static bool (*ksu_uid_should_umount_fn)(uid_t uid);
+
+/* __nocfi: called through a runtime-resolved pointer, which kCFI checks at the call
+ * site - the same rule every other resolved call in this module follows. */
+static __nocfi bool susfs_ksu_should_umount(uid_t uid)
+{
+	return ksu_uid_should_umount_fn(uid);
+}
+
+bool susfs_uid_is_hidden_target(void)
+{
+	uid_t uid = current_uid().val;
+	uid_t appid;
+
+	/* Keep upstream's floor.  It is not redundant with the DenyList: asked about uid 0
+	 * or a service uid, ksu_uid_should_umount() finds no app profile and answers the
+	 * GLOBAL DEFAULT - normally true - so handing it root would start hiding /data/adb
+	 * from ksud and the module scripts themselves. */
+	if (uid < SUSFS_FIRST_APPLICATION_UID)
+		return false;
+
+	if (unlikely(!ksu_uid_should_umount_fn))
+		return true;			/* the old proxy, unchanged */
+
+	/* ksu_handle_umount() umounts isolated processes whatever their profile says. */
+	appid = uid % SUSFS_PER_USER_RANGE;
+	if (appid >= SUSFS_FIRST_ISOLATED_UID && appid <= SUSFS_LAST_ISOLATED_UID)
+		return true;
+
+	return susfs_ksu_should_umount(uid);
+}
+
+static void susfs_init_hide_gate(void)
+{
+	ksu_uid_should_umount_fn = (void *)find_kernel_symbol_exact("ksu_uid_should_umount");
+	if (ksu_uid_should_umount_fn)
+		SUSFS_LOGI("hide gate: following KernelSU's DenyList (ksu_uid_should_umount at %px) - the manager and allow_su apps are NOT hidden from\n",
+			   ksu_uid_should_umount_fn);
+	else
+		pr_warn("susfs_guard_lkm: hide gate: ksu_uid_should_umount is not resolvable (KernelSU built as a module, or absent) - falling back to uid >= 10000, which hides from EVERY app including the manager\n");
+}
 
 static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_kstat",
@@ -101,6 +170,7 @@ static int __init susfs_init(void)
 
     SUSFS_LOGI("init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
+    susfs_init_hide_gate();
 
     /* Now that kallsyms lookups work, check the addresses themselves: see imports_guard.c. */
     if (susfs_imports_crosscheck())

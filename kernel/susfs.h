@@ -44,6 +44,12 @@ bool sus_path_relaxed_bits(u64 dev, u64 ino, umode_t *bits);
  * either (neither runs in an RCU read-side section); see lsm_hook.c.  Sleeps. */
 void susfs_wait_for_readers(void);
 
+/* Is the CALLING process one this module hides from?  Follows KernelSU's DenyList
+ * (ksu_uid_should_umount) when KernelSU is built into the kernel, else falls back to
+ * uid >= 10000.  See the long note in susfs_main.c: the fallback also hides from the
+ * KernelSU manager, the DenyList path does not. */
+bool susfs_uid_is_hidden_target(void);
+
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 

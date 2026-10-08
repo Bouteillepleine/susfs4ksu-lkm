@@ -100,7 +100,7 @@ static __nocfi bool or_in_su_domain(void)
 
 static bool or_reverse_visible(void)
 {
-	return current_uid().val >= OR_APP_UID_MIN;
+	return susfs_uid_is_hidden_target();
 }
 
 /* uid_scheme decision, mirroring upstream's switch in susfs_open_redirect_spoof_do_sys_openat() (susfs.c:941-964). */
@@ -116,7 +116,7 @@ static bool or_uid_matches(int scheme)
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
 	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
 
-		return current_uid().val >= OR_APP_UID_MIN;
+		return susfs_uid_is_hidden_target();
 	default:				/* susfs.c:962-963 */
 		return false;
 	}
