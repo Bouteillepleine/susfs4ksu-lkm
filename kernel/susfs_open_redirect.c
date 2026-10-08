@@ -133,9 +133,9 @@ static struct sus_or_entry *or_find_by_path(const char *target)
 
 static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
 {
-	int i;
+	int i, n = smp_load_acquire(&nor);	/* pairs with or_add()'s release store */
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < n; i++) {
 
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
@@ -150,9 +150,9 @@ static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
 /* Reverse direction: keyed on the redirected (really opened) inode, published like or_find_by_inode(). */
 static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t dev)
 {
-	int i;
+	int i, n = smp_load_acquire(&nor);
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < n; i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
@@ -167,11 +167,11 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 				   unsigned long *out_mnt_id)
 {
 	struct sus_or_entry *e = NULL;
-	int i, hits = 0;
+	int i, hits = 0, n = smp_load_acquire(&nor);
 
 	if (!ino || !out_ino || !or_reverse_visible())
 		return false;
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < n; i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
@@ -772,9 +772,36 @@ static int split_ws(char *buf, char **argv, int max)
 	return argc;
 }
 
+/* A retired slot becomes reusable once no reader can still be between its `dead` test and
+ * its use of the fields - which is exactly what susfs_wait_for_readers() waits for.  Without
+ * reuse the table was a one-way ratchet: SUS_OR_MAX adds or rewrites and every later add
+ * answered -ENOSPC for the module's lifetime, with two path references pinned per retired
+ * slot.  or_lock is held across this, so nothing else can claim the slot while it sleeps. */
+static struct sus_or_entry *or_reclaim_slot(void)
+{
+	int i;
+
+	for (i = 0; i < nor; i++)
+		if (READ_ONCE(or_entries[i].dead))
+			break;
+	if (i == nor)
+		return NULL;
+
+	susfs_wait_for_readers();
+
+	path_put(&or_entries[i].redirected_path);
+	or_entries[i].redirected_path.dentry = NULL;
+	or_entries[i].redirected_path.mnt = NULL;
+	path_put(&or_entries[i].target_path);
+	or_entries[i].target_path.dentry = NULL;
+	or_entries[i].target_path.mnt = NULL;
+	return &or_entries[i];
+}
+
 static int or_add(const char *target, const char *redirected, int scheme)
 {
 	struct sus_or_entry *e;
+	struct sus_or_entry *slot = NULL;
 	struct path tp, rp;
 	struct inode *ti, *ri;
 	int rc;
@@ -851,9 +878,12 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	 * the WRITE_ONCE(e->dead, ...) below would return -ENOSPC *and* silently kill the
 	 * redirection that was working. */
 	if (nor >= SUS_OR_MAX) {
-		path_put(&rp);
-		path_put(&tp);
-		return -ENOSPC;
+		slot = or_reclaim_slot();
+		if (!slot) {
+			path_put(&rp);
+			path_put(&tp);
+			return -ENOSPC;
+		}
 	}
 
 	if (e) {
@@ -863,10 +893,12 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		e = NULL;
 	}
 
-	e = &or_entries[nor++];
-	/* nor++ takes the slot before a single field is in it, and a never-used slot is already
-	 * dead == false, so the clear at the end cannot keep a reader out - a reader keyed on the
-	 * real (ino, dev) would hand vfs_open() a path whose dentry is still NULL.  Dead first. */
+	/* A fresh slot is NOT published by taking it: nor is bumped at the very end with a
+	 * release store, so a reader iterating i < nor cannot see the slot while its fields are
+	 * still zero (a reader keyed on the real (ino, dev) would otherwise hand vfs_open() a
+	 * path whose dentry is NULL, and uid_scheme 0 is UID_NON_APP_PROC, so even root's own
+	 * open of the target would pass the gate).  A reclaimed slot is already dead. */
+	e = slot ? slot : &or_entries[nor];
 	WRITE_ONCE(e->dead, true);
 	smp_wmb();
 	strscpy(e->target_pathname, target, OR_PATH_MAX);
@@ -882,6 +914,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	e->uid_scheme = scheme;
 	smp_wmb();
 	WRITE_ONCE(e->dead, false);	/* publish last: readers key off this */
+	if (!slot)
+		smp_store_release(&nor, nor + 1);	/* ... and a fresh slot, last of all */
 
 	return 0;			/* both path references now belong to e */
 }
