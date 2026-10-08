@@ -533,7 +533,7 @@ jobs:
           echo "the three mount show callbacks are present in $S"
 
       - name: Upload .ko
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_guard_lkm.ko-${{ matrix.variant }}
           path: kernel/susfs_guard_lkm.ko
@@ -565,7 +565,7 @@ jobs:
 
       - name: Upload userspace client
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_sc
           path: /tmp/susfs_sc
@@ -583,7 +583,7 @@ jobs:
 
       - name: Upload micro-benchmark
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_bench
           path: /tmp/susfs_bench
@@ -602,7 +602,7 @@ jobs:
 
       - name: Upload mmap/pagemap probe
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_mmap
           path: /tmp/susfs_mmap
@@ -621,7 +621,7 @@ jobs:
 
       - name: Upload remote-memory probe
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_memrd
           path: /tmp/susfs_memrd
@@ -639,7 +639,7 @@ jobs:
 
       - name: Upload mnt_id cross-check
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_mntid
           path: /tmp/susfs_mntid
@@ -659,7 +659,7 @@ jobs:
 
       - name: Upload 32-bit compat stat client
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_compat_stat
           path: /tmp/susfs_compat_stat
@@ -680,7 +680,7 @@ jobs:
 
       - name: Upload 64-bit stat/statx/fstat client
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_stat
           path: /tmp/susfs_stat
@@ -702,7 +702,7 @@ jobs:
 
       - name: Upload module loader
         continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_insmod
           path: /tmp/susfs_insmod
