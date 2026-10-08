@@ -37,6 +37,10 @@ module_param_string(or_su_ctx, or_su_ctx, sizeof(or_su_ctx), 0644);
 
 static u32 or_su_sid;
 
+/* See the escalation check in or_add(). */
+static int or_allow_restrictive;
+module_param_named(or_allow_restrictive, or_allow_restrictive, int, 0644);
+
 static void (*or_cred_getsecid)(const struct cred *cred, u32 *secid);
 
 struct sus_or_entry {
@@ -859,6 +863,28 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		path_put(&rp);
 		path_put(&tp);
 		return -EINVAL;
+	}
+
+	/* The swap happens in vfs_open(), which path_openat() reaches AFTER it has already run
+	 * may_open() and inode_permission() against the TARGET - so nothing ever checks the
+	 * redirected file, and do_open()'s handle_truncate() afterwards truncates the redirected
+	 * file, not the target.  Upstream rewrites the name before the lookup and therefore still
+	 * checks the real thing; a kprobe pre_handler cannot re-check (inode_permission() may
+	 * sleep), so the rule is refused HERE, in process context, when it would hand a caller
+	 * more than the target already gave it: the redirected file has to grant every permission
+	 * bit the target grants.  0644 -> 0600 is the escalation and is refused; 0600 -> 0600 and
+	 * 0600 -> 0644 are not.  or_allow_restrictive=1 is the deliberate override. */
+	if (!or_allow_restrictive) {
+		umode_t t = ti->i_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
+		umode_t r = ri->i_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
+
+		if (t & ~r) {
+			pr_warn("open_redirect: refusing '%s' (0%o) -> '%s' (0%o): the redirected file is more restrictive, so the redirect would grant access the target never did (set or_allow_restrictive=1 to override)\n",
+				target, (unsigned int)t, redirected, (unsigned int)r);
+			path_put(&rp);
+			path_put(&tp);
+			return -EPERM;
+		}
 	}
 
 	if (scheme == UID_ROOT_PROC_EXCEPT_SU_PROC ||
