@@ -12,6 +12,8 @@
 #include <linux/err.h>		/* IS_ERR/ERR_PTR for the getlink hook */
 #include <linux/cred.h>		/* current_uid(), for the read gate */
 #include <linux/spinlock.h>	/* serialises rule publication */
+#include <linux/slab.h>		/* the deferred path_put work item */
+#include <linux/task_work.h>	/* ... which runs it in process context */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
@@ -134,6 +136,7 @@ static atomic_t n_walk_nomatch = ATOMIC_INIT(0);	/* inode is not a rule */
 static atomic_t n_walk_dbg_left = ATOMIC_INIT(4);
 
 static atomic_t n_map_files_hides = ATOMIC_INIT(0);
+static atomic_t n_getlink_putfail = ATOMIC_INIT(0);
 static atomic_t n_getlink_calls = ATOMIC_INIT(0);
 static atomic_t n_getlink_skip = ATOMIC_INIT(0);
 static atomic_t n_getlink_nomatch = ATOMIC_INIT(0);
@@ -399,6 +402,56 @@ static int sus_map_maplink_entry(struct kretprobe_instance *ri, struct pt_regs *
     return 0;
 }
 
+/* map_files_get_link() path_get()s its output before it returns 0, and BOTH callers only
+ * release that reference on the success path - proc_pid_readlink() path_put()s after
+ * do_proc_readlink(), proc_pid_get_link() hands it to nd_jump_link(), and each of them
+ * `goto out` without a put when the callback returns an error.  So turning its success into
+ * -ENOENT below leaks one dentry and one vfsmount reference on every hidden readlink, which
+ * an app can loop until the filesystem can no longer be unmounted.
+ *
+ * The reference cannot be dropped here: path_put() -> dput() can sleep when it is the last
+ * one, and this is a kretprobe handler.  It goes to task_work instead - the task whose
+ * readlink this is runs it on the way back to userspace, in process context - which is the
+ * same trick susfs_supercall.c uses for the supercall payload.  The module is pinned across
+ * the callback because it runs from this module's text. */
+struct sus_map_path_put {
+    struct callback_head cb;
+    struct path path;
+};
+
+static void sus_map_path_put_work(struct callback_head *cb)
+{
+    struct sus_map_path_put *w = container_of(cb, struct sus_map_path_put, cb);
+
+    path_put(&w->path);
+    kfree(w);
+    module_put(THIS_MODULE);
+}
+
+/* true once the reference is queued for release, i.e. once it is ours to answer for. */
+static bool sus_map_defer_path_put(const struct path *p)
+{
+    struct sus_map_path_put *w;
+
+    if (!try_module_get(THIS_MODULE))
+        return false;
+
+    w = kzalloc(sizeof(*w), GFP_ATOMIC);
+    if (!w) {
+        module_put(THIS_MODULE);
+        return false;
+    }
+    w->path = *p;
+    w->cb.func = sus_map_path_put_work;
+
+    if (task_work_add(current, &w->cb, TWA_RESUME)) {
+        kfree(w);
+        module_put(THIS_MODULE);
+        return false;
+    }
+    return true;
+}
+
 static int sus_map_maplink_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     unsigned long outp = *(unsigned long *)ri->data;
@@ -426,6 +479,15 @@ static int sus_map_maplink_ret(struct kretprobe_instance *ri, struct pt_regs *re
     }
     if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
         atomic_inc(&n_getlink_nomatch);
+        return 0;
+    }
+
+    /* Take the reference back BEFORE the error is published: if it cannot be queued, leave
+     * the link resolvable rather than leak it - one visible symlink beats an unbounded
+     * reference leak an app controls. */
+    if (!sus_map_defer_path_put(p)) {
+        atomic_inc(&n_getlink_putfail);
+        pr_warn_ratelimited("sus_map: cannot queue the path_put for a hidden map_files link - leaving it visible\n");
         return 0;
     }
 
@@ -463,7 +525,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
 
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
-                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d\n"
+                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d putfail=%d\n"
                      "vm: gup_calls=%d inner_calls=%d hides=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
@@ -473,6 +535,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_walk_nofile), atomic_read(&n_walk_nomatch),
                      atomic_read(&n_getlink_calls), atomic_read(&n_getlink_skip),
                      atomic_read(&n_getlink_nomatch), atomic_read(&n_map_files_hides),
+                     atomic_read(&n_getlink_putfail),
                      atomic_read(&n_gup_calls), atomic_read(&n_gup_inner_calls),
                      atomic_read(&n_vm_hides),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
