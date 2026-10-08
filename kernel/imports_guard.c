@@ -99,9 +99,14 @@ static const struct susfs_import susfs_imports[] = {
     IMP(copy_to_kernel_nofault),
     IMP(security_secctx_to_secid),
     IMP(stop_machine),
+    /* Listed only when the kernel really has them: with CONFIG_TRACEPOINTS=n the sys_exit
+     * tracepoint struct is never declared and kernel/tracepoint.o is not built, so these
+     * three would make this guard itself the unresolved symbol it exists to catch. */
+#ifdef CONFIG_TRACEPOINTS
     IMP_DATA(__tracepoint_sys_exit),
     IMP(tracepoint_probe_register),
     IMP(tracepoint_probe_unregister),
+#endif
     IMP(register_kprobe),
     IMP(unregister_kprobe),
     IMP(register_kretprobe),
@@ -134,7 +139,11 @@ static const struct susfs_import susfs_imports[] = {
     IMP(__put_cred),
     IMP(strnlen_user),
     IMP(___ratelimit),
+    /* copy_to_user()'s check_object_size() is an empty inline without this option, so the
+     * out-of-line helper is neither referenced nor present. */
+#ifdef CONFIG_HARDENED_USERCOPY
     IMP(__check_object_size),
+#endif
     IMP(queue_delayed_work_on),
     IMP(cancel_delayed_work_sync),
     IMP(delayed_work_timer_fn),
