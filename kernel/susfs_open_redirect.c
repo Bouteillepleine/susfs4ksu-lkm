@@ -200,9 +200,9 @@ static struct sus_or_entry *or_find_by_path(const char *target)
 
 static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
 {
-	int i;
+	int i, n = smp_load_acquire(&nor);	/* pairs with or_add()'s release store */
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < n; i++) {
 		/* dead is cleared LAST by the writer, so skipping dead entries also skips any entry whose
 		 * fields are still being written. */
 		if (READ_ONCE(or_entries[i].dead))
@@ -218,9 +218,9 @@ static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
 /* Reverse direction: keyed on the redirected (really opened) inode, published like or_find_by_inode(). */
 static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t dev)
 {
-	int i;
+	int i, n = smp_load_acquire(&nor);
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < n; i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
@@ -238,11 +238,11 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 				   unsigned long *out_mnt_id)
 {
 	struct sus_or_entry *e = NULL;
-	int i, hits = 0;
+	int i, hits = 0, n = smp_load_acquire(&nor);
 
 	if (!ino || !out_ino || !or_reverse_visible())
 		return false;
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < n; i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
@@ -950,9 +950,36 @@ static int split_ws(char *buf, char **argv, int max)
 	return argc;
 }
 
+/* A retired slot becomes reusable once no reader can still be between its `dead` test and
+ * its use of the fields - which is exactly what susfs_wait_for_readers() waits for.  Without
+ * reuse the table was a one-way ratchet: SUS_OR_MAX adds or rewrites and every later add
+ * answered -ENOSPC for the module's lifetime, with two path references pinned per retired
+ * slot.  or_lock is held across this, so nothing else can claim the slot while it sleeps. */
+static struct sus_or_entry *or_reclaim_slot(void)
+{
+	int i;
+
+	for (i = 0; i < nor; i++)
+		if (READ_ONCE(or_entries[i].dead))
+			break;
+	if (i == nor)
+		return NULL;
+
+	susfs_wait_for_readers();
+
+	path_put(&or_entries[i].redirected_path);
+	or_entries[i].redirected_path.dentry = NULL;
+	or_entries[i].redirected_path.mnt = NULL;
+	path_put(&or_entries[i].target_path);
+	or_entries[i].target_path.dentry = NULL;
+	or_entries[i].target_path.mnt = NULL;
+	return &or_entries[i];
+}
+
 static int or_add(const char *target, const char *redirected, int scheme)
 {
 	struct sus_or_entry *e;
+	struct sus_or_entry *slot = NULL;
 	struct path tp, rp;
 	struct inode *ti, *ri;
 	int rc;
@@ -1042,9 +1069,12 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	 * may still hold and discard the reference the dead entry owns.  Rules are configuration, so the
 	 * array growing is fine. */
 	if (nor >= SUS_OR_MAX) {
-		path_put(&rp);
-		path_put(&tp);
-		return -ENOSPC;
+		slot = or_reclaim_slot();
+		if (!slot) {
+			path_put(&rp);
+			path_put(&tp);
+			return -ENOSPC;
+		}
 	}
 
 	if (e) {
@@ -1056,18 +1086,15 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		e = NULL;
 	}
 
-	e = &or_entries[nor++];
-	/* Take the slot, then mark it "not published" before a single field lands in it.  The
-	 * array is static, so a never-used slot already has dead == false - which means the
-	 * WRITE_ONCE(e->dead, false) below is a no-op for a fresh slot and the "cleared LAST, so
-	 * false means the rest of the entry is complete" invariant never held: nor++ publishes
-	 * the slot while target_ino/target_dev are still zero, and those two fields are written
-	 * BEFORE the two struct path fields.  A lockless reader (or_find_by_inode() and friends,
-	 * called from the kprobes) could therefore match a real (ino, dev) and hand
-	 * &e->redirected_path - still { NULL, NULL } - to vfs_open(), or &e->target_path to
-	 * d_path()/vfs_statfs().  vfs_open() does d_backing_inode(path->dentry) immediately, so
-	 * that is a NULL dereference in the kernel.  uid_scheme is also still 0 there, which is
-	 * UID_NON_APP_PROC, so even root's own open of the target passes the gate. */
+	/* A fresh slot is NOT published by taking it: nor is bumped at the very end with a release
+	 * store, so a reader iterating i < nor cannot see the slot while its fields are still zero.
+	 * That matters because the array is static - a never-used slot already has dead == false, so
+	 * the clear below cannot keep a reader out: one keyed on the real (ino, dev) would hand
+	 * vfs_open() a path whose dentry is still NULL (an immediate d_backing_inode() NULL
+	 * dereference), or &e->target_path to d_path()/vfs_statfs(), and uid_scheme 0 is
+	 * UID_NON_APP_PROC, so even root's own open of the target would pass the gate.
+	 * A reclaimed slot is already dead. */
+	e = slot ? slot : &or_entries[nor];
 	WRITE_ONCE(e->dead, true);
 	smp_wmb();		/* the flag must be visible before the fields it guards */
 	strscpy(e->target_pathname, target, OR_PATH_MAX);
@@ -1082,6 +1109,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	e->uid_scheme = scheme;
 	smp_wmb();
 	WRITE_ONCE(e->dead, false);	/* publish last: readers key off this */
+	if (!slot)
+		smp_store_release(&nor, nor + 1);	/* ... and a fresh slot, last of all */
 
 	return 0;			/* both path references now belong to e */
 }
