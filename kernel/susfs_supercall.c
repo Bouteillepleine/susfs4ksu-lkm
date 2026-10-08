@@ -160,7 +160,7 @@ static void susfs_tw_func(struct callback_head *cb)
 		break;
 	default:
 
-		pr_warn("susfs_guard_lkm: supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
+		pr_warn("supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
 			tw->cmd);
 		break;
 	}

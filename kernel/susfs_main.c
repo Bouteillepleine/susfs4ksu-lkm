@@ -82,7 +82,7 @@ static void susfs_init_hide_gate(void)
 		SUSFS_LOGI("hide gate: following KernelSU's DenyList (ksu_uid_should_umount at %px) - the manager and allow_su apps are NOT hidden from\n",
 			   ksu_uid_should_umount_fn);
 	else
-		pr_warn("susfs_guard_lkm: hide gate: ksu_uid_should_umount is not resolvable (KernelSU built as a module, or absent) - falling back to uid >= 10000, which hides from EVERY app including the manager\n");
+		pr_warn("hide gate: ksu_uid_should_umount is not resolvable (KernelSU built as a module, or absent) - falling back to uid >= 10000, which hides from EVERY app including the manager\n");
 }
 
 static const char *const susfs_self_hide_paths[] = {
@@ -108,7 +108,7 @@ static void susfs_self_hide_nodes(void)
         int rc = sus_path_add_self_hidden(susfs_self_hide_paths[i]);
 
         if (rc)
-            pr_warn("susfs_guard_lkm: self-hide %s failed %d\n",
+            pr_warn("self-hide %s failed %d\n",
                     susfs_self_hide_paths[i], rc);
     }
 }
@@ -183,7 +183,7 @@ static int __init susfs_init(void)
         susfs_layers[i].armed = true;
 
         if (fail_layer == i + 1) {
-            pr_warn("susfs_guard_lkm: fail_layer=%d - forcing %s's init to fail (diagnostic)\n",
+            pr_warn("fail_layer=%d - forcing %s's init to fail (diagnostic)\n",
                     fail_layer, susfs_layers[i].name);
             ret = -EIO;
         } else {
@@ -194,13 +194,13 @@ static int __init susfs_init(void)
             continue;
 
         if (susfs_layers[i].fatal) {
-            pr_err("susfs_guard_lkm: %s init failed %d, refusing to load\n",
+            pr_err("%s init failed %d, refusing to load\n",
                    susfs_layers[i].name, ret);
             /* The kernel is about to free this module; a hook left behind points into it. */
             susfs_layers_down(i);
             return ret;
         }
-        pr_warn("susfs_guard_lkm: %s init failed %d - that feature stays off\n",
+        pr_warn("%s init failed %d - that feature stays off\n",
                 susfs_layers[i].name, ret);
     }
 
