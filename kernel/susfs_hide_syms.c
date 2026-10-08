@@ -12,7 +12,7 @@
 #include <linux/mm.h>		/* kvmalloc()/kvfree() on 5.10-5.15 */
 #include "susfs_log.h"
 #include "susfs.h"		/* sus_path_add_self_hidden / sus_path_del_path */
-#include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
+#include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op), ksu_find_symbol_all (s_show) */
 
 #define HIDE_MODULES_MAX 16
 #define HIDE_MODULES_CMDLINE (HIDE_MODULES_MAX * (MODULE_NAME_LEN + 1) + 96)
@@ -424,8 +424,16 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	iter = (struct kallsym_iter_local *)m->private;
 	if (!hide_syms_iter_plausible(iter)) {
+		/* NOT a feature failure, and the old wording here ("symbol hiding is NOT
+		 * active") was simply wrong: this handler is attached to every symbol named
+		 * s_show, and LTO is free to fold identical ones, so it legitimately sees
+		 * other seq_files whose m->private is a different object.  Rejecting those
+		 * per call is the check doing its job - measured on android16-6.12, where
+		 * one such caller made the module announce the whole feature as dead while
+		 * it was filtering thousands of kallsyms lines.  Whether anything is really
+		 * being hidden is answered by the counters in /proc/susfs_hide_modules. */
 		if (atomic_inc_return(&hide_layout_bad) == 1)
-			pr_err("susfs_hide_syms: m->private does not look like struct kallsym_iter - the kprobe is on another s_show or the mirror drifted; not touching it (symbol hiding is NOT active)\n");
+			SUSFS_LOGI("susfs_hide_syms: a caller of s_show is not a kallsyms read (m->private is not a struct kallsym_iter) - skipping those; real kallsyms reads are still filtered\n");
 		return 0;
 	}
 	if (!iter->name[0])
@@ -446,10 +454,16 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
-static struct kprobe kp_s_show = {
-	.symbol_name = "s_show",
-	.pre_handler = hide_syms_s_show_pre,
-};
+/* `s_show` is NOT a unique name: kernel/kallsyms.c and kernel/trace/trace.c both define one
+ * (two on android16-6.12, four on some trees), and register_kprobe(.symbol_name=...) binds
+ * whichever kallsyms lists first - so the symbol filter was a coin toss, and when it lost,
+ * hide_syms_iter_plausible() disabled itself on every call.  Hook them all and let that
+ * per-call check decide; a wrong one then costs one comparison and changes nothing.  Same
+ * approach as sus_mount's fdinfo arm and open_redirect's. */
+#define HIDE_S_SHOW_MAX 8
+
+static struct kprobe kp_s_show[HIDE_S_SHOW_MAX];
+static int n_s_show_probes;
 
 static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -491,24 +505,66 @@ static unsigned long hide_syms_table_show(void)
 
 static bool hide_registered;
 
-int susfs_hide_syms_init(void)
+static int hide_syms_s_show_arm(void)
 {
-	int rc;
+	unsigned long addrs[HIDE_S_SHOW_MAX];
 	unsigned long table_show;
+	int i, n;
 
-	rc = register_kprobe(&kp_s_show);
-	if (rc) {
-		pr_warn("susfs_hide_syms: register_kprobe(s_show) failed %d\n", rc);
-		return rc;
+	n = ksu_find_symbol_all("s_show", addrs, HIDE_S_SHOW_MAX);
+	if (n <= 0) {
+		pr_warn("susfs_hide_syms: no symbol named s_show resolved - /proc/kallsyms is not filtered\n");
+		return -ENOENT;
 	}
-	hide_registered = true;
 
 	table_show = hide_syms_table_show();
 
-	SUSFS_LOGI("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
-		(void *)kp_s_show.addr, (void *)table_show,
-		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
-		" - same address" : " - different address (expected: table holds the CFI thunk)");
+	for (i = 0; i < n; i++) {
+		int rc;
+
+		kp_s_show[i].addr = (void *)addrs[i];
+		kp_s_show[i].pre_handler = hide_syms_s_show_pre;
+		rc = register_kprobe(&kp_s_show[i]);
+		if (rc) {
+			pr_warn("susfs_hide_syms: register_kprobe(s_show @%px) failed %d\n",
+				(void *)addrs[i], rc);
+			kp_s_show[i].addr = NULL;
+			continue;
+		}
+		n_s_show_probes++;
+		SUSFS_LOGI("susfs_hide_syms: armed on s_show %d/%d at %px%s\n",
+			i + 1, n, (void *)addrs[i],
+			(table_show && addrs[i] == table_show) ? " - this is kallsyms_op.show" : "");
+	}
+
+	if (!n_s_show_probes)
+		return -EINVAL;
+	SUSFS_LOGI("susfs_hide_syms: %d/%d s_show symbol(s) hooked (kallsyms_op.show=%px)\n",
+		n_s_show_probes, n, (void *)table_show);
+	return 0;
+}
+
+static void hide_syms_s_show_disarm(void)
+{
+	int i;
+
+	for (i = 0; i < HIDE_S_SHOW_MAX; i++) {
+		if (!kp_s_show[i].addr)
+			continue;
+		unregister_kprobe(&kp_s_show[i]);
+		kp_s_show[i].addr = NULL;
+	}
+	n_s_show_probes = 0;
+}
+
+int susfs_hide_syms_init(void)
+{
+	int rc;
+
+	rc = hide_syms_s_show_arm();
+	if (rc)
+		return rc;
+	hide_registered = true;
 
 	/* Separate probe, separate failure: hiding symbol names and hiding module entries are independent. */
 	rc = register_kprobe(&kp_m_show);
@@ -567,7 +623,7 @@ void susfs_hide_syms_exit(void)
 		m_show_registered = false;
 	}
 	if (hide_registered) {
-		unregister_kprobe(&kp_s_show);
+		hide_syms_s_show_disarm();
 		hide_registered = false;
 	}
 	/* The /sys/module rules are ours: drop them here, not in sus_path's teardown - this layer cleans up what it registered. */
