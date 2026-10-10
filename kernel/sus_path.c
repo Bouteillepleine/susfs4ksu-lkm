@@ -1198,12 +1198,34 @@ static long sus_path_filter(unsigned long buf, long count,
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
             !clear_user((void __user *)(buf + lay->name_off),
-                        (unsigned long)head_reclen - lay->name_off)) {
+                        (unsigned long)head_reclen - lay->name_off) &&
+            !clear_user((void __user *)(buf + head_reclen),
+                        (unsigned long)count - head_reclen)) {
             atomic_inc(&n_dirent_all_hidden);
             return head_reclen;
         }
 
         atomic_inc(&n_dirent_rewrite_fail);
+        return count;
+    }
+
+    /* The dropped records are gone from the chain, but their bytes are still where they used
+     * to be - past `written` - together with the original copy of the records that were moved
+     * down.  getdents64 hands back a length, not a secret: whoever ignores the return value,
+     * or scans the buffer for names instead of walking it record by record, reads a hidden
+     * name (and its d_ino/d_off) straight out of that tail.  Zero it.  The spinlock is
+     * released and faults are enabled by here, so a tail whose pages are not resident is
+     * still scrubbed rather than skipped. */
+    if (!failed && written < count &&
+        clear_user((void __user *)(buf + written), (unsigned long)count - written)) {
+        /* A partially scrubbed tail still carries hidden names, so this chunk cannot be handed
+         * back as filtered: report the full length instead.  The chunk is not literally
+         * untouched - records that were moved down stay where they were moved - but the chain
+         * the caller parses is still the kernel's own and still walks, which is the property
+         * that matters. */
+        atomic_inc(&n_dirent_rewrite_fail);
+        pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (returned %ld)\n",
+                            written, count, count);
         return count;
     }
 
