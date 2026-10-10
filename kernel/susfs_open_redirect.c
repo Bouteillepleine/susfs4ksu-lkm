@@ -18,6 +18,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"		/* susfs_expose_proc, sus_path_lsm_active */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
 
 #define SUS_OR_MAX 64
@@ -100,7 +101,7 @@ static __nocfi bool or_in_su_domain(void)
 
 static bool or_reverse_visible(void)
 {
-	return susfs_uid_is_hidden_target();
+	return susfs_is_current_proc_umounted_app();
 }
 
 /* uid_scheme decision, mirroring upstream's switch in susfs_open_redirect_spoof_do_sys_openat() (susfs.c:941-964). */
@@ -116,7 +117,7 @@ static bool or_uid_matches(int scheme)
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
 	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
 
-		return susfs_uid_is_hidden_target();
+		return susfs_is_current_proc_umounted_app();
 	default:				/* susfs.c:962-963 */
 		return false;
 	}

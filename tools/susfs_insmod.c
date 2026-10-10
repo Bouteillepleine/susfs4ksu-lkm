@@ -322,6 +322,88 @@ typedef char assert_ehdr_size[(sizeof(struct elf64_ehdr) == 64) ? 1 : -1];
 typedef char assert_shdr_size[(sizeof(struct elf64_shdr) == 64) ? 1 : -1];
 typedef char assert_sym_size[(sizeof(struct elf64_sym) == 24) ? 1 : -1];
 
+/* -------------------------------------------------------------------------- *
+ * environment: is this loader running in Magisk's domain?                      *
+ * -------------------------------------------------------------------------- */
+
+#define MAGISK_DOMAIN_PREFIX	"u:r:magisk:"
+
+/* The KernelSU gate symbol of the module (kernel/ksu_umount_gate.c, issue #34).  It belongs to
+ * kernelsu.ko and is not exported, so on a KernelSU device it resolves below like every other
+ * name; on a Magisk device there is no such symbol and it has to be stood in for - see the pin
+ * step after the rewrite pass. */
+static const char ksu_gate_symbol[] = "ksu_uid_should_umount";
+
+/* Magisk's own scripts, the ones that load modules at boot, run in u:r:magisk:s0, while the
+ * KernelSU side runs ksud in its own domain (u:r:ksu:s0 / u:r:su:s0) - so reading
+ * /proc/self/attr/current is enough and no SELinux API is needed in a freestanding tool.
+ * Fail closed: anything unreadable is "not Magisk". */
+static int is_magisk_domain(void)
+{
+	static char buf[128];
+	sysarg fd, n;
+	u64 i;
+
+	fd = sys6(SYS_openat, AT_FDCWD, (sysarg)"/proc/self/attr/current", O_RDONLY, 0, 0, 0);
+	if (fd < 0)
+		return 0;
+	n = sys6(SYS_read, fd, (sysarg)buf, (sysarg)sizeof(buf) - 1, 0, 0, 0);
+	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+
+	for (i = 0; MAGISK_DOMAIN_PREFIX[i]; i++) {
+		if (buf[i] != MAGISK_DOMAIN_PREFIX[i])
+			return 0;
+	}
+	return 1;
+}
+
+/* Does this device have KernelSU at all?  Needed to tell "no KernelSU here" (the module keeps the
+ * pre-#34 uid rule) apart from "KernelSU is here but that one symbol is not" (the load must fail
+ * loudly instead).  Two read-only probes, because the obvious one is unusable: measured on the
+ * project's device, /sys/module/kernelsu does not exist even while /proc/modules lists a live
+ * `kernelsu`, i.e. KernelSU hides its own module entry from sysfs.  /data/adb/ksud is the
+ * KernelSU userspace binary, and this tool runs as root. */
+static int path_exists(const char *path)
+{
+	sysarg fd = sys6(SYS_openat, AT_FDCWD, (sysarg)path, O_RDONLY, 0, 0, 0);
+
+	if (fd < 0)
+		return 0;
+	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+	return 1;
+}
+
+static int ksu_traces_present(void)
+{
+	static char buf[4096];
+	sysarg fd, n;
+	u64 i;
+
+	if (path_exists("/data/adb/ksud"))
+		return 1;
+
+	fd = sys6(SYS_openat, AT_FDCWD, (sysarg)"/proc/modules", O_RDONLY, 0, 0, 0);
+	if (fd < 0)
+		return 0;
+	n = sys6(SYS_read, fd, (sysarg)buf, (sysarg)sizeof(buf) - 1, 0, 0, 0);
+	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+
+	/* One module per line, name first; the module table is small enough for one read. */
+	for (i = 0; i + 8 <= (u64)n; i++) {
+		if (i && buf[i - 1] != '\n')
+			continue;
+		if (s_eq_n(buf + i, "kernelsu", 8))
+			return 1;
+	}
+	return 0;
+}
+
 #define MAX_UNDEF 4096
 #define MAX_LISTED 10
 
@@ -696,6 +778,10 @@ void insmod_main(long argc, char **argv)
 	u64 u, nsyms, i;
 	u32 resolved = 0, unresolved = 0, unresolved_weak = 0, unresolved_hard = 0;
 	u32 listed = 0, bad_sym = 0;
+	u32 gate_pinned = 0;
+	u32 gate_unresolved = 0;
+	int ksu_seen = 0;
+	int from_magisk;
 	int retried = 0;
 
 	/* ---- argv ---- */
@@ -719,6 +805,12 @@ void insmod_main(long argc, char **argv)
 		plen += alen;
 	}
 	params[plen] = 0;
+
+	/* Who is loading is reported, not decided on: whether this module can ask KernelSU is a fact
+	 * about the DEVICE (ksu_traces_present()), while the domain only says who is asking - a Magisk
+	 * setup may run this from any root context, and a KernelSU setup from a shell that never
+	 * switched domain. */
+	from_magisk = is_magisk_domain();
 
 	/* ---- map the module image read/write private ---- */
 	fd = sys6(SYS_openat, AT_FDCWD, (sysarg)path, O_RDONLY, 0, 0, 0);
@@ -874,6 +966,60 @@ void insmod_main(long argc, char **argv)
 			o_put(" dotted names (skipped)\n");
 			o_flush();
 		}
+		/* ---- the KernelSU gate symbol (issue #34) ----
+		 *
+		 * The module asks KernelSU's ksu_uid_should_umount() whether susfs hiding applies to a
+		 * given uid.  On a KernelSU device that name resolved above like every other one.  On a
+		 * Magisk device it does not exist at all, and leaving it SHN_UNDEF would make the kernel
+		 * refuse the entire load with "Unknown symbol" - so the symbol is stood in for: pinned to
+		 * 0, with is_magisk=1 passed to the module, which makes the gates answer the old uid rule
+		 * and never call that address.
+		 *
+		 * "That name did not resolve" has two very different causes, and getting the second one
+		 * wrong is worse than failing the load: no KernelSU at all (stand in, as above), versus a
+		 * KernelSU that is older than that symbol or has not been loaded yet (a stand-in would
+		 * load the module fine and leave issue #34 silently unfixed on that machine, forever).
+		 * So the decision is made on what the DEVICE is - a `kernelsu` entry in /proc/modules, or
+		 * /data/adb/ksud - and never on the loader's SELinux domain, which only says who is
+		 * asking; the domain is still reported, to make a surprise readable. */
+		for (i = 0; i < nundef; i++) {
+			struct undef *u = &undefs[i];
+
+			if (u->len != (u32)(sizeof(ksu_gate_symbol) - 1) ||
+			    !s_eq_n(u->name, ksu_gate_symbol, sizeof(ksu_gate_symbol) - 1))
+				continue;
+			if (u->resolved)
+				break;		/* KernelSU is there and supplied the address */
+			gate_unresolved = 1;
+			ksu_seen = ksu_traces_present();
+			if (!ksu_seen) {
+				u->sym->st_shndx = SHN_ABS;
+				u->sym->st_value = 0;
+				u->resolved = 1;
+				gate_pinned = 1;
+			}
+			break;
+		}
+
+		if (gate_pinned) {
+			static const char mp[] = " is_magisk=1";
+			u64 mn = sizeof(mp) - 1;
+
+			if (plen + mn >= sizeof(params))
+				die("module parameters too long (the kernel caps them at 4096 bytes)", -7);
+			copy_n(params + plen, mp, mn);
+			plen += mn;
+			params[plen] = 0;
+
+			o_put(P "note: ");
+			o_putn(ksu_gate_symbol, sizeof(ksu_gate_symbol) - 1);
+			o_put(" is not in kallsyms and this device shows no KernelSU (/proc/modules, /data/adb/ksud): pinned it to 0 and passed is_magisk=1, so the module keeps the uid >= 10000 rule");
+			o_put(from_magisk ?
+			      " (this loader ran in Magisk's domain)\n" :
+			      " (this loader did NOT run in Magisk's domain)\n");
+			o_flush();
+		}
+
 		for (i = 0; i < nundef; i++) {
 			if (!undefs[i].resolved) {
 				bad_sym++;
@@ -929,6 +1075,15 @@ void insmod_main(long argc, char **argv)
 		if (unresolved > listed)
 			o_put(" ...");
 		o_put("\n");
+		o_flush();
+	}
+
+	/* The loud counterpart of the stand-in above: the name is left unresolved on purpose, so the
+	 * kernel will refuse the load.  Say why, or the only visible symptom is "Unknown symbol". */
+	if (gate_unresolved && !gate_pinned) {
+		o_put(P "note: KernelSU's ");
+		o_putn(ksu_gate_symbol, sizeof(ksu_gate_symbol) - 1);
+		o_put(" did not resolve, yet this device HAS KernelSU (a kernelsu entry in /proc/modules, or /data/adb/ksud): standing in for it would load the module and silently keep the pre-#34 uid rule, so this load is left to fail with \"Unknown symbol\" instead.  Either kernelsu.ko is not loaded yet (load this module after it) or it is older than that symbol.\n");
 		o_flush();
 	}
 

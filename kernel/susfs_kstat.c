@@ -21,6 +21,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc, sus_path_dirent_filter() */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #define KSTAT_AUTO_SPOOF (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV | \
 	KSTAT_SPOOF_ATIME_TV_SEC | KSTAT_SPOOF_ATIME_TV_NSEC | \
@@ -123,7 +124,7 @@ static_assert(offsetof(struct stat, st_ctime) == ST_CTIME_OFF, "stat.st_ctime");
 
 static bool susfs_kstat_gate_ok(void)
 {
-	return susfs_uid_is_hidden_target();
+	return susfs_is_current_proc_umounted_app();
 }
 
 static bool susfs_kstat_table_empty(void)

@@ -17,6 +17,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for the walk ops */
 
 #define SUS_MAP_MAX 64
@@ -78,7 +79,7 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
 
 static bool sus_map_gate_ok(void)
 {
-    return susfs_uid_is_hidden_target();
+    return susfs_is_current_proc_umounted_app();
 }
 
 static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)

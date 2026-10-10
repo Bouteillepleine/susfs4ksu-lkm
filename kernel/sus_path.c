@@ -27,6 +27,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
 
 #include "lsm_hook.h"
@@ -256,14 +257,14 @@ static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
         return true;
-    return susfs_uid_is_hidden_target();
+    return susfs_is_current_proc_umounted_app();
 }
 
 static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
-    if (!susfs_uid_is_hidden_target())
+    if (!susfs_is_current_proc_umounted_app())
         return false;
     return current_uid().val != inode->i_uid.val;
 }
