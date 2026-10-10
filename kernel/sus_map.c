@@ -18,6 +18,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "susfs_kprobe.h"
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for the walk ops */
 
 #define SUS_MAP_MAX 64
@@ -565,6 +566,11 @@ static int sus_map_register_probes(void)
         if (rc) {
             pr_warn("sus_map: register_kprobe(%s) failed %d - that listing is not filtered\n",
                     map_probes[i]->symbol_name, rc);
+            /* This function is retried from the supercall that adds a rule (and it skips the
+             * probes that did arm), so the struct has to be clear for the retry to reach the
+             * symbol again: a failure after address resolution leaves .addr set - see
+             * susfs_kprobe.h. */
+            susfs_kp_forget_addr(map_probes[i]);
             if (!first_err)
                 first_err = rc;
             continue;
@@ -580,11 +586,13 @@ static int sus_map_register_probes(void)
     if (!kr_map_files_ok) {
         int rc = register_kretprobe(&kr_map_files);
 
-        if (rc)
+        if (rc) {
+            susfs_krp_forget_addr(&kr_map_files);
             pr_warn("sus_map: register_kretprobe(proc_map_files_get_link) failed %d - readlink on a hidden mapping still names the file\n",
                     rc);
-        else
+        } else {
             kr_map_files_ok = true;
+        }
     }
 
     map_registered = map_probe_armed[0];   /* show_map_vma is the required one */
@@ -615,10 +623,12 @@ void susfs_sus_map_exit(void)
         if (!map_probe_armed[i])
             continue;
         unregister_kprobe(map_probes[i]);
+        susfs_kp_forget_addr(map_probes[i]);
         map_probe_armed[i] = false;
     }
     if (kr_map_files_ok) {
         unregister_kretprobe(&kr_map_files);
+        susfs_krp_forget_addr(&kr_map_files);
         kr_map_files_ok = false;
     }
     map_registered = false;

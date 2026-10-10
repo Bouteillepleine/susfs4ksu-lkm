@@ -22,6 +22,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc, sus_path_dirent_filter() */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "susfs_kprobe.h"
 
 #define KSTAT_AUTO_SPOOF (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV | \
 	KSTAT_SPOOF_ATIME_TV_SEC | KSTAT_SPOOF_ATIME_TV_NSEC | \
@@ -365,10 +366,15 @@ static void kstat_maps_arm(void)
 	if (kstat_maps_registered)
 		return;
 	rc = register_kretprobe(&krp_kstat_map_vma);
-	if (rc)
+	if (rc) {
+		/* Every later rule operation retries this arming (kstat_maps_arm() is called from the
+		 * add/update/clear paths and from the supercall), so the struct has to come back clear:
+		 * a failure after the symbol was resolved leaves .addr set, and the retry would be
+		 * refused with -EINVAL instead of trying again - see susfs_kprobe.h. */
+		susfs_krp_forget_addr(&krp_kstat_map_vma);
 		pr_warn("susfs_kstat: register_kretprobe(show_map_vma) failed %d - maps keeps printing the real dev:ino\n",
 			rc);
-	else {
+	} else {
 		kstat_maps_registered = true;
 		SUSFS_LOGI("susfs_kstat: maps hook armed (kretprobe show_map_vma)\n");
 	}
@@ -379,6 +385,7 @@ static void kstat_maps_disarm(void)
 	if (!kstat_maps_registered)
 		return;
 	unregister_kretprobe(&krp_kstat_map_vma);
+	susfs_krp_forget_addr(&krp_kstat_map_vma);
 	kstat_maps_registered = false;
 }
 

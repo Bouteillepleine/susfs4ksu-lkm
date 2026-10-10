@@ -9,6 +9,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
+#include "susfs_kprobe.h"
 
 #define SUSFS_UNAME_LEN (__NEW_UTS_LEN + 1)
 
@@ -75,8 +76,13 @@ static int uname_register(void)
     if (uname_registered)
         return 0;
     rc = register_kretprobe(&krp);
-    if (rc)
+    if (rc) {
+        /* CMD_SUSFS_SET_UNAME can be sent again after a failure, and the address the kernel
+         * resolved is already in the struct: without this the retry is refused with -EINVAL
+         * and the spoof can never be turned on - see susfs_kprobe.h. */
+        susfs_krp_forget_addr(&krp);
         return rc;
+    }
     uname_registered = true;
     SUSFS_LOGI("uname spoof armed: release=%s version=%s\n",
             fake_release, fake_version);
@@ -88,6 +94,7 @@ static void uname_unregister(void)
     if (!uname_registered)
         return;
     unregister_kretprobe(&krp);
+    susfs_krp_forget_addr(&krp);
     uname_registered = false;
 }
 
