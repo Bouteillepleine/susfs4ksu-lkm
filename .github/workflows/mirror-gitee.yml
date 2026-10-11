@@ -1,0 +1,76 @@
+name: mirror-gitee
+
+# A full mirror of this repository on Gitee, so that a domestic reader has a copy that
+# is not behind github.com and so that the history survives losing this one.  Nothing
+# here is a second source of truth: no CI, no issues, no pull requests on the far side -
+# it is pushed at, never pulled from.
+#
+# Every branch and every tag, forced and pruned, on every push: "full" is the point of a
+# backup, and --force is what keeps a moved tag (v2.3.0-r18 was retargeted once) from
+# being refused on the far side.  The job is deliberately not part of build-ddk.yml: the
+# eight-variant build should not wait on - or be failed by - a mirror.
+#
+# Configuration, once, in this repository's settings (never in this file):
+#   secret   GITEE_TOKEN  a Gitee personal access token with the `projects` scope
+#   variable GITEE_REPO   owner/name on gitee.com, e.g. "someone/susfs4ksu-lkm"
+# Without the secret the job says so and succeeds: an unconfigured mirror must not turn
+# every push red, and the moment the secret exists the next push syncs everything.
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+  workflow_dispatch:
+
+# Two pushes in a row must not race each other into the same remote; the newer one waits.
+concurrency:
+  group: mirror-gitee
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (all history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push every branch and tag to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GITEE_TOKEN}" ]; then
+            echo "GITEE_TOKEN is not configured - skipping the mirror (see this workflow's header)"
+            exit 0
+          fi
+          if [ -z "${GITEE_REPO}" ]; then
+            echo "::error::GITEE_REPO is not configured - set it to owner/name on gitee.com"
+            exit 1
+          fi
+
+          # checkout gives one ref; the mirror needs all of them, plus the tags.
+          git fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+          branches=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin \
+                     | grep -v '^origin/HEAD$' | wc -l)
+          tags=$(git tag | wc -l)
+          echo "mirroring ${branches} branches and ${tags} tags to ${GITEE_REPO}"
+
+          # The token goes into this one command line and nowhere else.  The username half
+          # of the URL is the Gitee owner, which is the first path element of GITEE_REPO:
+          # Gitee wants https://<user>:<token>@gitee.com/... , and taking the owner from the
+          # repository variable keeps the two from drifting apart.
+          owner="${GITEE_REPO%%/*}"
+          git push --force --prune "https://${owner}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" \
+              '+refs/remotes/origin/*:refs/heads/*' \
+              '+refs/tags/*:refs/tags/*'
+
+          echo "mirrored: $(git rev-parse --short refs/remotes/origin/main) main, $(git rev-parse --short refs/remotes/origin/dev) dev"
