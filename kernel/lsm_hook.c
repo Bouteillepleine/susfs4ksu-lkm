@@ -1,5 +1,29 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-
+/*
+ * lsm_hook.c - runtime LSM hook installation (ported from KernelSU/SukiSU hook/lsm_hook.c).
+ * Both mechanisms write through ksu_patch_text(): every word they touch is read-only text, and the
+ * replacement lives in module .text, so a patch has to go through stop_machine.
+ *
+ *   replace  - find the struct security_hook_list whose function slot equals a symbol
+ *              resolved by name and overwrite that slot; the old pointer is kept in
+ *              hook->original and the replacement has to call it for pass-through.  The
+ *              slot sits in someone else's (SELinux's) entry, so the hook runs at
+ *              SELinux's position and a caller LSM that returns non-zero first masks it.
+ *   insert   - add our OWN struct security_hook_list node at the HEAD of the same hlist
+ *              (hook->insert, see KSU_LSM_HOOK_INSERT).  No symbol is resolved, no
+ *              original exists to call, and the node runs before every registered LSM,
+ *              so it can only add a denial - never suppress one.  On 6.12+ there is no
+ *              hlist to insert into, so insert takes over SELinux's slot of the hook in
+ *              static_calls_table instead (see ksu_lsm_hook_insert_scall()) and reaches
+ *              the displaced function through hook->original.
+ *
+ * The 6.12+ static-call dispatch is a different mechanism and BOTH shapes are implemented
+ * for it: replace patches the entry's hook word and then switches the static call, and
+ * insert scans static_calls_table for the SELinux slot of the hook and takes it over -
+ * found by the address kallsyms has for `selinux_<member>`, because offsetof() into the
+ * table names the right element only while the kernel's MAX_LSM_COUNT and hook order match
+ * the tree this module was compiled against.
+ */
 #include <linux/compiler.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
@@ -8,6 +32,7 @@
 #include <linux/delay.h>
 #include <linux/rcupdate.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>		/* copy_from_kernel_nofault() - ksu_lsm_read_ptr() is used by BOTH version paths, so this include is not gated */
 #include <linux/version.h>		/* LINUX_VERSION_CODE for the gates below (do not rely on a transitive include) */
 
 #include "symbol_resolver.h"
@@ -19,7 +44,6 @@
 #include <linux/static_call_types.h>	/* struct static_call_key */
 #include <linux/lsm_count.h>		/* MAX_LSM_COUNT = the slots each hook has */
 #include <linux/kallsyms.h>		/* KSYM_SYMBOL_LEN, to name the target function */
-#include <linux/uaccess.h>		/* copy_from_kernel_nofault(), layout probe */
 #endif
 
 struct ksu_lsm_hook_entry {
@@ -87,7 +111,10 @@ static int ksu_lsm_hook_patch_slot(void **slot, void *value)
 /* Both version paths below read kernel pointers they did not place themselves: the >= 6.12 one
  * walks static_calls_table, the < 6.12 one walks security_hook_heads.  A pointer that is not a
  * kernel address is refused, and every read goes through copy_from_kernel_nofault(), so a damaged
- * structure is skipped rather than faulted on. */
+ * structure is skipped rather than faulted on.
+ *
+ * The identity scan walks lists this module never touched before, so a pointer that is not a
+ * kernel address stops the walk instead of being dereferenced. */
 #define KSU_LSM_KPTR_MIN	0xff00000000000000UL
 
 static bool ksu_lsm_kptr_plausible(const void *p)
@@ -102,6 +129,10 @@ static int ksu_lsm_read_ptr(const void *addr, void *out)
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+/* ---- insertion into a hook list (hook->insert) -------------------------------
+ * SELinux's node lives in selinux_hooks[] __lsm_ro_after_init, hence ksu_patch_text()
+ * below; our node is writable and becomes reachable only once head->first is patched, so
+ * no walk can observe a half-initialised node. */
 
 /* How many entries of a list are looked at while identifying it; a list is short and this only
  * bounds the walk. */
@@ -274,6 +305,8 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
         return -EAGAIN;
     }
 
+    /* Set the hook word through the offset the slot path uses (the per-hook initialiser
+     * need not name the union member); `lsm` is char * on 5.10/5.15, const char * on 6.1. */
     memset(node, 0, sizeof(*node));
     *(void **)((char *)node + hook->hook_offset) = hook->replacement;
     node->head = head;
@@ -286,14 +319,17 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
     if (ret)
         return ret;
 
+    /* 2. the displaced node's back pointer, inside selinux_hooks[] (also RO after init):
+     *    a later removal of THAT node must not unlink from a stale pointer into ours. */
     ret = ksu_lsm_hook_patch_slot((void **)&first->pprev, &node->list.next);
     if (ret) {
         /* Roll back the publication - a wrong-way neighbour corrupts the list. */
         if (ksu_lsm_hook_patch_slot((void **)&head->first, first))
             pr_err("lsm_hook: %s: failed to roll back head->first after a failed insert\n",
                     hook->head_name ?: "unknown");
-        /* Leave ->next alone: a walker can still be inside this node, and NULL there would end
-         * its walk early - every LSM after us (SELinux included) goes unasked. */
+        /* Leave ->next alone for the same reason as in the unlink path below: a walker can still
+         * be inside this node, and a NULL there ends its walk early - every LSM after us
+         * (SELinux included) goes unasked. */
         node->list.pprev = NULL;
         return ret;
     }
@@ -321,6 +357,8 @@ static int ksu_lsm_hook_remove_head(struct ksu_lsm_hook *hook)
     if (ret)
         return ret;
 
+    /* 2. the successor's back pointer: not needed for the walk, but a later removal of
+     *    THAT node must not write through a pointer into this module's memory. */
     if (next) {
         ret = ksu_lsm_hook_patch_slot((void **)&next->pprev, pprev);
         if (ret) {
@@ -332,8 +370,11 @@ static int ksu_lsm_hook_remove_head(struct ksu_lsm_hook *hook)
         }
     }
 
-    /* ->next is deliberately left set: hlist removal does not clear it either, and the dispatch
-     * loop reads pos->next AFTER the callee returns - a NULL here ends the walk early. */
+    /* The node's own forward pointer is deliberately left alone - hlist removal does not clear
+     * it either, and the dispatch loop reads pos->member.next AFTER the callee returns: a walker
+     * still inside our node would read NULL, end the walk, and leave every LSM after us
+     * (SELinux included) unasked, with call_int_hook() returning our own LSM_RET_DEFAULT.
+     * Re-publishing does not need it: ksu_lsm_hook_insert_head() memsets the node first. */
     hook->list.list.pprev = NULL;
     hook->entry = NULL;
     SUSFS_LOGI("lsm_hook: removed %s node from its list\n", hook->head_name ?: "unknown");
@@ -816,7 +857,11 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     }
 
     if (hook->insert) {
-
+        /* Insertion needs no symbol: there is no original to find and no slot to match.
+         * Everything it does is validated before the first patched write - in
+         * ksu_lsm_hook_head_at() on < 6.12, in ksu_lsm_hook_insert_scall() on >= 6.12,
+         * whose scan identifies the SELinux slot of the hook by the address kallsyms
+         * has for `selinux_<member>`. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
         ret = ksu_lsm_hook_insert_scall(hook);
         goto out_unlock;
@@ -878,7 +923,10 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     }
 
     if (scalls_count == 0) {
-
+        /* sym_size is sizeof() and not kallsyms_lookup_size_offset(): that symbol is UNEXPORTED
+         * in every GKI tree this module targets, so importing it makes the module unloadable by
+         * a plain `insmod` (unknown symbol) - it is the fifth name the "Verify sections" CI step
+         * refuses in the .ko's undefined list - and the number is the same either way. */
         unsigned long sym_size = sizeof(struct lsm_static_calls_table);
         unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");
 
@@ -1014,6 +1062,11 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
         goto out_unlock;
     }
     unsigned long heads_size = sizeof(struct security_hook_heads);
+    /* heads_size is deliberately just sizeof() and not kallsyms_lookup_size_offset():
+     * that symbol is UNEXPORTED in every GKI tree this module targets, so calling it
+     * makes the module unloadable by a plain `insmod` (unknown symbol) on all six
+     * variants - and the lookup only ever produced this same number, since the fallback
+     * was already the struct size.  Deleting the call is behaviour-neutral. */
 
     head = (struct hlist_head *)heads_addr;
     struct hlist_head *head_end = (struct hlist_head *)(heads_addr + heads_size);
@@ -1160,7 +1213,8 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     }
 
     if (hook->entry == &hook->list) {
-
+        /* Our own security_hook_list node is in the list: an insert node, or (legacy) a
+         * replace-mode hook that found its head empty; both unlink through list.pprev. */
         if (ksu_lsm_hook_remove_head(hook)) {
             mutex_unlock(&ksu_lsm_hook_lock);
             return;
@@ -1184,9 +1238,20 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
 #endif
     mutex_unlock(&ksu_lsm_hook_lock);
 
+    /* Drained after the lock is released: the wait is unbounded (a quiescent state for every
+     * task, or the 50 ms fallback) and holding ksu_lsm_hook_lock across it serialises every
+     * other hook operation, while the node/slot is already unlinked above and only a task
+     * already inside the replacement can still be there. */
     ksu_lsm_hook_drain();
 }
 
+/* Wait until nothing can still be inside a replacement function.
+ * synchronize_rcu() is not enough: the LSM call sites walk their hook list with a plain
+ * hlist_for_each_entry (security/security.c), not through an RCU read-side section, so a task already
+ * inside the replacement is invisible to that barrier and would still be there when the module text is
+ * unmapped - a use-after-free on the next instruction.  synchronize_rcu_tasks() waits for every task to
+ * pass a context switch, which does cover it; it is resolved at runtime and reached through a __nocfi
+ * wrapper (kCFI checks the type hash at the call site), with a 50 ms delay if it cannot be resolved. */
 static void (*ksu_lsm_sync_rcu_tasks_fn)(void);
 static bool ksu_lsm_sync_looked_up;
 
@@ -1235,9 +1300,43 @@ void ksu_unregister_lsm_hook(struct ksu_lsm_hook *hook)
     ksu_lsm_unhook(hook);
 }
 
+/* No __init/__exit annotation on these two on purpose: the layer table (susfs_main.c) holds their
+ * addresses and calls the exit from the rollback path of a FAILED load, i.e. from plain .text. */
 void ksu_lsm_hook_init(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* Load-time self-check carried over from the stride derivation this file used before the
+     * >= 6.12 slot arithmetic was switched to the compiled-in KSU_LSM_SLOTS_PER_HOOK
+     * (MAX_LSM_COUNT).  lsm_active_cnt is the number of LSMs the kernel ENABLED, not the
+     * table stride, so it is not used as an index any more - these checks only report a table
+     * whose size does not agree with the count the kernel reports, or a count that cannot be
+     * one (symbol missing, or nonsense like 0 or 200), so a wrong assumption about this
+     * kernel is visible in dmesg at load instead of only in a failed hook later.
+     *
+     * A disagreement is NOT fatal: the >= 6.12 insert path finds its slot by name and the
+     * replace path reports the element offsetof() names next to the one the scan found, so a
+     * stride that differs from this build is handled rather than refused - hence pr_warn. */
+    static u32 lsm_max_cnt = KSU_LSM_SLOTS_PER_HOOK;
+    unsigned long sym_size = sizeof(struct lsm_static_calls_table);
+    u32 lsm_active_cnt = 5;
+    unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");
+    if (!addr) {
+        pr_err("failed to get lsm_active_cnt\n");
+    } else {
+        lsm_active_cnt = *(u32 *)addr;
+    }
+    SUSFS_LOGI("lsm_active_cnt = %d\n", lsm_active_cnt);
+    if (lsm_active_cnt == 0 || lsm_active_cnt > 20) {
+        pr_err("invalid lsm_active_cnt\n");
+    } else {
+        lsm_max_cnt = lsm_active_cnt;
+        if (sym_size % (lsm_active_cnt * sizeof(struct lsm_static_call)) != 0) {
+            pr_warn("invalid struct size\n");
+        }
+        if (lsm_max_cnt != KSU_LSM_SLOTS_PER_HOOK)
+            pr_warn("lsm_hook: %u LSM(s) are active while the compiled-in table stride is %d - the stride is not derived from this count any more, the >= 6.12 slot scan identifies its slot by name, so this is informational\n",
+                    lsm_max_cnt, (int)KSU_LSM_SLOTS_PER_HOOK);
+    }
 
     ksu_static_call_update_fn = (void *)find_kernel_symbol_exact("__static_call_update");
     SUSFS_LOGI("lsm_hook: static-call switch via %s\n",

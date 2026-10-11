@@ -12,7 +12,7 @@
 #   * did the 13 hooks land as the FIRST node of their lists, ahead of SELinux
 #   * do they actually run (counters move on a non-root probe)
 #   * is a registered entry absent from a LISTING as well, not just from stat() - the name
-#     layer is a separate kretprobe and it died silently on 6.1 while stat() kept answering
+#     layer is a hook of its own and it died silently on 6.1 while stat() kept answering
 #     ENOENT, so the two layers are checked separately
 #   * is everything they hide still hidden, and is an ordinary rule still app-only
 #   * does anything alarm across unload/reload cycles
@@ -155,6 +155,23 @@ dmesg | grep -E 'Unknown symbol|does not import it|version magic|CFI failure|BUG
 [ "$(dmesg | grep -c 'CFI failure')" = "0" ] && ok "no CFI failure line" || bad "CFI failure reported"
 loaded || { sec "result"; echo "  not loaded - the dmesg above is the evidence"; echo "  tally: $PASS pass, $FAIL fail, $NOTE note"; finish 1; }
 
+# The hide gates settle once, at load, whether KernelSU's predicate can be asked, and say which way
+# they went - but only the "not resolved" line is unconditional: the "resolved" one is SUSFS_LOGI, so a
+# load that was started with enable_log=0 prints neither (that is a documented feature, not a failure
+# of this script).  Only a load that was NOT silent and printed neither line means the layer never ran
+# (fail_layer=1 skips it, which is a diagnostic).
+if dmesg | grep -q 'ksu_umount_gate: resolved ksu_uid_should_umount at'; then
+    ok "gate: KernelSU's predicate resolved - issue #34's rule is in effect"
+elif dmesg | grep -q 'ksu_uid_should_umount is not in kallsyms'; then
+    note "gate: predicate not resolved - the pre-#34 uid rule is in effect (expected on Magisk/APatch; on a KernelSU device that is a GAP)"
+else
+    el=$(cat "$P/enable_log" 2>/dev/null)
+    case "$el" in
+        N) note "gate: no decision line - the load was silent (enable_log=0), so the 'resolved' line was never printed; reload without enable_log=0 to see which way the gate went" ;;
+        *) bad "gate: no decision line in dmesg (enable_log=${el:-?}) - the ksu_umount_gate layer did not run (fail_layer=1?)" ;;
+    esac
+fi
+
 sec "2. the 13 hooks went in as the FIRST node of their lists (ahead of SELinux)"
 echo 1 > /proc/susfs_enable_log 2>/dev/null
 rmmod susfs_guard_lkm 2>/dev/null
@@ -228,9 +245,10 @@ if [ "$HAVE_SU" = "1" ]; then
     # The LSM slots answer stat()/open(); they cannot touch a listing, because the
     # directory chain is built inside the filesystem and no per-entry callback is
     # reachable from a module.  A listing therefore tests the OTHER layer - and that is
-    # the layer that died silently on 6.1, where its kretprobe symbol (__do_sys_getdents64)
-    # had been inlined away: every registered entry kept appearing in every listing while
-    # stat() still answered ENOENT.  That combination is exactly what this section catches.
+    # the layer that has died silently before (on 6.1, where the symbol it hooked,
+    # __do_sys_getdents64, had been inlined away): every registered entry kept appearing in
+    # every listing while stat() still answered ENOENT.  That combination is exactly what
+    # this section catches.
     #
     # Judged on a NAMED entry, never on "the output was empty": the directory holds the
     # registered entry AND an unregistered neighbour, and the neighbour has to still be

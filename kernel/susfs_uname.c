@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
-
+/*
+ * susfs_uname.c - spoof uname release/version (SUSFS SPOOF_UNAME).  Upstream patches the body of
+ * SYSCALL_DEFINE1(newuname) between the memcpy(utsname) and copy_to_user; the LKM equivalent hooks
+ * __arm64_sys_newuname with a kretprobe and rewrites the release/version fields of the user buffer just before
+ * the syscall returns - the target pages were just faulted in by the original copy_to_user, so the handler's
+ * copy_to_user cannot fault, and "default" copies the device's CURRENT utsname()->release/version at runtime.
+ * Upstream semantics: OFF by default, enabled by CMD_SUSFS_SET_UNAME alone, kretprobe registered lazily.
+ */
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/utsname.h>
 #include <linux/string.h>
+#include <linux/mutex.h>	/* uname_ctl_lock: serialises the arm/disarm pair */
 #include <linux/version.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
@@ -34,6 +42,8 @@ static int kr_newuname_entry(struct kretprobe_instance *ri, struct pt_regs *regs
     struct uname_args *a = (struct uname_args *)ri->data;
     struct pt_regs *user = (struct pt_regs *)regs->regs[0];
 
+    /* this GKI kernel does NOT auto-adjust syscall-wrapper probe regs:
+     * regs->regs[0] is the struct pt_regs* argument, not the user arg */
     if (!user)
         return 1;   /* no return handler: ri->data would be left stale */
 
@@ -69,21 +79,33 @@ static struct kretprobe krp = {
 
 static bool uname_registered;
 
+/* Serialises the arm/disarm pair - the full reasoning is in susfs_avc_spoof.c's avc_ctl_lock:
+ * register_kprobe() answers -EINVAL once another task has resolved .addr, and the failure branch
+ * below clears .addr - which, without this lock, disarms a probe that is LIVE without ever
+ * unregistering it, leaving its breakpoint installed after the module is freed.  Two tasks can
+ * send CMD_SUSFS_SET_UNAME at the same time (each supercall runs in its own task_work). */
+static DEFINE_MUTEX(uname_ctl_lock);
+
 static int uname_register(void)
 {
     int rc;
 
-    if (uname_registered)
+    mutex_lock(&uname_ctl_lock);
+    if (uname_registered) {
+        mutex_unlock(&uname_ctl_lock);
         return 0;
+    }
     rc = register_kretprobe(&krp);
     if (rc) {
         /* CMD_SUSFS_SET_UNAME can be sent again after a failure, and the address the kernel
          * resolved is already in the struct: without this the retry is refused with -EINVAL
-         * and the spoof can never be turned on - see susfs_kprobe.h. */
+         * and the spoof can never be turned on - see susfs_kprobe.h.  Safe under the lock. */
         susfs_krp_forget_addr(&krp);
+        mutex_unlock(&uname_ctl_lock);
         return rc;
     }
     uname_registered = true;
+    mutex_unlock(&uname_ctl_lock);
     SUSFS_LOGI("uname spoof armed: release=%s version=%s\n",
             fake_release, fake_version);
     return 0;
@@ -91,11 +113,15 @@ static int uname_register(void)
 
 static void uname_unregister(void)
 {
-    if (!uname_registered)
+    mutex_lock(&uname_ctl_lock);
+    if (!uname_registered) {
+        mutex_unlock(&uname_ctl_lock);
         return;
+    }
     unregister_kretprobe(&krp);
     susfs_krp_forget_addr(&krp);
     uname_registered = false;
+    mutex_unlock(&uname_ctl_lock);
 }
 
 /* The insmod/sysfs parameter path does not go through the supercall's strscpy_pad(): the

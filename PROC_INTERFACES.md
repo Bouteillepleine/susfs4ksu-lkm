@@ -26,15 +26,20 @@
 
 登记一个路径，让 app 看到的 `stat()`/`statx()`/`maps` 里的 inode 与时间戳变成登记时的值。
 
-**读**：每条规则一行，外加两组计数器。
+**读**：每条规则一行，外加 `maps:` 行、每种 stat 号码一行、一条未列出号码的汇总行，以及 dirent 过滤器的统计块。
 
 ```
 /data/local/tmp/procdoc/target ino=981881 dev=65099 flags=0xff3 [ino=981881 dev=65099 nlink=1 size=2 atime=1789400211.918607439 mtime=1789400211.930607439 ctime=1789400211.946607439 blocks=8 blksize=4096]
 maps: armed=1 hits=0 rewrites=0
-vfs_getattr fallback: gattr_hits=6 gattr_spoofs=0
+stat nr newfstatat       (79): ok=3 rw=2 | err=0 nobuf=0 empty=0 gate=0 lookup=1 noflag=0 uacc=0
+stat nr fstat            (80): ok=1 rw=1 | err=0 nobuf=0 empty=0 gate=0 lookup=0 noflag=0 uacc=0
+stat nr statx            (291): ok=0 rw=0 | err=0 nobuf=0 empty=0 gate=0 lookup=0 noflag=0 uacc=0
+stat unlisted-nr hits=0 (stat-range numbers the dispatcher did not know: last 8 seen: 0 0 0 0 0 0 0 0)
 ```
 
-外层是登记目标，方括号里是伪装值。`maps:` 是 `maps` 行改写探针；`vfs_getattr fallback:` 是"内核内部调用者"那条回退路径的命中数。
+外层是登记目标，方括号里是伪装值。`maps:` 是 `maps` 行改写探针。`stat nr <名字> (<号码>):` 每行是一种 stat 号码的计数器：`ok` 是命中登记规则的次数、`rw` 是真正改写了缓冲的次数，`|` 之后是各条早退路径的计数（返回错误、没有缓冲、登记为空、门控拒绝、查不到规则、命中但没有 flag、uaccess 失败）——"登记了"与"真的被命中"因此可以分开看。`stat unlisted-nr` 汇总落在 stat 号码区间、但派发器不认识的号码，并回放最近 8 个。dirent 过滤器的统计块由 `sus_path.c` 的 `sus_path_dirent_stat_line()` 打印。
+
+**覆盖范围**：上面的号码白名单是 `vfs_getattr` kretprobe 删除后的替代——64 位 native 的 `newfstatat`(79)、`fstat`(80)、`statx`(291)，以及 32 位 compat 的 `fstatat64`(327)、`stat64`(195)、`lstat64`(196)、`fstat64`(197)。**AArch32 的 `__NR_stat`(106)、`__NR_lstat`(107)、`__NR_fstat`(108) 不在覆盖范围内**：它们填的是 `struct compat_stat`（与 `struct stat64` 布局不同），本模块没有带这一组字段偏移，而原先能覆盖它们的那个 `vfs_getattr` kretprobe 已经删除，所以这三条路径现在**没有任何钩子**——32 位进程用 `stat()`/`lstat()`/`fstat()` 读到的是真实值，用 `stat64()`/`fstat64()` 才是伪装值，同一个文件两种结果。这个缺口不是静默的：未列出号码的统计范围从 106 起，所以这三个号码会记进 `stat unlisted-nr hits=`，并出现在后面的 "last 8 seen" 回放里。要覆盖需要单独补 `struct compat_stat` 的偏移（`st_dev+0 st_ino+4 st_nlink+10 st_size+20 st_blksize+24 st_blocks+28 atime+32/36 mtime+40/44 ctime+48/52`），源码里的说明见 `kernel/susfs_kstat.c` 的 `:471-476` 与 `:676-687`。
 
 **写**：
 

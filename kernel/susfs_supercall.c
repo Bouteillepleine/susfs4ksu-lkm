@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
-
+/*
+ * susfs_supercall.c - SUSFS supercall dispatcher (reboot(2) ABI).
+ *
+ * ksu_susfs (and SukiSU ksud) call syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id,
+ * &payload) and the handler writes payload.err back.  Upstream SUSFS patches
+ * kernel/reboot.c SYSCALL_DEFINE4 to branch into ksu_handle_sys_reboot(); an LKM cannot
+ * patch that, so we kprobe __arm64_sys_reboot and match the magics ourselves.
+ *  - arm64 syscall-wrapper quirk: the kprobe sees regs->regs[0] == struct pt_regs * (the
+ *    wrapper's __regs argument); the real user args are in real_regs->regs[0..3] - SukiSU's
+ *    PT_REAL_REGS() / arch.h.
+ *  - a pre_handler runs in interrupt context and must not copy_from_user, so the command is
+ *    deferred to task_work (TWA_RESUME), i.e. process context - the same trick SukiSU uses.
+ * The handlers keep upstream's signature `void xxx(void __user **arg)`, *arg pointing at
+ * the userspace payload struct.
+ */
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/task_work.h>
@@ -75,6 +89,10 @@ static const struct feature_entry enabled_features[] = {
 	/* hide_modules is not upstream's, so it is not listed here - the feature itself is unchanged. */
 };
 
+/* The -ENOMEM answer for CMD_SUSFS_SHOW_ENABLED_FEATURES is the whole ABI struct (8192-byte
+ * string + err), copied in one piece.  As a local it broke the 6.1/6.6 builds: "stack frame
+ * size (8320) exceeds limit (2048) in 'susfs_tw_func' [-Wframe-larger-than]", an error
+ * there.  As a static it is harmless - BSS-zeroed, err = -ENOMEM, same for every caller. */
 static struct st_susfs_enabled_features susfs_enabled_features_nomem;
 
 static void susfs_show_enabled_features(void __user **arg)
@@ -85,7 +103,8 @@ static void susfs_show_enabled_features(void __user **arg)
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
-
+		/* Answering nothing would leave the caller unable to tell "no memory" from
+		 * "the kernel said nothing": report it in the ABI's err field. */
 		susfs_enabled_features_nomem.err = -ENOMEM;
 		if (copy_to_user((void __user *)*arg, &susfs_enabled_features_nomem,
 				 sizeof(susfs_enabled_features_nomem)))
@@ -159,8 +178,9 @@ static void susfs_tw_func(struct callback_head *cb)
 		susfs_sus_mount_supercall(&arg);
 		break;
 	default:
-
-		pr_warn("supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
+		/* Unreachable: reboot_pre() only defers a command susfs_cmd_handled()
+		 * accepted.  Kept as a net in case the two lists drift apart. */
+		pr_warn("susfs_guard_lkm: supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
 			tw->cmd);
 		break;
 	}
@@ -171,6 +191,17 @@ static void susfs_tw_func(struct callback_head *cb)
 	module_put(THIS_MODULE);
 }
 
+/* Commands susfs_tw_func() above actually dispatches - keep the two in sync.
+ *
+ * The kprobe consults this BEFORE swallowing the syscall: upstream answers an unrecognised
+ * command with `return -EINVAL` from ksu_handle_sys_reboot()
+ * (KernelSU/10_enable_susfs_for_ksu.patch:2925-2926), and reboot.c's `if (ret) goto
+ * orig_flow;` falls through to the real reboot path, whose magic check rejects
+ * 0xDEADBEEF/0xFAFAFAFA with -EINVAL.  Upstream writes NOTHING to payload.err then, and 126
+ * (ERR_CMD_NOT_SUPPORTED) is a USERSPACE sentinel the ksu_susfs C tool pre-seeds and reads
+ * back as "the kernel never handled this command" (ksu_susfs/jni/features/sus_map.c:51-53,
+ * ksu_susfs/jni/includes/susfs_defs.h:16-18).  So an unknown command must NOT be hijacked:
+ * leave the regs and err alone, while every command listed here still short-circuits to 0. */
 static bool susfs_cmd_handled(unsigned int cmd)
 {
 	switch (cmd) {
@@ -203,6 +234,8 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 	void __user *payload;
 	struct susfs_tw *tw;
 
+	/* A prober runs before the callee, so an argument the callee would have checked is
+	 * still raw here (see the filename_lookup lesson in sus_path.c). */
 	if (!real_regs)
 		return 0;
 
@@ -218,16 +251,18 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (current_uid().val != 0)
 		return 0;
 
+	/* Not ours to answer: leave the syscall alone so reboot(2) reports the -EINVAL
+	 * upstream reports and payload.err keeps the caller's value. */
 	if (!susfs_cmd_handled(cmd)) {
 		SUSFS_LOGI("susfs supercall: unsupported cmd 0x%x\n", cmd);
 		return 0;
 	}
 
 	/* The callback runs from module .text when this task next returns to userspace, which can
-	 * be after `rmmod` has already freed the module: the kprobe is on a vmlinux symbol, so its
-	 * registration does not hold a reference for us, and unregister_kprobe() cannot cancel a
-	 * task_work that is already queued.  Pin the module until the callback has run.  GFP_ATOMIC
-	 * context, so no sleeping here. */
+	 * be after `rmmod` has already freed the module: the kprobe is on a vmlinux symbol, so
+	 * its registration does not hold a reference for us, and unregister_kprobe() cannot
+	 * cancel a task_work that is already queued.  Pin the module until the callback has
+	 * run.  GFP_ATOMIC context, so no sleeping here. */
 	if (!try_module_get(THIS_MODULE))
 		return 0;
 
@@ -247,6 +282,14 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	}
 
+	/* Upstream's reboot.c patch makes a handled supercall return 0 instead of falling
+	 * through to the real reboot path:
+	 *     if (ret) goto orig_flow;
+	 *     return ret;
+	 * We cannot patch reboot.c, so mirror it from the kprobe: skip the rest of
+	 * __arm64_sys_reboot and return 0 - with these magic values reboot would otherwise
+	 * return -EINVAL, and the prebuilt ksu_susfs tool checks the syscall result.  The
+	 * command itself still runs from task_work before we return to userspace. */
 	regs->pc = regs->regs[30];
 	regs->regs[0] = 0;
 	return 1;
@@ -259,6 +302,13 @@ static struct kprobe reboot_kp = {
 
 static bool sc_registered;
 
+/* ---- ABI layout assertions ----
+ * These sizes and `err` offsets ARE the userspace contract (ksu_susfs, ksud and
+ * tools/susfs_sc compile against these numbers); a drift shows up as "the command returned
+ * 0 and userspace printed garbage", not as a build error, and the repository's own
+ * abi_layout_check/ harness is not wired into any build step - hence the trip wire here.
+ * Values are aarch64 LP64, the only ABI shipped clients use, and match upstream's structs
+ * (kernel_patches/include/linux/susfs.h). */
 static void __init susfs_abi_layout_check(void)
 {
 	BUILD_BUG_ON(sizeof(struct st_susfs_sus_path) != 260);
@@ -304,6 +354,9 @@ int susfs_supercall_init(void)
 
 	susfs_abi_layout_check();
 
+	/* One-shot: armed here and dropped in susfs_supercall_exit() only, so no retry can ever meet a
+	 * stale .addr.  This layer is fatal, so a failure refuses the load instead of leaving the probe
+	 * half-armed - which is why it is exempt from the reset rule in kernel/susfs_kprobe.h. */
 	rc = register_kprobe(&reboot_kp);
 	if (rc) {
 		pr_warn("susfs supercall: register_kprobe(reboot) failed %d\n", rc);

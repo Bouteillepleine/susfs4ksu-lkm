@@ -23,9 +23,10 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
 # every kernel and left an undefined dcache_clean_inval_poc in the module.  Fail loudly
 # instead of guessing.
 #
-# srctree is set only when kbuild reaches this file (make -C $KDIR M=$PWD ...); the check used to
-# be a parse-time $(error), which aborted make before any goal was chosen and so made the `all:`
-# entry point below - and KDIR's default - unreachable.  It fires from the `all:` recipe now.
+# `srctree` is set only when kbuild reaches this file (make -C $KDIR M=$PWD ...).  The check for
+# it used to be a parse-time $(error), which aborted make before any goal was chosen and so made
+# the `all:` entry point below - and KDIR's default - unreachable.  It now lives in the `all:`
+# recipe, i.e. it fires when the build is actually attempted.
 KSU_SRCTREE_MISSING := $(if $(srctree),0,1)
 KSU_HAS_OLD_DCACHE := $(shell grep -l __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h 2>/dev/null)
 ifneq ($(KSU_HAS_OLD_DCACHE),)

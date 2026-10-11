@@ -6,11 +6,18 @@
 #include <linux/err.h>	/* IS_ERR */
 #include <linux/mm.h>	/* PAGE_SIZE */
 
+/* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1
+ * and a kretprobe hands that sentinel over as "the argument" - the sus_map vma probe panicked on exactly that (fault
+ * address 0xa1) until this test existed.  Every kernel object lives above the first page, so "< PAGE_SIZE" covers a
+ * sentinel and a garbage register too, and IS_ERR() covers error pointers; user pointers must NOT go through it. */
 static inline bool susfs_ptr_plausible(const void *p)
 {
 	return (unsigned long)p >= PAGE_SIZE && !IS_ERR(p);
 }
 
+/* Bind a fixed-size ABI pathname field to a C string safely: char[N] pathname fields a caller need not NUL-terminate, and
+ * strlen()/strcmp()/kern_path() on one walks off the end of the struct, which lives on OUR kernel stack.  Every consumer of
+ * an ABI pathname goes through this first. */
 static inline bool susfs_abi_path_ok(const char *field, size_t size)
 {
 	return strnlen(field, size) < size;
@@ -32,13 +39,6 @@ int susfs_imports_guard(void);
  * pointers); the attribute belongs on the definition, so it is not repeated here. */
 int susfs_imports_crosscheck(void);
 
-/* sus_path relaxes a registered inode's permission bits to 0777 so DAC cannot answer EACCES
- * before the LSM layer answers ENOENT.  These two put the recorded bits back in a stat result
- * for the callers that are allowed to see the file at all (susfs_kstat.c does it on the
- * sys_exit path); has_relaxed() is the one-load fast-path test. */
-bool sus_path_has_relaxed(void);
-bool sus_path_relaxed_bits(u64 dev, u64 ino, umode_t *bits);
-
 /* Wait until no task can still be inside a window it entered before this call - a kprobe
  * handler, or boot_config_proc_show()'s seq_puts().  synchronize_rcu() is NOT enough for
  * either (neither runs in an RCU read-side section); see lsm_hook.c.  Sleeps. */
@@ -47,17 +47,31 @@ void susfs_wait_for_readers(void);
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 
+/* Same, for one of this module's own control nodes: flagged so the gate hides it from EVERY non-root caller, not merely
+ * from app processes - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
 int sus_path_add_self_hidden(const char *path);
 
+/* Undo sus_path_add_self_hidden(): drops the rule for @path and restores whatever it changed (the relaxed mode, the inode
+ * reference); returns the number of rules removed, so 0 means "was not registered".  Process context only (iput). */
 int sus_path_del_path(const char *path);
 
-/* -1 when this syscall number, for a task running that ABI, is not a directory listing. */
+/* The listing filter, driven from the shared sys_exit tracepoint in susfs_kstat.c: which layout a
+ * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), and
+ * the rewrite itself.  There is no "armed" flag any more: the filter self-gates on no_extra, on
+ * the syscall's own return value and on whether any rule exists, so what the caller has to get
+ * right is the arguments, not the state.  The stat family in susfs_kstat.c has its own
+ * is_compat_task() gate of the same shape; it does not call these. */
 int sus_path_dirent_layout_id(long syscall_nr, bool compat);
 
 long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
 
+/* One line of per-ABI dirent counters for /proc/susfs_kstat: "the callback ran and filtered
+ * nothing" has to be distinguishable from "the callback never ran", and the same line names the
+ * ABI each count belongs to.  Returns the length written, 0 when the buffer is too small. */
 int sus_path_dirent_stat_line(char *buf, size_t size);
 
+/* The module's own name: the /sys/module directory and the modinfo name are both the module file name, and the self-hide
+ * rules and the /proc/modules filter have to agree with it. */
 #define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
 #define SUSFS_LKM_SYSFS_DIR   "/sys/module/" SUSFS_LKM_MODULE_NAME
 
@@ -65,6 +79,8 @@ int sus_path_dirent_stat_line(char *buf, size_t size);
  * reports it when it refuses a load - and that happens before susfs_main.c prints its banner. */
 #define SUSFS_LKM_VERSION "2.3.0-gki"
 
+/* hide_modules (susfs_hide_syms.c): filters module NAMES out of /proc/modules (plus /sys/module and /proc/kallsyms for
+ * non-root callers).  Node and same-named parameter are root-only; the node answers ENOENT through sus_path's hidden set. */
 #define SUSFS_HIDE_MODULES_NODE "/proc/susfs_hide_modules"
 bool susfs_hide_modules_active(void);
 
@@ -72,8 +88,12 @@ bool susfs_hide_modules_active(void);
 #define SUSFS_HIDE_MOUNTS_NODE "/proc/susfs_hide_mounts"
 bool susfs_hide_modules_node_ready(void);
 
+/* sus_path's own control node: `cat` is the rule listing (the hide_list parameter view), writing takes add/del/clear.  An
+ * operator who cannot see the rule table cannot tell "registered" from "hiding"; root-only, everyone else gets ENOENT. */
 #define SUSFS_PATH_NODE "/proc/susfs_path"
 
+/* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE; they are created only when the LSM layer
+ * that hides them is installed, so nobody ends up with an unprotected control node, and expose_proc=0 removes them. */
 extern bool susfs_expose_proc;
 
 /* feature init/exit (each feature is its own translation unit) */
@@ -122,14 +142,23 @@ void susfs_sus_mount_supercall(void __user **arg);
 int susfs_hide_syms_init(void);
 void susfs_hide_syms_exit(void);
 
+/* Actual install state: enabled_features must not advertise a feature whose registration failed - hide_syms used to fail
+ * silently and still be reported as active, the kind of inconsistency a detector looks for. */
 bool susfs_hide_syms_active(void);
 bool sus_path_lsm_active(void);
 
+/* Whether a 0777 /proc/susfs_* control node may be created.  Two independent conditions, neither optional: susfs_expose_proc
+ * (the operator opted in) and sus_path_lsm_active() (with 0777 DAC passes every caller, so only the LSM layer can still
+ * answer ENOENT for an app).  This gates node CREATION ONLY, never hook registration: an earlier revision returned early from
+ * the feature inits on !susfs_expose_proc, which silently disabled sus_kstat's tracepoint and kretprobe. */
 static inline bool susfs_control_node_allowed(void)
 {
 	return susfs_expose_proc && sus_path_lsm_active();
 }
 
+/* open_redirect, reverse direction, for callers that only have an inode NUMBER: fdinfo prints "ino:\t<i>" with no device, so
+ * this is a lookup by ino alone and returns false when the number is ambiguous (two rules, same redirected ino) or the caller is
+ * not one the reverse disguise applies to.  On success *out_ino is the target inode to show, *out_mnt_id the target mount id. */
 bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino, unsigned long *out_mnt_id);
 
 #endif
