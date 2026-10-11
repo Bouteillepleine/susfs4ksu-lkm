@@ -710,6 +710,61 @@ jobs:
           path: /tmp/susfs_stat
           if-no-files-found: warn
 
+      # The O_PATH layer's client (kernel/susfs_opath.c), and the first thing in tools/ that opens
+      # with O_PATH at all: every other tool here - and ls/toybox stat - opens with flags 0, which is
+      # a different sys_call_table entry and therefore a different code path through the layer, so
+      # none of them could have exercised it.  The layer's whole contract is that a hidden path
+      # answers -ENOENT to an O_PATH open instead of handing out a descriptor, and the descriptor is
+      # what this probe proves with readlinkat("/proc/self/fd/N").
+      #
+      # One source, built twice, because the two tables the layer patches are not reachable from the
+      # same binary: a 64-bit process cannot make a 32-bit syscall, so the compat entries need the
+      # armv7a build and the native ones the aarch64 build.  The exit code is INVERTED on purpose -
+      # 1 means "every method answered ENOENT", i.e. the layer works, and 0 means a descriptor came
+      # back, which is the leak.  See the file header before reading a run as green or red.
+      #
+      # The two builds below are BLOCKING, like every other tool build in this file ("a broken tool
+      # FAILS this job on purpose") - it is the uploads that tolerate a missing file.  A probe whose
+      # build silently degraded would take the one verification this layer has with it.
+      - name: Build O_PATH probe (aarch64, openat 56 / openat2 437)
+        run: |
+          set -e
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_opath_probe tools/susfs_opath_probe.c
+          file /tmp/susfs_opath_probe
+          ls -la /tmp/susfs_opath_probe
+
+      - name: Upload O_PATH probe (aarch64)
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_opath_probe
+          path: /tmp/susfs_opath_probe
+          if-no-files-found: warn
+
+      # The 32-bit half, and it is not the build above with other numbers: open (5) takes
+      # (path, flags, mode) with NO DIRFD, and openat2 (437) is a SEPARATE compat_sys_call_table
+      # element that holds the NATIVE __arm64_sys_openat2 (unistd32.h:884-885 -> sys32.c), which is
+      # exactly why susfs_opath.c carries a second table slot for it.  Neither is reachable from the
+      # aarch64 artifact, so both have to be on the device for a complete run.
+      - name: Build O_PATH probe (armv7a, open 5 / openat 322 / openat2 437)
+        run: |
+          set -e
+          clang --target=armv7a-linux-androideabi -march=armv7-a -O2 -nostdlib \
+                -static-pie -fno-stack-protector -fno-builtin -fuse-ld=lld \
+                -Wl,-e,_start -o /tmp/susfs_opath_probe_compat tools/susfs_opath_probe.c
+          file /tmp/susfs_opath_probe_compat
+          ls -la /tmp/susfs_opath_probe_compat
+
+      - name: Upload O_PATH probe (32-bit compat)
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_opath_probe_compat
+          path: /tmp/susfs_opath_probe_compat
+          if-no-files-found: warn
+
       # The loading half of this project: it loads the .ko on a stock vendor kernel WITHOUT ksud, by rewriting every
       # undefined symbol of the image to st_shndx=SHN_ABS / st_value=<kallsyms address> before init_module(2), so the
       # kernel's SHN_UNDEF branch (resolve_symbol -> export lookup, namespace import, CRC check, KMI whitelist) is never
