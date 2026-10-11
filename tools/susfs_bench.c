@@ -5,7 +5,7 @@
  * The point is to measure what the hook costs per call, which is far below what a
  * shell loop can resolve: the fp layer adds a wrapper call, one strncpy_from_user
  * and one rule match to every hooked syscall, all of it in the hundred-nanosecond
- * range.  So this is a tight loop around four syscalls with only
+ * range.  So this is a tight loop around five syscalls with only
  * clock_gettime(CLOCK_MONOTONIC) around it - no libc, no printf, no allocation.
  *
  * Run it four times and compare:
@@ -39,6 +39,10 @@
  *     susfs_bench -p <kind> <iters-per-sample> <samples> <pathA> <pathB>
  *
  * kinds: 1=faccessat 2=fchownat 3=newfstatat 4=statx 5=openat+close
+ *        6=getdents64(dir) 7=openat(O_PATH)+close
+ * (Existing callers keep their numbers: 1..6 are unchanged and new kinds are only ever
+ * APPENDED, because a kind that shifted would silently re-point an old command line at a
+ * different syscall and its numbers would look plausible.)
  *
  * Each sample is the average of <iters-per-sample> calls (the clock is read per
  * batch, not per call - a syscall-based clock costs more than the thing being
@@ -66,6 +70,13 @@ typedef long s64;
 #define CLOCK_MONOTONIC 1
 #define O_RDONLY       0
 #define O_DIRECTORY    0x10000
+/* O_PATH = 010000000 (0x200000), and the SAME value in both ABIs: the ARM-specific overrides
+ * of fcntl.h exist for O_DIRECTORY/O_NOFOLLOW/O_DIRECT/O_LARGEFILE and leave O_PATH to
+ * asm-generic (include/uapi/asm-generic/fcntl.h:85).  It is the exact bit the interception
+ * layer's fast-path test reads (kernel/susfs_opath.c, SUSFS_OPATH_WRAPPER), so this has to be
+ * the kernel's own value and not a lookalike - a wrong bit would silently measure the fast
+ * path twice and call the second row "O_PATH". */
+#define O_PATH         010000000
 
 #define STATX_BASIC_STATS 0x7ff
 #define MAX_SAMPLES 300
@@ -220,6 +231,16 @@ static long one_call(int kind, const char *path)
 		sys6(SYS_getdents64, fd, (long)dbuf, DBUF, 0, 0, 0);
 		sys6(SYS_close, fd, 0, 0, 0, 0, 0);
 		return 0;
+	case 7:
+		/* The same call shape as case 5 with O_PATH added, so the pair measured here is
+		 * the one the layer answers differently: the fast path at best, the full
+		 * post-check (fget_raw/FMODE_PATH/hidden walk/fput) at worst, and -ENOENT when
+		 * the file is hidden.  Appended after 6, never inserted: the numbers of the
+		 * kinds above are what existing command lines pass. */
+		fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_PATH, 0, 0, 0);
+		if (fd >= 0)
+			sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+		return fd;
 	}
 	return -1;
 }
@@ -242,6 +263,8 @@ static u64 put_kind(u64 pos, int kind)
 		return putstr(pos, "openat+close");
 	if (kind == 6)
 		return putstr(pos, "getdents64(dir)");
+	if (kind == 7)
+		return putstr(pos, "openat(O_PATH)+close");
 	return putstr(pos, "?");
 }
 
@@ -476,6 +499,14 @@ void bench_main(long argc, char **argv)
 	}
 	report("statx", iters, best);
 
+	/* The ORDINARY open, i.e. the layer's fast path.  Flags are O_RDONLY (0), which contains
+	 * no O_PATH, so the wrapper in kernel/susfs_opath.c answers at its own flags test:
+	 *     ret = orig(regs);  atomic_inc(&n_opath_seen);
+	 *     if (flags_reg >= 0 && !(regs->regs[flags_reg] & O_PATH)) return ret;
+	 * - one register read, one branch and one atomic add on top of the syscall itself, with
+	 * no fget_raw()/fput() pair and no rule-table walk.  That is the path the device
+	 * measurement quoted as "+20ns per ordinary open", and it is the only path an open with
+	 * these flags can take. */
 	best = ~0ull;
 	for (r = 0; r < ROUNDS; r++) {
 		t0 = now_ns();
@@ -490,6 +521,51 @@ void bench_main(long argc, char **argv)
 			best = took;
 	}
 	report("openat+close", iters, best);
+
+	/* The OTHER half of the same table entry, and a different code path - which is the whole
+	 * reason both rows exist.  O_PATH is the only flag that reaches susfs_opath_post(), the
+	 * function the row above never enters, and there the wrapper pays:
+	 *     fget_raw()                        (fd-table lookup; fget() would reject FMODE_PATH)
+	 *     the FMODE_PATH test               (the kernel's own "this is an O_PATH file")
+	 *     sus_path_inode_hidden_public()    (sus_path_lock + a walk of the rule table)
+	 *     fput()                            (and, for a hidden file, close_fd_get_file() plus a
+	 *                                        second fput() and -ENOENT on top)
+	 * So a number taken from the openat row alone is the CHEAP half of this layer: the row
+	 * below is where its per-call cost actually lives, and on the device O_PATH opens were
+	 * ~7.6% of all opens, i.e. a fraction of traffic large enough that this cost shows up in
+	 * an aggregate and not only in a micro-benchmark.
+	 *
+	 * Two properties of the layer this number inherits, both visible in the source and both
+	 * needed to read it:
+	 *   - post() returns at its first test when the OPEN ITSELF failed (ret < 0), so an O_PATH
+	 *     open of a path that does not exist is the fast path again and no fget_raw() happens.
+	 *     The extra work appears only on a successful open.  The default path here exists and
+	 *     is not hidden, so this row measures the full post-check on a file the rule table
+	 *     does NOT match; point it at a hidden path for the deny path, which adds the
+	 *     descriptor-taking-away half.
+	 *   - the flags live in a different register per entry (native openat and the AArch32
+	 *     openat: argument 3 -> regs[2]; the AArch32 3-argument open: argument 2 -> regs[1];
+	 *     openat2 carries a struct open_how, so it passes -1 and always runs the full check).
+	 *     This row is only the openat(56) entry with O_PATH - it does not stand in for
+	 *     openat2, and no amount of these flags would make it reach that wrapper.
+	 *
+	 * `-p 7` pairs two O_PATH paths instead (hidden vs. nonexistent is the interesting pair):
+	 * that is the timing side channel question this file's paired mode was written for, and
+	 * it only exists on this row, because the ordinary row's cost is the same either way. */
+	best = ~0ull;
+	for (r = 0; r < ROUNDS; r++) {
+		t0 = now_ns();
+		for (i = 0; i < iters; i++) {
+			long fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_PATH, 0, 0, 0);
+
+			if (fd >= 0)
+				sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+		}
+		took = now_ns() - t0;
+		if (took < best)
+			best = took;
+	}
+	report("openat(O_PATH)+close", iters, best);
 
 	/* Keep the compiler honest: rc is used so the loops cannot be optimised
 	 * away, and its value is not interesting. */
