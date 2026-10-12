@@ -547,6 +547,47 @@ module_param_named(vopen_drop, vopen_drop, bool, 0644);
 bool vopen_drop_fake;
 module_param_named(vopen_drop_fake, vopen_drop_fake, bool, 0644);
 
+/*
+ * Name filter for the tracing below: with this set, only a component whose dentry name
+ * matches it is logged.  Without it the log is useless on a phone - every process's
+ * O_PATH opens pass through this layer, and a 200-line window drains long before the
+ * benchmark starts, which is exactly how the first trace came back with the benchmark's
+ * own component missing.
+ */
+static char vopen_dbg_name[64];
+module_param_string(vopen_dbg_name, vopen_dbg_name, sizeof(vopen_dbg_name), 0644);
+
+/*
+ * True when this component should be traced (and consumes one from the vopen_dbg
+ * countdown).  An empty filter means "everything"; a set one means "only this name", so
+ * the countdown cannot be spent on other processes' paths.
+ */
+static bool susfs_vfs_dbg_on(const char *name, unsigned int len)
+{
+	unsigned int want = 0, i;
+
+	if (READ_ONCE(vopen_dbg) <= 0)
+		return false;
+
+	while (want < sizeof(vopen_dbg_name) && vopen_dbg_name[want])
+		want++;
+	/* `echo name > param` may leave the newline in the buffer depending on the kernel's
+	 * sysfs write path, and a filter that silently never matches would look exactly like
+	 * "the component was never judged". */
+	while (want && (vopen_dbg_name[want - 1] == '\n' || vopen_dbg_name[want - 1] == '\r'))
+		want--;
+	if (want) {
+		if (want != len)
+			return false;
+		for (i = 0; i < len; i++)
+			if (vopen_dbg_name[i] != name[i])
+				return false;
+	}
+
+	WRITE_ONCE(vopen_dbg, vopen_dbg - 1);
+	return true;
+}
+
 /* Countdown as well: writing N logs the next N verdict decisions, with their input
  * (dentry name, inode, dev, uid) and their answer, and then stops.  This exists because
  * the device reports a case that cannot happen if the verdict is asked the question the
@@ -630,6 +671,27 @@ static atomic_t n_vopen_fa_ref_miss = ATOMIC_INIT(0);
 static atomic_t n_vopen_wc_hot = ATOMIC_INIT(0);	/* refuse branch taken */
 static atomic_t n_vopen_wc_plain = ATOMIC_INIT(0);	/* ordinary slow lookup */
 static atomic_t n_vopen_wc_cold = ATOMIC_INIT(0);	/* verdict true after a slow lookup */
+
+/*
+ * ENTRY counters: one per copied function, incremented unconditionally at its first
+ * statement, before any branch.  These are the only counters that answer "was OUR
+ * implementation the one that ran" - the branch counters above cannot, because a branch
+ * that is never taken and a function that is never called look the same from them, and
+ * the assembly table cannot either: a point labelled "no bl to the child in the parent"
+ * may be inlined there, may be called through the vfs table (an indirect call the scan
+ * does not recognise), or may not be called by that parent at all.  A counter at the
+ * callee's own body counts all three cases correctly - inlining keeps the body's code.
+ *
+ * Measured need: on the device the verdict ran 3177 times and never judged the trailing
+ * component of /proc/susfs_kstat, while the table called every point on that path ours.
+ */
+static atomic_t n_vopen_enter_link_path_walk = ATOMIC_INIT(0);
+static atomic_t n_vopen_enter_lookup_last = ATOMIC_INIT(0);
+static atomic_t n_vopen_enter_walk_component = ATOMIC_INIT(0);
+static atomic_t n_vopen_enter_step_into = ATOMIC_INIT(0);
+static atomic_t n_vopen_enter_handle_mounts = ATOMIC_INIT(0);
+static atomic_t n_vopen_enter_lookup_fast = ATOMIC_INIT(0);
+static atomic_t n_vopen_enter_lookup_slow = ATOMIC_INIT(0);
 
 /*
  * =====================================================================
@@ -790,7 +852,7 @@ static inline const char *susfs_vfs_kind_name(unsigned int kind)
 	switch (kind) {
 	case SUSFS_VFS_KIND_OURS:		return "ours";
 	case SUSFS_VFS_KIND_PREFER_KERNEL:	return "prefer-kernel";
-	case SUSFS_VFS_KIND_OURS_INLINED:	return "ours-inlined";
+	case SUSFS_VFS_KIND_OURS_INLINED:	return "ours-no-bl";
 	}
 	return "?";
 }
@@ -863,6 +925,7 @@ static struct susfs_vfs_edge susfs_vfs_edges[] = {
 
 #define SUSFS_VFS_A64_BL_MASK	0xfc000000u
 #define SUSFS_VFS_A64_BL	0x94000000u	/* BL: opcode 100101, imm26 */
+#define SUSFS_VFS_A64_B	0x14000000u	/* B: same imm26, a tail call - not an inlining */
 #define SUSFS_VFS_SCAN_INSNS	1024		/* 4 KiB window per parent */
 
 static bool susfs_vfs_parent_calls_child(void *parent, void *child)
@@ -885,7 +948,8 @@ static bool susfs_vfs_parent_calls_child(void *parent, void *child)
 		u32 insn = READ_ONCE(p[i]);
 		long off;
 
-		if ((insn & SUSFS_VFS_A64_BL_MASK) != SUSFS_VFS_A64_BL)
+		if ((insn & SUSFS_VFS_A64_BL_MASK) != SUSFS_VFS_A64_BL &&
+		    (insn & SUSFS_VFS_A64_BL_MASK) != SUSFS_VFS_A64_B)
 			continue;
 		off = (long)((s32)(insn << 6) >> 6);	/* sign-extended imm26 */
 		if ((unsigned long)&p[i] + (unsigned long)(off << 2) == target)
@@ -1141,8 +1205,7 @@ static __nocfi bool susfs_vfs_hidden_inode(struct dentry *dentry, int site)
 	if (hidden)
 		atomic_inc(&n_vopen_verdict_true);
 
-	if (READ_ONCE(vopen_dbg) > 0) {
-		WRITE_ONCE(vopen_dbg, vopen_dbg - 1);
+	if (susfs_vfs_dbg_on((const char *)dentry->d_name.name, dentry->d_name.len)) {
 		/* An input record, not a verdict record: the point is to see which inode the
 		 * walk asked about (d_name/d_inode of the dentry it just resolved) next to
 		 * the uid that the gate is applied to. */
@@ -2193,6 +2256,7 @@ static inline __nocfi int handle_mounts(struct nameidata *nd, struct dentry *den
 			  unsigned int *seqp)
 {
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME_handle_mounts);
+	atomic_inc(&n_vopen_enter_handle_mounts);
 	bool jumped;
 	int ret;
 
@@ -2234,6 +2298,7 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			          unsigned *seqp)
 {
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME_lookup_fast);
+	atomic_inc(&n_vopen_enter_lookup_fast);
 	struct dentry *dentry, *parent = nd->path.dentry;
 	int status = 1;
 
@@ -2377,6 +2442,7 @@ static __nocfi struct dentry *lookup_slow(const struct qstr *name,
 				  unsigned int flags)
 {
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME_lookup_slow);
+	atomic_inc(&n_vopen_enter_lookup_slow);
 	struct inode *inode = dir->d_inode;
 	struct dentry *res;
 	inode_lock_shared(inode);
@@ -2517,6 +2583,7 @@ static __nocfi const char *step_into(struct nameidata *nd, int flags,
 		     struct dentry *dentry, struct inode *inode, unsigned seq)
 {
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME_step_into);
+	atomic_inc(&n_vopen_enter_step_into);
 	struct path path;
 	int err = handle_mounts(nd, dentry, &path, &inode, &seq);
 
@@ -2674,6 +2741,10 @@ static __nocfi const char *handle_dots(struct nameidata *nd, int type)
 static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 {
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME_walk_component);
+	atomic_inc(&n_vopen_enter_walk_component);
+	if (susfs_vfs_dbg_on(nd->last.name, nd->last.len))
+		pr_info("susfs_vfs_open: walk_component name=%.*s type=%d flags=%#x\n",
+			(int)nd->last.len, nd->last.name, nd->last_type, flags);
 	struct dentry *dentry;
 	struct inode *inode;
 	unsigned seq;
@@ -2743,6 +2814,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 static __nocfi int link_path_walk(const char *name, struct nameidata *nd)
 {
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME_link_path_walk);
+	atomic_inc(&n_vopen_enter_link_path_walk);
 	int depth = 0; // depth <= nd->depth
 	int err;
 
@@ -2948,8 +3020,12 @@ static __nocfi const char *path_init(struct nameidata *nd, unsigned flags)
 }
 
 /* ==== copied from namei.c:2426-2474  (lookup_last + handle_lookup_down + path_lookupat) ==== */
-static inline __nocfi const char *lookup_last(struct nameidata *nd)
+static __nocfi const char *lookup_last(struct nameidata *nd)
 {
+	atomic_inc(&n_vopen_enter_lookup_last);
+	if (susfs_vfs_dbg_on(nd->last.name, nd->last.len))
+		pr_info("susfs_vfs_open: lookup_last name=%.*s type=%d\n",
+			(int)nd->last.len, nd->last.name, nd->last_type);
 	if (nd->last_type == LAST_NORM && nd->last.name[nd->last.len])
 		nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
 
@@ -3425,10 +3501,16 @@ void susfs_vfs_open_dump(void)
 		pr_info("susfs_vfs_open: edge %s -> %s: parent=%s child=%s\n",
 			e->parent_name, e->child_name,
 			susfs_vfs_kind_name(e->parent_kind),
-			e->child_called ? "called" :
+			e->child_called ? "called (bl/b to the child)" :
 			(e->child_kind == SUSFS_VFS_KIND_OURS_INLINED ?
-			 "ours-inlined" : "not called"));
+			 "no bl/b seen - inlined, or called through the table, or not called by this parent"
+			 : "not called"));
 	}
+	pr_info("susfs_vfs_open: enter link_path_walk=%d lookup_last=%d walk_component=%d step_into=%d handle_mounts=%d lookup_fast=%d lookup_slow=%d\n",
+		atomic_read(&n_vopen_enter_link_path_walk), atomic_read(&n_vopen_enter_lookup_last),
+		atomic_read(&n_vopen_enter_walk_component), atomic_read(&n_vopen_enter_step_into),
+		atomic_read(&n_vopen_enter_handle_mounts), atomic_read(&n_vopen_enter_lookup_fast),
+		atomic_read(&n_vopen_enter_lookup_slow));
 	pr_info("susfs_vfs_open: resolve rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d wc_hot=%d wc_plain=%d wc_cold=%d\n",
 		atomic_read(&n_vopen_fa_rcu_hit), atomic_read(&n_vopen_fa_rcu_miss),
 		atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
@@ -3475,7 +3557,7 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 			   susfs_vfs_kind_name(e->parent_kind),
 			   (!e->parent || !e->child) ? "unresolved" :
 			   (susfs_vfs_parent_calls_child(e->parent, e->child) ?
-			    "bl <child>" : "no bl <child>"));
+			    "call to child seen" : "no call seen"));
 	}
 
 	seq_puts(m, "\nframe self-check (depth = kernel stack top - frame pointer; 0 = not a frame)\n");
@@ -3487,10 +3569,15 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 			   (void *)r->lr, (void *)r->fp);
 	}
 
-	seq_printf(m, "\narmed=%d enable=%d fake=%d drop=%d drop_fake=%d frame=%d dbg=%d salt=%d\n",
+	seq_printf(m, "\narmed=%d enable=%d fake=%d drop=%d drop_fake=%d 	frame=%d dbg=%d dbg_name=%s salt=%d\n",
 		   (int)READ_ONCE(susfs_vfs_armed), vopen_enable, vopen_fake,
 		   (int)vopen_drop, (int)vopen_drop_fake, vopen_frame, vopen_dbg,
-		   (int)(susfs_vfs_salt != 0));
+		   vopen_dbg_name[0] ? vopen_dbg_name : "-", (int)(susfs_vfs_salt != 0));
+	seq_printf(m, "enter: link_path_walk=%d lookup_last=%d walk_component=%d step_into=%d handle_mounts=%d lookup_fast=%d lookup_slow=%d\n",
+		   atomic_read(&n_vopen_enter_link_path_walk), atomic_read(&n_vopen_enter_lookup_last),
+		   atomic_read(&n_vopen_enter_walk_component), atomic_read(&n_vopen_enter_step_into),
+		   atomic_read(&n_vopen_enter_handle_mounts), atomic_read(&n_vopen_enter_lookup_fast),
+		   atomic_read(&n_vopen_enter_lookup_slow));
 	seq_printf(m, "resolve: rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d | slow: wc_hot=%d wc_plain=%d wc_cold=%d\n",
 		   atomic_read(&n_vopen_fa_rcu_hit), atomic_read(&n_vopen_fa_rcu_miss),
 		   atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
