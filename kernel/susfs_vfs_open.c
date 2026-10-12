@@ -174,6 +174,51 @@
  * to an empty layer that says so once and leaves the existing O_PATH post-check layer
  * as the whole answer, which is also what keeps the eight CI variants building.
  *
+ * PROVENANCE, AND WHY THIS FILE IS HAND-MAINTAINED FROM HERE ON
+ * ------------------------------------------------------------
+ * The copied bodies came out of one specific tree -
+ * C:\Users\ASUS\dsh\workspace\android_kernel_oneplus_sm8550, i.e. the 5.15.180
+ * source this device's kernel was built from - and they were taken function by
+ * function from fs/namei.c (the walk: hash machinery at :2002-2211, the nameidata
+ * block at :564-591, then :593-2474 up to path_lookupat()) and from fs/open.c
+ * (build_open_how :1080-1094, build_open_flags :1096-1213, do_sys_openat2
+ * :1293-1320).  The closure itself - which functions are on the O_PATH path, and
+ * therefore what had to be taken - was worked out in a separate static analysis,
+ * %TEMP%\\opath-vendor\\SCOPE.md; that file (not this comment) is the place to look
+ * for the argument about why each one is in the set, and it is also where the
+ * "variants A/B" question is answered.
+ *
+ * They were extracted and rewritten by a throwaway script (see
+ * susfs4ksu-lkm-notes/tools/opath_vendor/ - archived, NOT in this repository, and
+ * NOT to be re-run against this file any more).  That is the part worth stating
+ * plainly: an earlier round did re-run it, and doing so silently reverted four
+ * hand-made fixes that had already been committed (a forward declaration, one
+ * variable spelled two ways, __nocfi on the init function, and __cond_resched
+ * being optional on this device).  A file whose content is regenerated from
+ * outside the repository will keep losing hand edits, and every other source file
+ * in kernel/ is hand-written anyway - so:
+ *
+ *   ** EDIT THIS FILE DIRECTLY.  Do not regenerate it. **
+ *
+ * The two things the generator did that are easy to get wrong by hand, and that a
+ * reviewer should check on any future edit: (1) every copied body is `__nocfi`
+ * (an instrumented indirect call into the kernel is a panic here, not an error
+ * return - the CI's tools/cfi_sites.py asserts this on the artifact), and (2) no
+ * copied body may call another one by name unless it is one of the points this
+ * file owns - everything else goes through the vfs table, which is filled at load
+ * time.
+ *
+ * Which bodies are NOT verbatim copies, and why (both are stated in full at the
+ * definitions themselves): path_openat() keeps only the O_PATH branch, and
+ * do_o_path() produces its file through dentry_open() instead of
+ * alloc_empty_file()+vfs_open(), because alloc_empty_file() has no entity in this
+ * device's kallsyms.  Everything else is byte-identical to the tree above, except
+ * for four deliberate insertions (the layout gate and the private wrapper, the
+ * refusal in lookup_fast(), the derived-name dispatch in walk_component(), and the
+ * removal of touch_atime()/atime_needs_update() from pick_link() - each of them
+ * carries its own comment) and for the audit_inode() call sites, which are gone
+ * because this kernel has no such symbol.
+ *
  * LF only, English comments, and every comment in here says WHY rather than what.
  */
 
