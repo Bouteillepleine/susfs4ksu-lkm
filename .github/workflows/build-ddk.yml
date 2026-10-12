@@ -295,7 +295,11 @@ jobs:
           #   init_module / susfs_layers_down - the susfs_layers[] init/exit table
           #   susfs_tw_func                   - the supercall command table
           # (The CFI runtime's own __cfi_check is filtered by the tool, not listed here.)
-          ALLOW="init_module,susfs_layers_down,susfs_tw_func"
+          #   do_sys_openat2 / drop_links / path_init / put_link - the vendored walk's own
+          #   functions, reached through susfs_vfs_open.c's module-local function table.  The
+          #   tool reports the CALLEE of such a table entry, and every call site of that table
+          #   sits inside a __nocfi function body (the table itself is filled at load time).
+          ALLOW="init_module,susfs_layers_down,susfs_tw_func,do_sys_openat2,drop_links,path_init,put_link"
           if command -v python3 >/dev/null 2>&1; then PY=python3
           elif command -v python >/dev/null 2>&1; then PY=python
           else

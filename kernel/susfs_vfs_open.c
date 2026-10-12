@@ -3495,7 +3495,7 @@ static int susfs_vfs_check_layout(void)
 	return bad;
 }
 
-int susfs_vfs_open_init(void)
+__nocfi int susfs_vfs_open_init(void)
 {
 	int missing;
 
@@ -3594,7 +3594,7 @@ void susfs_vfs_open_exit(void)
  * existing O_PATH post-check layer (kernel/susfs_opath.c) stays the whole
  * implementation.  This is also what keeps the eight CI variants building.
  */
-int susfs_vfs_open_init(void)
+__nocfi int susfs_vfs_open_init(void)
 {
 	SUSFS_LOGI("susfs_vfs_open: kernel line %u.%u is not supported by the vendored O_PATH open (5.15 only) - keeping the existing O_PATH post-check layer\n",
 		   (LINUX_VERSION_CODE >> 16) & 0xff, (LINUX_VERSION_CODE >> 8) & 0xff);
