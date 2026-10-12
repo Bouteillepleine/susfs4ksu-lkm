@@ -681,6 +681,7 @@ static atomic_t n_vopen_fa_ref_miss = ATOMIC_INIT(0);
 static atomic_t n_vopen_wc_hot = ATOMIC_INIT(0);	/* refuse branch taken */
 static atomic_t n_vopen_wc_plain = ATOMIC_INIT(0);	/* ordinary slow lookup */
 static atomic_t n_vopen_wc_cold = ATOMIC_INIT(0);	/* verdict true after a slow lookup */
+static atomic_t n_vopen_wc_commit = ATOMIC_INIT(0);	/* verdict true at the commit point */
 
 /*
  * ENTRY counters: one per copied function, incremented unconditionally at its first
@@ -1197,10 +1198,16 @@ static __nocfi struct dentry *susfs_vfs_fake_lookup(struct dentry *dir, unsigned
  * disagreeing with inode_getattr/inode_permission).
  */
 /*
- * site: 0 = the RCU hit in lookup_fast(), 1 = the ref-walk hit there, 2 = after a slow
- * lookup in walk_component().  Only the log uses it - it is what makes a "the verdict
- * says no" report say WHERE it said no, which is the difference between the fast path
- * running and the slow path running.
+ * site (only the log uses it; it is what makes a "the verdict says no" report say WHERE
+ * it said no, which is the difference between the fast path running and the slow path
+ * running):
+ *   0  lookup_fast(), RCU hit
+ *   1  lookup_fast(), ref-walk hit
+ *   2  lookup_fast(), the exit where a revalidate had to be redone after
+ *      try_to_unlazy_next() - the way out the device found, which returned the dentry
+ *      with no verdict at all before this fix
+ *   3  walk_component(), after a slow lookup
+ *   4  walk_component(), the commit point, just before step_into()
  */
 static __nocfi bool susfs_vfs_hidden_inode(struct dentry *dentry, int site)
 {
@@ -2327,6 +2334,12 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			return NULL;
 		}
 		atomic_inc(&n_vopen_fa_rcu_hit);
+		if (susfs_vfs_dbg_on(nd->last.name, nd->last.len))
+			pr_info("susfs_vfs_open: lookup_fast rcu hit last=%.*s dentry=%.*s ino=%lu\n",
+				(int)nd->last.len, (const char *)nd->last.name,
+				(int)dentry->d_name.len, (const char *)dentry->d_name.name,
+				(unsigned long)(d_backing_inode(dentry) ?
+						d_backing_inode(dentry)->i_ino : 0));
 
 		/*
 		 * This sequence count validates that the inode matches
@@ -2378,6 +2391,23 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 		if (status == -ECHILD)
 			/* we'd been told to redo it in non-rcu mode */
 			status = vfs.d_revalidate(dentry, nd->flags);
+		/*
+		 * THE EXIT THE FIRST DEVICE RUN WENT THROUGH.  A hit whose revalidate had
+		 * to be redone in ref-walk falls out of the `if (likely(status > 0))` block
+		 * above and returns the dentry from the fall-through at the end of this
+		 * function - so the hidden check that lives inside that block never runs, the
+		 * dentry is committed by walk_component()/step_into(), and a hidden file is
+		 * opened.  Measured: the trailing component of /proc/susfs_kstat reached
+		 * step_into() with lookup_slow=0 and no verdict call at all.
+		 * A reference IS held here (try_to_unlazy_next() took one on the child), so
+		 * the refusal drops it exactly like the ref-walk site above does.
+		 */
+		if (likely(status > 0) && unlikely(susfs_vfs_hidden_inode(dentry, 2))) {
+			susfs_vfs_drop_hidden(dentry);
+			dput(dentry);
+			susfs_vfs_nd_of(nd)->hidden_last = 1;
+			return NULL;
+		}
 	} else {
 		dentry = __d_lookup(parent, &nd->last);
 		if (unlikely(!dentry)) {
@@ -2385,6 +2415,12 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			return NULL;
 		}
 		atomic_inc(&n_vopen_fa_ref_hit);
+		if (susfs_vfs_dbg_on(nd->last.name, nd->last.len))
+			pr_info("susfs_vfs_open: lookup_fast ref hit last=%.*s dentry=%.*s ino=%lu\n",
+				(int)nd->last.len, (const char *)nd->last.name,
+				(int)dentry->d_name.len, (const char *)dentry->d_name.name,
+				(unsigned long)(d_backing_inode(dentry) ?
+						d_backing_inode(dentry)->i_ino : 0));
 		status = vfs.d_revalidate(dentry, nd->flags);
 		if (unlikely(status > 0 && susfs_vfs_hidden_inode(dentry, 1))) {
 			/* The ref-walk half of the refusal above.  A reference IS held here,
@@ -2789,7 +2825,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 			dentry = lookup_slow(&nd->last, nd->path.dentry, nd->flags);
 			atomic_inc(&n_vopen_wc_plain);
 			if (!IS_ERR(dentry) &&
-			    unlikely(susfs_vfs_hidden_inode(dentry, 2))) {
+			    unlikely(susfs_vfs_hidden_inode(dentry, 3))) {
 				/*
 				 * Cold path: the dentry was not in the dcache, so the real
 				 * lookup had to run before the inode was known.  Drop what it
@@ -2809,6 +2845,44 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 	}
 	if (!(flags & WALK_MORE) && nd->depth)
 		vfs.put_link(nd);
+
+	/*
+	 * THE COMMIT-POINT CHECK.  By the time the walk gets here the component IS
+	 * resolved and is about to become nd->path - and this is the one place no branch
+	 * of lookup_fast() can bypass, which is why it exists: the fast-path checks above
+	 * cover the two ways a hit is normally taken, and the device showed a third way
+	 * (a revalidate redone after try_to_unlazy_next()) that returned a hidden dentry
+	 * without ever asking.  The refusal here is the same one, with the same cost
+	 * structure: the resolved dentry is given back, and the name actually handed to
+	 * the filesystem is the derived one, so this component fails the way a component
+	 * that is not there fails.
+	 *
+	 * No double work: when lookup_fast() DID refuse, it left hidden_last set and
+	 * walk_component()'s branch above handles it, so this dentry is never the hidden
+	 * one (it is the derived one, which is not hidden).
+	 */
+	if (unlikely(susfs_vfs_hidden_inode(dentry, 4))) {
+		atomic_inc(&n_vopen_wc_commit);
+		atomic_inc(&n_vopen_hidden);
+		if (nd->flags & LOOKUP_RCU) {
+			/* No reference to the child is held in RCU mode, and the derived-name
+			 * lookup sleeps, so take the same two steps a dcache miss takes: drop
+			 * to ref-walk and let it be resolved again - except that here it will be
+			 * this function's slow path, which is where the derived name is used. */
+			if (!vfs.try_to_unlazy(nd))
+				return ERR_PTR(-ECHILD);
+		} else {
+			/* A reference IS held: give it back, and drop it from the cache when
+			 * the tuning asks for it. */
+			susfs_vfs_drop_hidden(dentry);
+			dput(dentry);
+		}
+		dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
+		if (IS_ERR(dentry))
+			return ERR_CAST(dentry);
+		inode = NULL;	/* handle_mounts() derives it again, in ref-walk */
+		seq = 0;
+	}
 	return step_into(nd, flags, dentry, inode, seq);
 }
 
@@ -3521,11 +3595,11 @@ void susfs_vfs_open_dump(void)
 		atomic_read(&n_vopen_enter_walk_component), atomic_read(&n_vopen_enter_step_into),
 		atomic_read(&n_vopen_enter_handle_mounts), atomic_read(&n_vopen_enter_lookup_fast),
 		atomic_read(&n_vopen_enter_lookup_slow));
-	pr_info("susfs_vfs_open: resolve rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d wc_hot=%d wc_plain=%d wc_cold=%d\n",
+	pr_info("susfs_vfs_open: resolve rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d wc_hot=%d wc_plain=%d wc_cold=%d wc_commit=%d\n",
 		atomic_read(&n_vopen_fa_rcu_hit), atomic_read(&n_vopen_fa_rcu_miss),
 		atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
 		atomic_read(&n_vopen_wc_hot), atomic_read(&n_vopen_wc_plain),
-		atomic_read(&n_vopen_wc_cold));
+		atomic_read(&n_vopen_wc_cold), atomic_read(&n_vopen_wc_commit));
 	pr_info("susfs_vfs_open: verdict calls=%d true=%d | derived name try=%d neg=%d enoent=%d other=%d\n",
 		atomic_read(&n_vopen_verdict_calls), atomic_read(&n_vopen_verdict_true),
 		atomic_read(&n_vopen_fake_try), atomic_read(&n_vopen_fake_neg),
@@ -3588,11 +3662,11 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 		   atomic_read(&n_vopen_enter_walk_component), atomic_read(&n_vopen_enter_step_into),
 		   atomic_read(&n_vopen_enter_handle_mounts), atomic_read(&n_vopen_enter_lookup_fast),
 		   atomic_read(&n_vopen_enter_lookup_slow));
-	seq_printf(m, "resolve: rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d | slow: wc_hot=%d wc_plain=%d wc_cold=%d\n",
+	seq_printf(m, "resolve: rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d | slow: wc_hot=%d wc_plain=%d wc_cold=%d wc_commit=%d\n",
 		   atomic_read(&n_vopen_fa_rcu_hit), atomic_read(&n_vopen_fa_rcu_miss),
 		   atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
 		   atomic_read(&n_vopen_wc_hot), atomic_read(&n_vopen_wc_plain),
-		   atomic_read(&n_vopen_wc_cold));
+		   atomic_read(&n_vopen_wc_cold), atomic_read(&n_vopen_wc_commit));
 	seq_printf(m, "verdict: calls=%d true=%d | derived name: try=%d neg=%d enoent=%d other=%d collide=%d\n",
 		   atomic_read(&n_vopen_verdict_calls), atomic_read(&n_vopen_verdict_true),
 		   atomic_read(&n_vopen_fake_try), atomic_read(&n_vopen_fake_neg),
