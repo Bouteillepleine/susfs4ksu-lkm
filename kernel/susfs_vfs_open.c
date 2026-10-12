@@ -1394,14 +1394,34 @@ struct susfs_vfs_nd {
 static_assert(offsetof(struct susfs_vfs_nd, nd) == 0);
 
 /*
- * container_of() and nothing else: every walk that reaches this file starts in
- * do_filp_open() below - this file's own copy, and the only place set_nameidata() is
- * called - so every `struct nameidata *` on this path is the first member of one of
- * these.  No kernel copy of a function here can be holding one of our pointers
- * instead, because the private field is only touched by points bound to our own
- * copies (lookup_fast, walk_component, __set_nameidata).
+ * container_of(), and reached through a FUNCTION and not through a macro - which is a
+ * lesson this file paid for in CI.  The wrapper is only ever entered from this file's
+ * own walks: every one of them starts in do_filp_open() below, which is the only place
+ * set_nameidata() is called, and the private field is only touched by points bound to
+ * our own copies (lookup_fast, walk_component, __set_nameidata), so no kernel copy of
+ * a function can be holding one of these pointers instead.
+ *
+ * It was `#define SUSFS_VFS_ND(nd) container_of((nd), struct susfs_vfs_nd, nd)` first,
+ * and that is subtly wrong: a function-like macro substitutes its argument into EVERY
+ * occurrence of the parameter, including the one that has to stay the MEMBER NAME.  So
+ * the definition happened to be right only for call sites whose expression was spelled
+ * `nd`; SUSFS_VFS_ND(p) - the __set_nameidata() call site, where the variable is called
+ * p - expanded into container_of((p), struct susfs_vfs_nd, p), i.e. into a search for a
+ * member named `p`.  container_of() checks precisely that with __same_type()
+ * (include/linux/kernel.h:497), so the build failed with
+ *
+ *     error: no member named 'p' in 'struct susfs_vfs_nd'
+ *
+ * A static inline function cannot have that failure mode: its parameter is an ordinary
+ * local name and the member name stays a literal.  This is called on the hot path
+ * (lookup_fast, walk_component), and it costs nothing there because the compiler inlines
+ * it - the whole body is an address adjustment plus the same __same_type() check, which
+ * is compile-time.
  */
-#define SUSFS_VFS_ND(nd)	container_of((nd), struct susfs_vfs_nd, nd)
+static inline struct susfs_vfs_nd *susfs_vfs_nd_of(struct nameidata *nd)
+{
+	return container_of(nd, struct susfs_vfs_nd, nd);
+}
 
 #define ND_ROOT_PRESET 1
 #define ND_ROOT_GRABBED 2
@@ -1416,7 +1436,7 @@ static __nocfi void __set_nameidata(struct nameidata *p, int dfd, struct filenam
 	 * initialised on EVERY walk: the wrapper is an uninitialised stack object in
 	 * do_filp_open(), and hidden_last is read by walk_component() on the first
 	 * component of that walk. */
-	SUSFS_VFS_ND(p)->hidden_last = 0;
+	susfs_vfs_nd_of(p)->hidden_last = 0;
 
 	p->stack = p->internal;
 	p->depth = 0;
@@ -2178,7 +2198,7 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 				 */
 				if (!vfs.try_to_unlazy(nd))
 					return ERR_PTR(-ECHILD);
-				SUSFS_VFS_ND(nd)->hidden_last = 1;
+				susfs_vfs_nd_of(nd)->hidden_last = 1;
 				return NULL;
 			}
 			return dentry;
@@ -2201,7 +2221,7 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			 * of a cache hit.  That is why it is not the default. */
 			susfs_vfs_drop_hidden(dentry);
 			dput(dentry);
-			SUSFS_VFS_ND(nd)->hidden_last = 1;
+			susfs_vfs_nd_of(nd)->hidden_last = 1;
 			return NULL;
 		}
 	}
@@ -2573,7 +2593,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 	if (IS_ERR(dentry))
 		return ERR_CAST(dentry);
 	if (unlikely(!dentry)) {
-		if (unlikely(SUSFS_VFS_ND(nd)->hidden_last)) {
+		if (unlikely(susfs_vfs_nd_of(nd)->hidden_last)) {
 			/*
 			 * lookup_fast() refused a hit because the component is hidden.  Do
 			 * NOT look the real name up now: that lookup would SUCCEED (the file
@@ -2582,7 +2602,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 			 * name is looked up instead, so this component fails with the cost
 			 * structure of a component that is not there.
 			 */
-			SUSFS_VFS_ND(nd)->hidden_last = 0;
+			susfs_vfs_nd_of(nd)->hidden_last = 0;
 			atomic_inc(&n_vopen_hidden);
 			dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
 		} else {
