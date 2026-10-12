@@ -547,6 +547,20 @@ module_param_named(vopen_drop, vopen_drop, bool, 0644);
 bool vopen_drop_fake;
 module_param_named(vopen_drop_fake, vopen_drop_fake, bool, 0644);
 
+/* Countdown as well: writing N logs the next N verdict decisions, with their input
+ * (dentry name, inode, dev, uid) and their answer, and then stops.  This exists because
+ * the device reports a case that cannot happen if the verdict is asked the question the
+ * code thinks it asks: the post-check layer - the same predicate, in the same task, on
+ * the inode this layer's walk handed out - answers HIDDEN for /proc/susfs_kstat while
+ * this layer's own verdict answers "not hidden" for every one of 8640 walks (hidden=0,
+ * fa_* whatever, old layer deny +8000).  Two calls that cannot differ must not be
+ * guessed about, so from here on the verdict prints its input. */
+int vopen_dbg;
+module_param_named(vopen_dbg, vopen_dbg, int, 0644);
+
+/* Not a switch: writing N logs the next N frames and then stops by itself, so a
+ * benchmark run cannot turn the self-check into a dmesg flood whose own cost would then
+ * be part of the measurement.  Write it again for another batch. */
 int vopen_frame;
 module_param_named(vopen_frame, vopen_frame, int, 0644);
 
@@ -575,6 +589,47 @@ static atomic_t n_vopen_err = ATOMIC_INIT(0);
  * resolver). */
 static unsigned int n_vopen_leaf_missing;
 static unsigned int n_vopen_leaf_zero;
+
+/*
+ * ---- diagnostics that exist because the first device run could not be read ----------
+ *
+ * The first measurement on the device left three questions open, and all three are
+ * answerable only by counting the right events:
+ *
+ *   - `faked` stayed 0 while the refuse path was clearly not costing what it should.
+ *     The counter sat AFTER `if (IS_ERR(d)) return d;` in susfs_vfs_fake_lookup(), and
+ *     that is a place the common outcome on THIS device never reaches: procfs answers a
+ *     lookup of a name that does not exist with ERR_PTR(-ENOENT) (fs/proc/generic.c:261,
+ *     fs/proc/base.c:2335) rather than handing back a negative dentry, and
+ *     __lookup_slow() propagates that error verbatim (fs/namei.c:1663-1668).  So the
+ *     counter could not distinguish "the refusal never ran" from "the refusal ran and
+ *     the filesystem said ENOENT the way it always does".  The attempt and its outcome
+ *     are now counted separately.
+ *   - whether the verdict is even CONSULTED for the last component, and what it
+ *     answered.  n_vopen_hidden counts the refuse branch of walk_component() (a
+ *     different event), so on its own it cannot say which of the two broke.
+ *   - which of the seven resolution paths each component took.  That is what turns
+ *     "A is 1us cheaper than B" into "A did these steps and not those".
+ */
+static atomic_t n_vopen_fake_try = ATOMIC_INIT(0);	/* derived-name lookup attempted */
+static atomic_t n_vopen_fake_neg = ATOMIC_INIT(0);	/* ... came back as a negative dentry */
+static atomic_t n_vopen_fake_enoent = ATOMIC_INIT(0);	/* ... fs answered -ENOENT (procfs) */
+static atomic_t n_vopen_fake_other = ATOMIC_INIT(0);	/* ... some other error */
+
+/* The verdict counted at its own site: `calls` proves the check is reached for a
+ * component, `true` proves the inode matched.  Compared with n_vopen_hidden (the refuse
+ * branch) this says whether the verdict and the refusal are wired to each other. */
+static atomic_t n_vopen_verdict_calls = ATOMIC_INIT(0);
+static atomic_t n_vopen_verdict_true = ATOMIC_INIT(0);
+
+/* Where each component was resolved. */
+static atomic_t n_vopen_fa_rcu_hit = ATOMIC_INIT(0);
+static atomic_t n_vopen_fa_rcu_miss = ATOMIC_INIT(0);
+static atomic_t n_vopen_fa_ref_hit = ATOMIC_INIT(0);
+static atomic_t n_vopen_fa_ref_miss = ATOMIC_INIT(0);
+static atomic_t n_vopen_wc_hot = ATOMIC_INIT(0);	/* refuse branch taken */
+static atomic_t n_vopen_wc_plain = ATOMIC_INIT(0);	/* ordinary slow lookup */
+static atomic_t n_vopen_wc_cold = ATOMIC_INIT(0);	/* verdict true after a slow lookup */
 
 /*
  * =====================================================================
@@ -931,8 +986,11 @@ static __nocfi noinline void susfs_vfs_frame_note(unsigned int slot,
 	r->depth = (fp && fp < top && top - fp < THREAD_SIZE) ?
 		   (unsigned int)(top - fp) : 0;
 
-	if (READ_ONCE(vopen_frame)) {
+	if (READ_ONCE(vopen_frame) > 0) {
 		char buf[KSYM_SYMBOL_LEN];
+
+		/* the countdown itself (see the parameter's comment) */
+		WRITE_ONCE(vopen_frame, vopen_frame - 1);
 		char *mod = NULL;
 
 		if (ksu_symbol_name_of(lr, buf, &mod) && buf[0])
@@ -1012,11 +1070,22 @@ static __nocfi struct dentry *susfs_vfs_fake_lookup(struct dentry *dir, unsigned
 				       SUSFS_VFS_FAKE_LEN);
 	fake.name = (const unsigned char *)name;
 
+	atomic_inc(&n_vopen_fake_try);
 	d = lookup_slow(&fake, dir, flags & ~(LOOKUP_RCU | LOOKUP_PARENT));
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		/* Counted by outcome and not by "did it return a dentry": on procfs the
+		 * answer to a name that is not there IS an error (ERR_PTR(-ENOENT),
+		 * fs/proc/generic.c:261), which is why the original counter - written after
+		 * this test - read 0 on a device where every derived-name lookup had in fact
+		 * run. */
+		if (PTR_ERR(d) == -ENOENT)
+			atomic_inc(&n_vopen_fake_enoent);
+		else
+			atomic_inc(&n_vopen_fake_other);
 		return d;
-
+	}
 	atomic_inc(&n_vopen_faked);
+	atomic_inc(&n_vopen_fake_neg);
 
 	if (unlikely(d_is_positive(d))) {
 		/* The derived name exists.  Not supposed to be reachable (the name is
@@ -1053,11 +1122,35 @@ static __nocfi struct dentry *susfs_vfs_fake_lookup(struct dentry *dir, unsigned
  * the same inode (a second implementation is how the O_PATH answer would start
  * disagreeing with inode_getattr/inode_permission).
  */
-static __nocfi bool susfs_vfs_hidden_inode(struct inode *inode)
+/*
+ * site: 0 = the RCU hit in lookup_fast(), 1 = the ref-walk hit there, 2 = after a slow
+ * lookup in walk_component().  Only the log uses it - it is what makes a "the verdict
+ * says no" report say WHERE it said no, which is the difference between the fast path
+ * running and the slow path running.
+ */
+static __nocfi bool susfs_vfs_hidden_inode(struct dentry *dentry, int site)
 {
+	struct inode *inode = d_backing_inode(dentry);
+	bool hidden;
+
 	if (!inode || !READ_ONCE(susfs_vfs_armed))
 		return false;
-	return sus_path_inode_hidden_public(inode);
+
+	atomic_inc(&n_vopen_verdict_calls);
+	hidden = sus_path_inode_hidden_public(inode);
+	if (hidden)
+		atomic_inc(&n_vopen_verdict_true);
+
+	if (READ_ONCE(vopen_dbg) > 0) {
+		WRITE_ONCE(vopen_dbg, vopen_dbg - 1);
+		/* An input record, not a verdict record: the point is to see which inode the
+		 * walk asked about (d_name/d_inode of the dentry it just resolved) next to
+		 * the uid that the gate is applied to. */
+		pr_info("susfs_vfs_open: verdict site=%d dentry=%.*s ino=%lu dev=%u uid=%u -> hidden=%d\n",
+			site, (int)dentry->d_name.len, (const char *)dentry->d_name.name,
+			inode->i_ino, inode->i_sb->s_dev, current_uid().val, (int)hidden);
+	}
+	return hidden;
 }
 
 static __nocfi void susfs_vfs_drop_hidden(struct dentry *dentry)
@@ -2153,10 +2246,12 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 		unsigned seq;
 		dentry = __d_lookup_rcu(parent, &nd->last, &seq);
 		if (unlikely(!dentry)) {
+			atomic_inc(&n_vopen_fa_rcu_miss);
 			if (!vfs.try_to_unlazy(nd))
 				return ERR_PTR(-ECHILD);
 			return NULL;
 		}
+		atomic_inc(&n_vopen_fa_rcu_hit);
 
 		/*
 		 * This sequence count validates that the inode matches
@@ -2179,7 +2274,7 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 		*seqp = seq;
 		status = vfs.d_revalidate(dentry, nd->flags);
 		if (likely(status > 0)) {
-			if (unlikely(susfs_vfs_hidden_inode(d_backing_inode(dentry)))) {
+			if (unlikely(susfs_vfs_hidden_inode(dentry, 0))) {
 				/*
 				 * A HIDDEN COMPONENT - AND THE ANSWER IS NOT PRODUCED HERE.
 				 *
@@ -2210,10 +2305,13 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			status = vfs.d_revalidate(dentry, nd->flags);
 	} else {
 		dentry = __d_lookup(parent, &nd->last);
-		if (unlikely(!dentry))
+		if (unlikely(!dentry)) {
+			atomic_inc(&n_vopen_fa_ref_miss);
 			return NULL;
+		}
+		atomic_inc(&n_vopen_fa_ref_hit);
 		status = vfs.d_revalidate(dentry, nd->flags);
-		if (unlikely(status > 0 && susfs_vfs_hidden_inode(d_backing_inode(dentry)))) {
+		if (unlikely(status > 0 && susfs_vfs_hidden_inode(dentry, 1))) {
 			/* The ref-walk half of the refusal above.  A reference IS held here,
 			 * so the dentry can also be taken out of the dcache when the tuning
 			 * asks for it (vopen_drop) - which makes the NEXT lookup of this path
@@ -2603,12 +2701,14 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 			 * structure of a component that is not there.
 			 */
 			susfs_vfs_nd_of(nd)->hidden_last = 0;
+			atomic_inc(&n_vopen_wc_hot);
 			atomic_inc(&n_vopen_hidden);
 			dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
 		} else {
 			dentry = lookup_slow(&nd->last, nd->path.dentry, nd->flags);
+			atomic_inc(&n_vopen_wc_plain);
 			if (!IS_ERR(dentry) &&
-			    unlikely(susfs_vfs_hidden_inode(d_backing_inode(dentry)))) {
+			    unlikely(susfs_vfs_hidden_inode(dentry, 2))) {
 				/*
 				 * Cold path: the dentry was not in the dcache, so the real
 				 * lookup had to run before the inode was known.  Drop what it
@@ -2616,6 +2716,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 				 * a name that is not there costs instead of what a lookup that
 				 * succeeded and was thrown away costs.
 				 */
+				atomic_inc(&n_vopen_wc_cold);
 				atomic_inc(&n_vopen_cold);
 				susfs_vfs_drop_hidden(dentry);
 				dput(dentry);
@@ -3328,6 +3429,15 @@ void susfs_vfs_open_dump(void)
 			(e->child_kind == SUSFS_VFS_KIND_OURS_INLINED ?
 			 "ours-inlined" : "not called"));
 	}
+	pr_info("susfs_vfs_open: resolve rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d wc_hot=%d wc_plain=%d wc_cold=%d\n",
+		atomic_read(&n_vopen_fa_rcu_hit), atomic_read(&n_vopen_fa_rcu_miss),
+		atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
+		atomic_read(&n_vopen_wc_hot), atomic_read(&n_vopen_wc_plain),
+		atomic_read(&n_vopen_wc_cold));
+	pr_info("susfs_vfs_open: verdict calls=%d true=%d | derived name try=%d neg=%d enoent=%d other=%d\n",
+		atomic_read(&n_vopen_verdict_calls), atomic_read(&n_vopen_verdict_true),
+		atomic_read(&n_vopen_fake_try), atomic_read(&n_vopen_fake_neg),
+		atomic_read(&n_vopen_fake_enoent), atomic_read(&n_vopen_fake_other));
 	pr_info("susfs_vfs_open: assembly %u kernel / %u ours / %u inlined (of %u points), leaves %u (absent %u, present-at-0 %u), armed=%d\n",
 		k, o, in, (unsigned int)ARRAY_SIZE(susfs_vfs_bindings),
 		(unsigned int)ARRAY_SIZE(susfs_vfs_leaves), n_vopen_leaf_missing,
@@ -3377,10 +3487,20 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 			   (void *)r->lr, (void *)r->fp);
 	}
 
-	seq_printf(m, "\narmed=%d enable=%d fake=%d drop=%d drop_fake=%d frame=%d salt=%d\n",
+	seq_printf(m, "\narmed=%d enable=%d fake=%d drop=%d drop_fake=%d frame=%d dbg=%d salt=%d\n",
 		   (int)READ_ONCE(susfs_vfs_armed), vopen_enable, vopen_fake,
-		   (int)vopen_drop, (int)vopen_drop_fake, vopen_frame,
+		   (int)vopen_drop, (int)vopen_drop_fake, vopen_frame, vopen_dbg,
 		   (int)(susfs_vfs_salt != 0));
+	seq_printf(m, "resolve: rcu_hit=%d rcu_miss=%d ref_hit=%d ref_miss=%d | slow: wc_hot=%d wc_plain=%d wc_cold=%d\n",
+		   atomic_read(&n_vopen_fa_rcu_hit), atomic_read(&n_vopen_fa_rcu_miss),
+		   atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
+		   atomic_read(&n_vopen_wc_hot), atomic_read(&n_vopen_wc_plain),
+		   atomic_read(&n_vopen_wc_cold));
+	seq_printf(m, "verdict: calls=%d true=%d | derived name: try=%d neg=%d enoent=%d other=%d collide=%d\n",
+		   atomic_read(&n_vopen_verdict_calls), atomic_read(&n_vopen_verdict_true),
+		   atomic_read(&n_vopen_fake_try), atomic_read(&n_vopen_fake_neg),
+		   atomic_read(&n_vopen_fake_enoent), atomic_read(&n_vopen_fake_other),
+		   atomic_read(&n_vopen_collide));
 	seq_printf(m, "seen=%d opath=%d hidden=%d faked=%d cold=%d dropped=%d collide=%d err=%d\n",
 		   atomic_read(&n_vopen_seen), atomic_read(&n_vopen_opath),
 		   atomic_read(&n_vopen_hidden), atomic_read(&n_vopen_faked),
