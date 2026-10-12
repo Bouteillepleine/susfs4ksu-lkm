@@ -1,0 +1,111 @@
+name: gitee-release
+
+# Publishes a GitHub release's ASSETS to Gitee as a release of its own.  This repository
+# is not mirrored as source there any more: what a reader in China needs from Gitee is the
+# built artifact - the eight .ko files and the loader - not a second copy of the tree.
+#
+# Triggered by a published GitHub release, and by hand (workflow_dispatch) to seed or to
+# re-upload after a release was edited in place.  Assets already present on the Gitee side
+# with the same name are replaced: a release asset is a build output, and the r18 release
+# was updated in place once already.
+#
+# Configuration, once, in this repository's settings (never in this file):
+#   secret   GITEE_TOKEN  a Gitee personal access token with the `projects` scope
+#   variable GITEE_REPO   owner/name on gitee.com, e.g. "someone/susfs4ksu-lkm"
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub release tag to publish to Gitee (default: the latest release)"
+        required: false
+        default: ""
+
+concurrency:
+  group: gitee-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_REPO: ${{ vars.GITEE_REPO }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+    steps:
+      - name: Check configuration
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_TOKEN}" ]; then
+            echo "GITEE_TOKEN is not configured - nothing is published (see this workflow's header)"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+          if [ -z "${GITEE_REPO}" ]; then
+            echo "::error::GITEE_REPO is not configured - set it to owner/name on gitee.com"
+            exit 1
+          fi
+          if [ -z "${TAG}" ]; then
+            echo "no tag given - using the latest release"
+            echo "TAG=$(gh release view --repo ${GITHUB_REPOSITORY} --json tagName -q .tagName)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download the release assets
+        if: env.SKIP != '1'
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir assets --clobber
+          ls -la assets
+
+      - name: Create (or find) the Gitee release
+        if: env.SKIP != '1'
+        id: rel
+        env:
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+
+          body=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json body -q .body || echo "")
+          name=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json name -q .name || echo "${TAG}")
+
+          # Gitee's release API takes the tag that must already exist there, which the old
+          # source mirror created.  A missing tag is a real error: publishing assets against
+          # a tag nobody can check out would hand out builds with no matching source.
+          id=$(curl -sf -X POST -H "Content-Type: application/json" \
+                 -d "$(jq -nc --arg t "$TAG" --arg n "$name" --arg b "$body" \
+                        '{access_token: $token, tag_name: $t, name: $n, body: $b, target_commitish: "main", prerelease: false}' \
+                        --arg token "$GITEE_TOKEN")" \
+                 "${api}/releases" | jq -r '.id' || true)
+
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "release for ${TAG} already exists on Gitee - reusing it"
+            id=$(curl -sf "${api}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq -r '.id')
+          fi
+          echo "release id: ${id}"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the assets
+        if: env.SKIP != '1'
+        env:
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+          id="${{ steps.rel.outputs.id }}"
+
+          for f in assets/*; do
+            echo "uploading $(basename "$f") ($(stat -c%s "$f") bytes)"
+            curl -sf -X POST "${api}/releases/${id}/attach_files?access_token=${GITEE_TOKEN}" \
+                 -F "file=@$f" -o /dev/null
+          done
+
+          echo "--- the release as Gitee sees it ---"
+          curl -sf "${api}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq -r '.assets[]? | "\(.name) \(.size)"'
