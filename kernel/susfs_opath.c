@@ -107,6 +107,15 @@ static inline bool opath_has_landing_pad(const void *fn)
  * instead (the counters and the log say which name was missing). */
 static struct file *(*opath_fget_raw)(unsigned int fd);
 static int (*opath_close_fd_get_file)(unsigned int fd, struct file **res);
+/* ...and the two the dentry-drop experiment needs (opath_drop_dentry).  Resolved by name for
+ * the same reason as everything else here, and one more: taking their addresses directly would
+ * put new names into the module's undefined-symbol list, which the loaders and the CI's symbol
+ * gates read - an experiment must not move those.
+ * dget() is deliberately NOT in this list: on 5.15 it is a static inline in <linux/dcache.h>
+ * (lockref_get of d_lockref) with no kallsyms entry at all - measured on the device - so the
+ * inline is called directly below. */
+static void (*opath_d_invalidate)(struct dentry *dentry);
+static void (*opath_dput)(struct dentry *dentry);
 /* Which of the two names the kernel above answered to (see susfs_opath_init): only the log
  * needs it, and a log that prints a pointer without the name it came from cannot tell
  * close_fd_get_file from file_close_fd on a kernel where one of them is missing. */
@@ -119,12 +128,28 @@ static atomic_t n_opath_opath = ATOMIC_INIT(0);	/* of those, the O_PATH ones */
 static atomic_t n_opath_hidden = ATOMIC_INIT(0);	/* of those, sus_path said hidden */
 static atomic_t n_opath_deny = ATOMIC_INIT(0);	/* of those, the fd was taken away */
 static atomic_t n_opath_err = ATOMIC_INIT(0);	/* lookups that failed, or an fd not ours */
+static atomic_t n_opath_dropped = ATOMIC_INIT(0);	/* deny path: dentries invalidated (opath_drop_dentry) */
 
 int opath_test;
 module_param_named(opath_test, opath_test, int, 0644);
 
 int opath_dump;
 module_param_named(opath_dump, opath_dump, int, 0644);
+
+/* EXPERIMENT (2026-10-11).  Measured on the device with susfs_bench -p 7: a hidden path answers
+ * -ENOENT about 1.3 us FASTER than a path that does not exist at all (2787 vs 4092 ns at p50,
+ * 30/30 samples, perfectly separable) - because the hidden path took a successful, cached
+ * lookup and was then refused, while the other one paid a real lookup that failed.  If that is
+ * where the whole gap comes from, invalidating the hidden path's dentry on the way out closes it
+ * without vendoring a walk: the next lookup of that path is a real one again.
+ *
+ * Runtime-writable on purpose, so both states can be compared inside ONE loaded module:
+ *     echo 1 > /sys/module/susfs_guard_lkm/parameters/opath_drop_dentry
+ * It is an experiment, not the fix: the dentry is dropped for every caller (root re-looks it up
+ * and still sees the file, the LSM gate decides that), and a hidden path that is opened in a
+ * loop now pays a real lookup each time. */
+bool opath_drop_dentry;
+module_param_named(opath_drop_dentry, opath_drop_dentry, bool, 0644);
 
 /* Set by susfs_opath_exit() before it touches anything; read by the arm path.  There is no
  * lock around it, and that is deliberate - see the note in susfs_opath_exit(). */
@@ -165,10 +190,23 @@ static __nocfi long susfs_opath_post(long ret)
 
 	hidden = sus_path_inode_hidden_public(d_inode(f->f_path.dentry));
 
-	/* Release before deciding: the deny path takes an fd-table lock, and holding a file
-	 * reference across it buys nothing (the file is in this task's table and cannot go
-	 * away while its own syscall is running). */
-	fput(f);
+	/* The experiment: drop the dentry so that the NEXT lookup of this path is a real one.
+	 * dget() first, because d_invalidate() may drop the last reference while the file still
+	 * holds one - and it has to happen before fput(f), since the dentry comes from that file. */
+	if (hidden && READ_ONCE(opath_drop_dentry) && opath_d_invalidate && opath_dput) {
+		struct dentry *drop = f->f_path.dentry;
+
+		dget(drop);
+		fput(f);
+		opath_d_invalidate(drop);
+		opath_dput(drop);
+		atomic_inc(&n_opath_dropped);
+	} else {
+		/* Release before deciding: the deny path takes an fd-table lock, and holding a file
+		 * reference across it buys nothing (the file is in this task's table and cannot go
+		 * away while its own syscall is running). */
+		fput(f);
+	}
 
 	if (!hidden)
 		return ret;
@@ -414,10 +452,11 @@ static int opath_proc_show(struct seq_file *m, void *v)
 	 * counters are what a bring-up is judged by - seen without opath means the wrapper runs
 	 * and every open it sees is not an O_PATH one, and hidden without deny would mean the fd
 	 * was not taken away. */
-	seq_printf(m, "seen=%d opath=%d hidden=%d deny=%d err=%d (opath_test=%d opath_dump=%d)\n",
+	seq_printf(m, "seen=%d opath=%d hidden=%d deny=%d err=%d dropped=%d (opath_test=%d opath_dump=%d opath_drop_dentry=%d)\n",
 		   atomic_read(&n_opath_seen), atomic_read(&n_opath_opath),
 		   atomic_read(&n_opath_hidden), atomic_read(&n_opath_deny),
-		   atomic_read(&n_opath_err), opath_test, opath_dump);
+		   atomic_read(&n_opath_err), atomic_read(&n_opath_dropped),
+		   opath_test, opath_dump, (int)opath_drop_dentry);
 	return 0;
 }
 
@@ -441,6 +480,18 @@ int susfs_opath_init(void)
 	}
 
 	opath_fget_raw = (void *)find_kernel_symbol_exact("fget_raw");
+
+	/* The three the dentry-drop experiment needs.  Only required when the switch is on: with
+	 * opath_drop_dentry=0 they are never called, and a kernel that has none of them should not
+	 * lose the layer over an experiment.  Turning the switch off when a name is missing is the
+	 * honest answer - a silently half-wired experiment would measure nothing. */
+	opath_d_invalidate = (void *)find_kernel_symbol_exact("d_invalidate");
+	opath_dput = (void (*)(struct dentry *))find_kernel_symbol_exact("dput");
+	if (opath_drop_dentry && (!opath_d_invalidate || !opath_dput)) {
+		pr_warn("opath: opath_drop_dentry is on but d_invalidate=%px dput=%px - the experiment stays off\n",
+			(void *)opath_d_invalidate, (void *)opath_dput);
+		opath_drop_dentry = false;
+	}
 
 	/* One function, two names: 6.11 reworked the fd-table internals, so what 5.15 calls
 	 * close_fd_get_file() (fs/file.c:795-805) is file_close_fd() from 6.12 on
