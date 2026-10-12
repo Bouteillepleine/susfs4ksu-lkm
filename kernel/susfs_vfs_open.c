@@ -148,11 +148,17 @@
  * ->get_link, and it reads nd->flags, nd->path, nd->inode and nd->state while the
  * struct lives on THIS MODULE'S stack.  A layout mismatch is not an error return, it
  * is silent corruption, and no compiler on the build host can see it: the struct is
- * file-local in fs/namei.c and is not in the DDK headers at all.  Everything that is
- * checkable here is asserted (see the asserts after the struct); the absolute size and
- * the offsets of `internal` and `state` can only be read off the device, and those are
- * gated at load time by vopen_nd_size / vopen_nd_internal / vopen_nd_state, which stay
- * 0 ("not checked") until an operator fills them in from the device's BTF.
+ * file-local in fs/namei.c and is not in the DDK headers at all.
+ *
+ * Everything of ours therefore lives OUTSIDE that struct: the walk's private state is
+ * in struct susfs_vfs_nd, whose first member is the struct itself, so the address
+ * handed to current->nameidata is the kernel's layout and the kernel never sees our
+ * bytes.  The three layout numbers of the device (sizeof 224, offsetof(state) 60,
+ * offsetof(internal) 96) are static_assert'd in the build and re-checked at load time
+ * against the same three module parameters, which stay 0 ("not checked") until an
+ * operator fills them in from the device's BTF.  The device gate caught a real defect
+ * once - an appended private field made our copy 240 bytes - which is why the private
+ * state is a wrapper now.
  *
  * 5.10 AND 6.x ARE NOT SUPPORTED, ON PURPOSE
  * -----------------------------------------
@@ -253,17 +259,6 @@ static_assert(offsetof(struct open_flags, intent) == 12);
 static_assert(offsetof(struct open_flags, lookup_flags) == 16);
 
 /*
- * The private tail of struct nameidata.  Appended, never carved out of the kernel's
- * fields - see the comment at the struct itself.
- */
-#define SUSFS_VFS_ND_MAGIC	0x53555346564f5045ULL	/* "SUSFVOPE" */
-
-struct susfs_nd_private {
-	u64 magic;
-	u64 hidden_last;	/* this component's hit was refused as hidden */
-};
-
-/*
  * =====================================================================
  * 2. The leaf dependencies - every kernel function this file calls
  * =====================================================================
@@ -295,8 +290,6 @@ static int            (*susfs_k___fsnotify_parent)(struct dentry *, __u32, const
 static void *         (*susfs_k___kmalloc)(size_t, gfp_t);
 static int            (*susfs_k___legitimize_mnt)(struct vfsmount *, unsigned);
 static struct mount * (*susfs_k___lookup_mnt)(struct vfsmount *, struct dentry *);
-static int            (*susfs_k___cond_resched)(void);
-static bool           (*susfs_k_atime_needs_update)(const struct path *, struct inode *);
 static void           (*susfs_k_audit_log_path_denied)(int, const char *);
 static struct dentry * (*susfs_k_d_alloc_parallel)(struct dentry *, const struct qstr *, wait_queue_head_t *);
 static int            (*susfs_k_d_invalidate)(struct dentry *);
@@ -324,15 +317,10 @@ static void           (*susfs_k_path_put)(const struct path *);
 static void           (*susfs_k_put_unused_fd)(unsigned int);
 static void           (*susfs_k_putname)(struct filename *);
 static int            (*susfs_k_security_inode_follow_link)(struct dentry *, struct inode *, bool);
-static void           (*susfs_k_touch_atime)(const struct path *);
 static seqlock_t      *susfs_k_mount_lock;
 static seqlock_t      *susfs_k_rename_lock;
 static int            *susfs_k_sysctl_protected_symlinks;
-
-/* Forward declaration only: the definition sits down with the entry code (line ~3117), while the
- * openat2 branch above it is the first caller - and -Werror,-Wimplicit-function-declaration makes
- * that a hard error rather than a warning. */
-static int susfs_vfs_copy_open_how(const void __user *u, size_t usize, struct open_how *out);
+static int            (*susfs_k___cond_resched)(void);
 
 struct susfs_vfs_leaf {
 	const char	*name;
@@ -349,12 +337,6 @@ static struct susfs_vfs_leaf susfs_vfs_leaves[] = {
 	{ "__kmalloc", (void **)&susfs_k___kmalloc },
 	{ "__legitimize_mnt", (void **)&susfs_k___legitimize_mnt },
 	{ "__lookup_mnt", (void **)&susfs_k___lookup_mnt },
-	/* __cond_resched is NOT in this table on purpose: every entry here is required, and this one
-	 * is missing on the device this layer was measured on (5.15.180: it is a global function
-	 * whose only callers are the static inline cond_resched() sites, so LTO left no entity).
-	 * It is resolved optionally in susfs_vfs_open_init() instead - a walk that cannot yield the
-	 * CPU on a long path is slower for everyone else, not wrong. */
-	{ "atime_needs_update", (void **)&susfs_k_atime_needs_update },
 	{ "audit_log_path_denied", (void **)&susfs_k_audit_log_path_denied },
 	{ "d_alloc_parallel", (void **)&susfs_k_d_alloc_parallel },
 	{ "d_invalidate", (void **)&susfs_k_d_invalidate },
@@ -382,7 +364,6 @@ static struct susfs_vfs_leaf susfs_vfs_leaves[] = {
 	{ "put_unused_fd", (void **)&susfs_k_put_unused_fd },
 	{ "putname", (void **)&susfs_k_putname },
 	{ "security_inode_follow_link", (void **)&susfs_k_security_inode_follow_link },
-	{ "touch_atime", (void **)&susfs_k_touch_atime },
 };
 
 /*
@@ -398,7 +379,6 @@ static struct susfs_vfs_leaf susfs_vfs_leaves[] = {
 #define __fsnotify_parent(...)	susfs_k___fsnotify_parent(__VA_ARGS__)
 #define __legitimize_mnt(...)	susfs_k___legitimize_mnt(__VA_ARGS__)
 #define __lookup_mnt(...)	susfs_k___lookup_mnt(__VA_ARGS__)
-#define atime_needs_update(...)	susfs_k_atime_needs_update(__VA_ARGS__)
 #define audit_log_path_denied(...)	susfs_k_audit_log_path_denied(__VA_ARGS__)
 #define d_alloc_parallel(...)	susfs_k_d_alloc_parallel(__VA_ARGS__)
 #define d_invalidate(...)	susfs_k_d_invalidate(__VA_ARGS__)
@@ -424,7 +404,6 @@ static struct susfs_vfs_leaf susfs_vfs_leaves[] = {
 #define put_unused_fd(...)	susfs_k_put_unused_fd(__VA_ARGS__)
 #define putname(...)	susfs_k_putname(__VA_ARGS__)
 #define security_inode_follow_link(...)	susfs_k_security_inode_follow_link(__VA_ARGS__)
-#define touch_atime(...)	susfs_k_touch_atime(__VA_ARGS__)
 #define mount_lock	(*susfs_k_mount_lock)
 #define rename_lock	(*susfs_k_rename_lock)
 #define sysctl_protected_symlinks	(*susfs_k_sysctl_protected_symlinks)
@@ -486,6 +465,14 @@ static __nocfi unsigned int susfs_vfs_fold_hash(unsigned long x, unsigned long y
 
 
 /*
+ * Forward declaration only: susfs_vfs_copy_open_how() is defined with the entry code
+ * further down, while the openat2 branch above it is its first caller - and
+ * -Werror,-Wimplicit-function-declaration turns that into a hard error rather than a
+ * warning.
+ */
+static int susfs_vfs_copy_open_how(const void __user *u, size_t usize, struct open_how *out);
+
+/*
  * =====================================================================
  * 3. Parameters and counters
  * =====================================================================
@@ -538,6 +525,11 @@ static atomic_t n_vopen_cold = ATOMIC_INIT(0);		/* of those, after a real lookup
 static atomic_t n_vopen_dropped = ATOMIC_INIT(0);	/* dentries dropped (vopen_drop) */
 static atomic_t n_vopen_collide = ATOMIC_INIT(0);	/* derived name existed (must not) */
 static atomic_t n_vopen_err = ATOMIC_INIT(0);
+/* Written once at load time, so plain ints: which leaves were absent, and which were
+ * present in kallsyms with no callable address (a device difference - see the
+ * resolver). */
+static unsigned int n_vopen_leaf_missing;
+static unsigned int n_vopen_leaf_zero;
 
 /*
  * =====================================================================
@@ -1035,6 +1027,19 @@ static __nocfi void susfs_vfs_drop_hidden(struct dentry *dentry)
 }
 
 /* Header inlines that would otherwise reach a non-exported symbol. */
+/*
+ * Is this name known to the kernel but without a callable address?  See the resolver
+ * for why the .cfi_jt sibling answers this and ksu_find_symbol_all() cannot.
+ */
+static bool susfs_vfs_name_present_at_zero(const char *name)
+{
+	char cfi[128];
+
+	if (snprintf(cfi, sizeof(cfi), "%s.cfi_jt", name) >= (int)sizeof(cfi))
+		return false;
+	return find_kernel_symbol_exact(cfi) != 0;
+}
+
 static __nocfi void *susfs_vfs_kmalloc_array(size_t n, size_t size, gfp_t flags)
 {
 	size_t bytes;
@@ -1051,7 +1056,8 @@ static __nocfi void *susfs_vfs_memcpy(void *dst, const void *src, size_t n)
 
 static __nocfi void susfs_vfs_cond_resched(void)
 {
-	/* Optional (see the leaf table): without it a long path walk simply never yields. */
+	/* Optional (see OPTIONAL_LEAVES in the leaf section): without it a long path walk
+	 * simply never yields the CPU. */
 	if (susfs_k___cond_resched)
 		susfs_k___cond_resched();
 }
@@ -1293,31 +1299,34 @@ struct nameidata {
 	int		dfd;
 	kuid_t		dir_uid;
 	umode_t		dir_mode;
-	/*
-	 * ---- appended by susfs_vfs_open.c; NOT part of the kernel's struct ----
-	 *
-	 * Appended rather than carved out of the kernel's own fields, because this
-	 * struct is SHARED with the kernel: once __set_nameidata() has pointed
-	 * current->nameidata at it, the kernel's own code reads and writes it through
-	 * the kernel's idea of the layout.  nd_jump_link() (fs/namei.c:989) is the one
-	 * an O_PATH open can reach - a procfs magic link's ->get_link is called from
-	 * pick_link() while LOOKUP_FOLLOW is set - and it reads nd->flags, nd->path,
-	 * nd->inode and nd->state while the struct lives on THIS MODULE'S stack.  Every
-	 * byte at or before dir_mode therefore has to mean what the kernel thinks it
-	 * means, and nothing in the kernel ever reads past dir_mode, so a field here is
-	 * invisible to it.  That is also why the upstream patch's trick of re-using a
-	 * `state` bit is not used: a state bit would have to keep agreeing with the
-	 * kernel about which bits are free, and the gain is one bit.
-	 */
-	struct susfs_nd_private susfs;
 } __randomize_layout;
 
 /*
- * What CAN be checked at compile time about that contract.  These are checks on our
- * own copy: they cannot compare against the device's struct, which is file-local to
- * fs/namei.c and absent from the DDK headers (the vopen_nd_* parameters are the
- * load-time half of the same gate).
+ * ---- the layout gate, and why nothing of ours is inside this struct ----
+ *
+ * This struct is SHARED with the kernel: __set_nameidata() points current->nameidata
+ * at it, and the kernel's own code then reads it through the KERNEL's layout -
+ * nd_jump_link() (fs/namei.c:989) is the one an O_PATH open can reach, from a procfs
+ * magic link's ->get_link while LOOKUP_FOLLOW is set, and it reads nd->flags,
+ * nd->path, nd->inode and nd->state while the struct lives on THIS MODULE'S stack.
+ *
+ * The three asserts below are therefore the three numbers the DEVICE reports for
+ * this struct (5.15.180, read from BTF: sizeof = 224, offsetof(state) = 60,
+ * offsetof(internal) = 96).  A mismatch has to break the BUILD rather than the
+ * phone, and the gate caught a real defect once: an earlier version of this file
+ * appended a private field here, which made our copy 240 bytes against the device's
+ * 224 while every other check still passed.  Nothing of ours goes inside this struct
+ * any more - the walk's private state lives in struct susfs_vfs_nd below, whose
+ * FIRST member is this struct, so the pointer the kernel follows starts at the
+ * kernel's idea of the layout and ends exactly where the kernel's struct ends.
+ *
+ * What these asserts cannot do is speak for the device: they pin the layout this
+ * file was derived from, and the vopen_nd_* parameters re-check the same three
+ * numbers at load time against whatever that device's BTF says.
  */
+static_assert(sizeof(struct nameidata) == 224);
+static_assert(offsetof(struct nameidata, state) == 60);
+static_assert(offsetof(struct nameidata, internal) == 96);
 static_assert(EMBEDDED_LEVELS == 2);
 static_assert(sizeof(((struct nameidata *)0)->internal) ==
 	      EMBEDDED_LEVELS * sizeof(struct saved));
@@ -1325,8 +1334,29 @@ static_assert(offsetof(struct nameidata, state) ==
 	      offsetof(struct nameidata, flags) + sizeof(unsigned int));
 static_assert(offsetof(struct nameidata, internal) +
 	      sizeof(((struct nameidata *)0)->internal) == offsetof(struct nameidata, name));
-static_assert((offsetof(struct nameidata, dir_mode) + sizeof(umode_t) + 7) / 8 * 8 ==
-	      offsetof(struct nameidata, susfs));
+
+/*
+ * The wrapper this walk's private state lives in.  `nd` MUST stay the first member:
+ * that is what makes &w.nd both the address the kernel follows through
+ * current->nameidata and the address every copied body in this file already expects,
+ * i.e. what makes this a pure container rather than a second struct.
+ */
+struct susfs_vfs_nd {
+	struct nameidata nd;
+	u64 hidden_last;	/* this component's hit was refused as hidden */
+};
+
+static_assert(offsetof(struct susfs_vfs_nd, nd) == 0);
+
+/*
+ * container_of() and nothing else: every walk that reaches this file starts in
+ * do_filp_open() below - this file's own copy, and the only place set_nameidata() is
+ * called - so every `struct nameidata *` on this path is the first member of one of
+ * these.  No kernel copy of a function here can be holding one of our pointers
+ * instead, because the private field is only touched by points bound to our own
+ * copies (lookup_fast, walk_component, __set_nameidata).
+ */
+#define SUSFS_VFS_ND(nd)	container_of((nd), struct susfs_vfs_nd, nd)
 
 #define ND_ROOT_PRESET 1
 #define ND_ROOT_GRABBED 2
@@ -1337,12 +1367,11 @@ static __nocfi void __set_nameidata(struct nameidata *p, int dfd, struct filenam
 {
 	struct nameidata *old = current->nameidata;
 
-	/* The private tail is ours alone, so only we may initialise it - and it must be
-	 * initialised on EVERY walk: `struct nameidata nd` is an uninitialised stack
-	 * object in do_filp_open(), and hidden_last is read by walk_component() on the
-	 * first component of that walk. */
-	p->susfs.magic = SUSFS_VFS_ND_MAGIC;
-	p->susfs.hidden_last = 0;
+	/* The private state is ours alone, so only we may initialise it - and it must be
+	 * initialised on EVERY walk: the wrapper is an uninitialised stack object in
+	 * do_filp_open(), and hidden_last is read by walk_component() on the first
+	 * component of that walk. */
+	SUSFS_VFS_ND(p)->hidden_last = 0;
 
 	p->stack = p->internal;
 	p->depth = 0;
@@ -2104,7 +2133,7 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 				 */
 				if (!vfs.try_to_unlazy(nd))
 					return ERR_PTR(-ECHILD);
-				nd->susfs.hidden_last = 1;
+				SUSFS_VFS_ND(nd)->hidden_last = 1;
 				return NULL;
 			}
 			return dentry;
@@ -2127,7 +2156,7 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			 * of a cache hit.  That is why it is not the default. */
 			susfs_vfs_drop_hidden(dentry);
 			dput(dentry);
-			nd->susfs.hidden_last = 1;
+			SUSFS_VFS_ND(nd)->hidden_last = 1;
 			return NULL;
 		}
 	}
@@ -2262,12 +2291,20 @@ static __nocfi const char *pick_link(struct nameidata *nd, struct path *link,
 		return ERR_PTR(-ELOOP);
 
 	if (!(nd->flags & LOOKUP_RCU)) {
-		touch_atime(&last->link);
+		/*
+		 * touch_atime() and atime_needs_update() were here (fs/namei.c:1751-1758)
+		 * and are REMOVED, not resolved.  This device's kallsyms carries
+		 * touch_atime with address 0 (plus a touch_atime.cfi_jt stub), so there is
+		 * no callable entity to bind to - and an O_PATH open does not update atime
+		 * in the first place: do_dentry_open() returns early for an O_PATH file
+		 * and do_o_path() never calls it.  What is given up is the atime update of
+		 * a SYMLINK traversed on the way (an atime side effect on the link inode,
+		 * on mounts that are noatime on this device); what is gained is that no
+		 * branch of this walk can call a NULL pointer.  The RCU-to-ref-walk
+		 * transition this branch forced existed only to make touch_atime() safe, so
+		 * the walk now simply stays in RCU mode here.
+		 */
 		susfs_vfs_cond_resched();
-	} else if (atime_needs_update(&last->link, inode)) {
-		if (!vfs.try_to_unlazy(nd))
-			return ERR_PTR(-ECHILD);
-		touch_atime(&last->link);
 	}
 
 	error = security_inode_follow_link(link->dentry, inode,
@@ -2491,7 +2528,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 	if (IS_ERR(dentry))
 		return ERR_CAST(dentry);
 	if (unlikely(!dentry)) {
-		if (unlikely(nd->susfs.hidden_last)) {
+		if (unlikely(SUSFS_VFS_ND(nd)->hidden_last)) {
 			/*
 			 * lookup_fast() refused a hit because the component is hidden.  Do
 			 * NOT look the real name up now: that lookup would SUCCEED (the file
@@ -2500,7 +2537,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 			 * name is looked up instead, so this component fails with the cost
 			 * structure of a component that is not there.
 			 */
-			nd->susfs.hidden_last = 0;
+			SUSFS_VFS_ND(nd)->hidden_last = 0;
 			atomic_inc(&n_vopen_hidden);
 			dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
 		} else {
@@ -2878,22 +2915,29 @@ static __nocfi struct file *path_openat(struct nameidata *nd,
 static __nocfi struct file *do_filp_open(int dfd, struct filename *pathname,
 		const struct open_flags *op)
 {
-	struct nameidata nd;
+	struct susfs_vfs_nd w;
 	int flags = op->lookup_flags;
 	struct file *filp;
 
-	set_nameidata(&nd, dfd, pathname, NULL);
-	filp = path_openat(&nd, op, flags | LOOKUP_RCU);
+	/*
+	 * The walk's private state lives in this wrapper and NOT in struct nameidata:
+	 * current->nameidata is a pointer the KERNEL follows with its own layout (see
+	 * the layout gate at struct nameidata), so our struct nameidata has to be
+	 * byte-for-byte the kernel's.  &w.nd is what the kernel sees, and it is the
+	 * wrapper's first member (asserted there).
+	 */
+	set_nameidata(&w.nd, dfd, pathname, NULL);
+	filp = path_openat(&w.nd, op, flags | LOOKUP_RCU);
 	if (unlikely(filp == ERR_PTR(-ECHILD)))
-		filp = path_openat(&nd, op, flags);
+		filp = path_openat(&w.nd, op, flags);
 	if (unlikely(filp == ERR_PTR(-ESTALE)))
-		filp = path_openat(&nd, op, flags | LOOKUP_REVAL);
+		filp = path_openat(&w.nd, op, flags | LOOKUP_REVAL);
 	restore_nameidata();
 	return filp;
 }
 
 /* ==== copied from open.c:1080-1213  (build_open_how + build_open_flags) ==== */
-inline struct open_how build_open_how(int flags, umode_t mode)
+static inline __nocfi struct open_how build_open_how(int flags, umode_t mode)
 {
 	struct open_how how = {
 		.flags = flags & VALID_OPEN_FLAGS,
@@ -2909,7 +2953,7 @@ inline struct open_how build_open_how(int flags, umode_t mode)
 	return how;
 }
 
-inline int build_open_flags(const struct open_how *how, struct open_flags *op)
+static inline __nocfi int build_open_flags(const struct open_how *how, struct open_flags *op)
 {
 	u64 flags = how->flags;
 	u64 strip = FMODE_NONOTIFY | O_CLOEXEC;
@@ -3219,9 +3263,10 @@ void susfs_vfs_open_dump(void)
 			(e->child_kind == SUSFS_VFS_KIND_OURS_INLINED ?
 			 "ours-inlined" : "not called"));
 	}
-	pr_info("susfs_vfs_open: assembly %u kernel / %u ours / %u inlined (of %u points), leaves %u, armed=%d\n",
+	pr_info("susfs_vfs_open: assembly %u kernel / %u ours / %u inlined (of %u points), leaves %u (absent %u, present-at-0 %u), armed=%d\n",
 		k, o, in, (unsigned int)ARRAY_SIZE(susfs_vfs_bindings),
-		(unsigned int)ARRAY_SIZE(susfs_vfs_leaves), (int)READ_ONCE(susfs_vfs_armed));
+		(unsigned int)ARRAY_SIZE(susfs_vfs_leaves), n_vopen_leaf_missing,
+		n_vopen_leaf_zero, (int)READ_ONCE(susfs_vfs_armed));
 }
 
 static int vopen_proc_show(struct seq_file *m, void *v)
@@ -3239,7 +3284,8 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 			   b->kind == SUSFS_VFS_KIND_OURS ? " (required)" : "");
 	}
 
-	seq_puts(m, "\nleaf                            resolved\n");
+	seq_printf(m, "\nleaf                            resolved   (absent %u, present-at-0 %u)\n",
+		   n_vopen_leaf_missing, n_vopen_leaf_zero);
 	for (i = 0; i < ARRAY_SIZE(susfs_vfs_leaves); i++) {
 		struct susfs_vfs_leaf *l = &susfs_vfs_leaves[i];
 
@@ -3440,9 +3486,25 @@ static int susfs_vfs_resolve_leaves(void)
 		unsigned long a = find_kernel_symbol_exact(l->name);
 
 		WRITE_ONCE(*l->slot, (void *)a);
-		if (!a) {
-			missing++;
-			pr_warn("susfs_vfs_open: leaf '%s' is not in this kernel's kallsyms\n",
+		if (a)
+			continue;
+		missing++;
+		/* "the name is not there" and "the name is there with no callable
+		 * address" are different facts about a device, and only the second is a
+		 * device difference worth recording: a 5.15 kallsyms can keep a symbol
+		 * whose body was folded away and report it as 0 - measured on this device
+		 * for touch_atime, which is why that dependency was removed from this
+		 * file rather than worked around.  ksu_find_symbol_all() cannot see that
+		 * case (its callback skips `!addr`), so the .cfi_jt sibling is the probe:
+		 * a CFI kernel gives one to every indirectly-called function, so "plain
+		 * name 0 + .cfi_jt present" IS the signature of present-but-not-callable. */
+		if (susfs_vfs_name_present_at_zero(l->name)) {
+			n_vopen_leaf_zero++;
+			pr_warn("susfs_vfs_open: leaf '%s' IS in this kernel's kallsyms but at address 0 (only a .cfi_jt stub) - no callable entity\n",
+				l->name);
+		} else {
+			n_vopen_leaf_missing++;
+			pr_warn("susfs_vfs_open: leaf '%s' is not in this kernel's kallsyms at all\n",
 				l->name);
 		}
 	}
@@ -3454,11 +3516,6 @@ static int susfs_vfs_resolve_leaves(void)
 	susfs_k_rename_lock = (seqlock_t *)find_kernel_symbol_exact("rename_lock");
 	susfs_k_sysctl_protected_symlinks = (int *)find_kernel_symbol_exact("sysctl_protected_symlinks");
 
-	/* Optional, and missing on the measured device: see the note in the leaf table. */
-	susfs_k___cond_resched = (int (*)(void))find_kernel_symbol_exact("__cond_resched");
-	if (!susfs_k___cond_resched)
-		pr_warn("susfs_vfs_open: '__cond_resched' not resolved - the vendored walk will not yield the CPU on a long path (slower for other tasks, not wrong)\n");
-
 	if (!susfs_k_mount_lock) {
 		pr_warn("susfs_vfs_open: 'mount_lock' not resolved - the walk cannot run\n");
 		missing++;
@@ -3469,6 +3526,11 @@ static int susfs_vfs_resolve_leaves(void)
 	}
 	if (!susfs_k_sysctl_protected_symlinks)
 		pr_warn("susfs_vfs_open: 'sysctl_protected_symlinks' not resolved - may_follow_link() will read 0 (the kernel's default) instead of the configured value\n");
+
+	/* Optional, and missing on the measured device: see the note in OPTIONAL_LEAVES. */
+	susfs_k___cond_resched = (int (*)(void))find_kernel_symbol_exact("__cond_resched");
+	if (!susfs_k___cond_resched)
+		pr_warn("susfs_vfs_open: '__cond_resched' not resolved - the vendored walk will not yield the CPU on a long path (slower for other tasks, not wrong)\n");
 
 	return missing;
 }
