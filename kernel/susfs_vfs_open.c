@@ -329,6 +329,11 @@ static seqlock_t      *susfs_k_mount_lock;
 static seqlock_t      *susfs_k_rename_lock;
 static int            *susfs_k_sysctl_protected_symlinks;
 
+/* Forward declaration only: the definition sits down with the entry code (line ~3117), while the
+ * openat2 branch above it is the first caller - and -Werror,-Wimplicit-function-declaration makes
+ * that a hard error rather than a warning. */
+static int susfs_vfs_copy_open_how(const void __user *u, size_t usize, struct open_how *out);
+
 struct susfs_vfs_leaf {
 	const char	*name;
 	void		**slot;
@@ -3441,7 +3446,7 @@ static int susfs_vfs_resolve_leaves(void)
 	 * sysctl_protected_symlinks is only read (by may_follow_link). */
 	susfs_k_mount_lock = (seqlock_t *)find_kernel_symbol_exact("mount_lock");
 	susfs_k_rename_lock = (seqlock_t *)find_kernel_symbol_exact("rename_lock");
-	susfs_k_protected_symlinks = (int *)find_kernel_symbol_exact("sysctl_protected_symlinks");
+	susfs_k_sysctl_protected_symlinks = (int *)find_kernel_symbol_exact("sysctl_protected_symlinks");
 
 	if (!susfs_k_mount_lock) {
 		pr_warn("susfs_vfs_open: 'mount_lock' not resolved - the walk cannot run\n");
@@ -3451,7 +3456,7 @@ static int susfs_vfs_resolve_leaves(void)
 		pr_warn("susfs_vfs_open: 'rename_lock' not resolved - the walk cannot run\n");
 		missing++;
 	}
-	if (!susfs_k_protected_symlinks)
+	if (!susfs_k_sysctl_protected_symlinks)
 		pr_warn("susfs_vfs_open: 'sysctl_protected_symlinks' not resolved - may_follow_link() will read 0 (the kernel's default) instead of the configured value\n");
 
 	return missing;
