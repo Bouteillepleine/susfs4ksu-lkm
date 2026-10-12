@@ -552,6 +552,12 @@ module_param_string(vopen_dbg_name, vopen_dbg_name, sizeof(vopen_dbg_name), 0644
 int vopen_fake = 2;
 module_param_named(vopen_fake, vopen_fake, int, 0644);
 
+/* Measured on the device, and the measurement has a direction: turning this on made the
+ * hidden path 6.8us SLOWER than a path that does not exist (diff -6775/-7240), because
+ * dropping the hidden dentry costs TWO real lookups - the next lookup of the real name is
+ * cold again, and the derived name is looked up after it.  So it is not a parity knob; it
+ * is for the case where the hidden dentry must not stay in the dcache at all (a detector
+ * that watches dcache-cached state), and it stays off. */
 bool vopen_drop;
 module_param_named(vopen_drop, vopen_drop, bool, 0644);
 
@@ -2360,45 +2366,59 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 			return ERR_PTR(-ECHILD);
 
 		*seqp = seq;
-		status = vfs.d_revalidate(dentry, nd->flags);
-		if (likely(status > 0)) {
-			if (unlikely(susfs_vfs_hidden_inode(dentry, 0))) {
-				/*
-				 * A HIDDEN COMPONENT - AND THE ANSWER IS NOT PRODUCED HERE.
-				 *
-				 * This is the RCU fast path, and it is where the post-check
-				 * layer's timing side channel comes from: the hidden file's
-				 * dentry is a plain dcache hit, so the caller paid a cache-hit
-				 * lookup and was refused afterwards, while a path that is not
-				 * there pays a real, failing filesystem lookup.  Nothing may
-				 * sleep here (the slow lookup takes inode_lock_shared) and no
-				 * reference to the child may be taken while LOOKUP_RCU is set,
-				 * so the hit is refused in place, with exactly the two steps a
-				 * dcache miss takes: drop out of RCU, report "not in the
-				 * dcache".  walk_component() then runs the slow lookup - of the
-				 * DERIVED name, so what actually runs is the failing lookup a
-				 * name that is not there would run.
-				 */
-				if (!vfs.try_to_unlazy(nd))
-					return ERR_PTR(-ECHILD);
-				susfs_vfs_nd_of(nd)->hidden_last = 1;
-				return NULL;
-			}
-			return dentry;
+		/*
+		 * A HIDDEN COMPONENT - AND THE ANSWER IS NOT PRODUCED HERE, AND IT IS ASKED
+		 * BEFORE d_revalidate().
+		 *
+		 * This is the RCU fast path, and it is where the post-check layer's timing
+		 * side channel came from: the hidden file's dentry is a plain dcache hit, so
+		 * the caller paid a cache-hit lookup and was refused afterwards, while a path
+		 * that is not there pays a real, failing filesystem lookup.  Nothing may
+		 * sleep here (the slow lookup takes inode_lock_shared) and no reference to
+		 * the child may be taken while LOOKUP_RCU is set, so the hit is refused in
+		 * place, with exactly the two steps a dcache miss takes: drop out of RCU,
+		 * report "not in the dcache".  walk_component() then runs the slow lookup -
+		 * of the DERIVED name, so what actually runs is the failing lookup a name
+		 * that is not there would run.
+		 *
+		 * THE ORDER IS THE POINT, and this device paid for it twice over.  The check
+		 * used to sit inside `if (likely(status > 0))`, i.e. BEHIND the filesystem's
+		 * d_revalidate() - and a procfs misc node's dentry answers -ECHILD to
+		 * d_revalidate() while LOOKUP_RCU is set (fs/proc/generic.c:220,
+		 * proc_misc_d_revalidate()).  That sent the walk through
+		 * try_to_unlazy_next() plus a second d_revalidate() and out of the
+		 * fall-through at the end of this function: the verdict was never asked and
+		 * the hidden file was opened (measured: wc_hot=4 with lookup_slow=0 and no
+		 * verdict line at all).  No filesystem callback may be able to hide the
+		 * verdict - and asking first is CHEAPER as well, because that -ECHILD detour
+		 * is exactly the extra work a dcache hit was paying over a miss (measured:
+		 * the hidden path ran 593ns slower than the nonexistent one, and the detour
+		 * is the bulk of that).
+		 */
+		if (unlikely(susfs_vfs_hidden_inode(dentry, 0))) {
+			if (!vfs.try_to_unlazy(nd))
+				return ERR_PTR(-ECHILD);
+			susfs_vfs_nd_of(nd)->hidden_last = 1;
+			return NULL;
 		}
+		status = vfs.d_revalidate(dentry, nd->flags);
+		if (likely(status > 0))
+			return dentry;
 		if (!vfs.try_to_unlazy_next(nd, dentry, seq))
 			return ERR_PTR(-ECHILD);
 		if (status == -ECHILD)
 			/* we'd been told to redo it in non-rcu mode */
 			status = vfs.d_revalidate(dentry, nd->flags);
 		/*
-		 * THE EXIT THE FIRST DEVICE RUN WENT THROUGH.  A hit whose revalidate had
-		 * to be redone in ref-walk falls out of the `if (likely(status > 0))` block
-		 * above and returns the dentry from the fall-through at the end of this
-		 * function - so the hidden check that lives inside that block never runs, the
-		 * dentry is committed by walk_component()/step_into(), and a hidden file is
-		 * opened.  Measured: the trailing component of /proc/susfs_kstat reached
-		 * step_into() with lookup_slow=0 and no verdict call at all.
+		 * A BACKSTOP, NOT THE MAIN PATH.  This is the exit the first device run went
+		 * through: a hit whose revalidate had to be redone in ref-walk returns the
+		 * dentry from the fall-through at the end of this function, which used to
+		 * bypass the verdict entirely (measured: the trailing component of
+		 * /proc/susfs_kstat reached step_into() with lookup_slow=0 and no verdict call
+		 * at all).  The verdict is now asked BEFORE d_revalidate() above, so a hidden
+		 * dentry no longer reaches here; this stays as the backstop for what the
+		 * detour can still change - a dentry that was negative at the first look and
+		 * positive now, or a rule registered in between.
 		 * A reference IS held here (try_to_unlazy_next() took one on the child), so
 		 * the refusal drops it exactly like the ref-walk site above does.
 		 */
@@ -2421,18 +2441,21 @@ static __nocfi struct dentry *lookup_fast(struct nameidata *nd,
 				(int)dentry->d_name.len, (const char *)dentry->d_name.name,
 				(unsigned long)(d_backing_inode(dentry) ?
 						d_backing_inode(dentry)->i_ino : 0));
-		status = vfs.d_revalidate(dentry, nd->flags);
-		if (unlikely(status > 0 && susfs_vfs_hidden_inode(dentry, 1))) {
-			/* The ref-walk half of the refusal above.  A reference IS held here,
-			 * so the dentry can also be taken out of the dcache when the tuning
-			 * asks for it (vopen_drop) - which makes the NEXT lookup of this path
-			 * a real one too, at the price of one failing lookup per call instead
-			 * of a cache hit.  That is why it is not the default. */
+		/* The ref-walk half of the refusal above, and asked before d_revalidate()
+		 * for the same reason: the answer must not depend on what a filesystem
+		 * callback says about this dentry (that dependency is what let a procfs misc
+		 * node's -ECHILD hide the verdict in the RCU branch).  A reference IS held
+		 * here, so the dentry can also be taken out of the dcache when the tuning
+		 * asks for it (vopen_drop) - which makes the NEXT lookup of this path a real
+		 * one too, at the price of one failing lookup per call instead of a cache
+		 * hit.  That is why it is not the default. */
+		if (unlikely(susfs_vfs_hidden_inode(dentry, 1))) {
 			susfs_vfs_drop_hidden(dentry);
 			dput(dentry);
 			susfs_vfs_nd_of(nd)->hidden_last = 1;
 			return NULL;
 		}
+		status = vfs.d_revalidate(dentry, nd->flags);
 	}
 	if (unlikely(status <= 0)) {
 		if (!status)
