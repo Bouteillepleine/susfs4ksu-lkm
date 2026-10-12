@@ -82,7 +82,10 @@ typedef long s64;
 #define MAX_SAMPLES 300
 #define DBUF 4096
 
-static char out[512];
+/* Large enough for the paired report INCLUDING the two per-side distributions below
+ * (min/p25/p50/p75/max, the largest gap, and a 100ns histogram capped at 12 buckets per
+ * side); the buffer is flushed with one write() at the end of the report. */
+static char out[4096];
 static char statbuf[512] __attribute__((aligned(16)));
 static char dbuf[DBUF] __attribute__((aligned(16)));
 static long sa[MAX_SAMPLES], sb[MAX_SAMPLES], sd[MAX_SAMPLES];
@@ -290,6 +293,78 @@ static long pct(const long *sorted, int n, int p)
 	return sorted[idx];
 }
 
+/*
+ * One side's own distribution, appended to the report.
+ *
+ * Why the shape and not just percentiles: the acceptance criterion is that the hidden path
+ * and a name that is not there OVERLAP IN THE SAME STATE.  Two sides can share a p50 and
+ * still be different objects - a bimodal side (fast mode + slow mode) means some calls took
+ * a different route, and p50 alone would hide it.  `s` is already sorted by the caller.
+ *
+ * gapmax is the largest step between adjacent sorted samples and @ is where it is: a gap
+ * that is a large fraction of the spread is the numeric version of "two humps".  A single
+ * cold sample at the start of a side is expected - the first lookup of any name is cold,
+ * after which the VFS retains the (negative or positive) dentry it created, so it is the
+ * warm-up and not a difference to explain away.
+ */
+static u64 putdist(u64 pos, const char *label, const long *s, int n)
+{
+	int i, b, nb;
+	long lo, hi, gap = 0, gpos = 0;
+
+	pos = putstr(pos, "\n  ");
+	pos = putstr(pos, label);
+	pos = putstr(pos, " min=");
+	pos = putnum_s(pos, s[0]);
+	pos = putstr(pos, " p25=");
+	pos = putnum_s(pos, pct(s, n, 25));
+	pos = putstr(pos, " p50=");
+	pos = putnum_s(pos, pct(s, n, 50));
+	pos = putstr(pos, " p75=");
+	pos = putnum_s(pos, pct(s, n, 75));
+	pos = putstr(pos, " max=");
+	pos = putnum_s(pos, s[n - 1]);
+
+	for (i = 1; i < n; i++) {
+		long g = s[i] - s[i - 1];
+
+		if (g > gap) {
+			gap = g;
+			gpos = s[i - 1];
+		}
+	}
+	pos = putstr(pos, " gapmax=");
+	pos = putnum_s(pos, gap);
+	pos = putstr(pos, "@");
+	pos = putnum_s(pos, gpos);
+
+	/* 100ns buckets, at most 12 printed: the two ends carry the shape, so when the spread
+	 * needs more buckets the middle ones are elided.  Empty buckets inside the printed range
+	 * are printed as 0, so the counts always add up to the sample count. */
+	lo = s[0] / 100;
+	hi = s[n - 1] / 100;
+	nb = (int)(hi - lo) + 1;
+	pos = putstr(pos, "\n    hist100ns ");
+	i = 0;
+	for (b = 0; b < nb; b++) {
+		int cnt = 0;
+
+		while (i < n && s[i] / 100 == lo + b) {
+			cnt++;
+			i++;
+		}
+		if (b < 6 || b >= nb - 6) {
+			pos = putnum(pos, (u64)((lo + b) * 100));
+			pos = putstr(pos, ":");
+			pos = putnum(pos, (u64)cnt);
+			pos = putstr(pos, " ");
+		} else if (b == 6 && nb > 12) {
+			pos = putstr(pos, "... ");
+		}
+	}
+	return pos;
+}
+
 /* Both paths are measured alternately, one batch each, so that a frequency drop
  * or a background task hits both sides of the pair instead of one of them. */
 static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
@@ -382,7 +457,12 @@ static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
 			pos = putstr(pos, "%");
 			pos = putstr(pos, (neg == n || neg == 0) ? " (perfect)" : "");
 		}
-		pos = putstr(pos, "\n");
+		pos = putdist(pos, "A-dist:", sa, n);
+		pos = putdist(pos, "B-dist:", sb, n);
+		pos = putstr(pos, "\n  read: A and B must overlap in the SAME state (cold vs cold, or\n"
+				  "  warm vs warm).  One cold sample at the start of each side is the warm-up,\n"
+				  "  not a difference.  A bimodal A means some calls took another route - check\n"
+				  "  resolve:/verdict:/mode3: in /proc/susfs_vfs_open.\n");
 		sys6(SYS_write, 1, (long)out, pos, 0, 0, 0);
 	}
 }
