@@ -538,6 +538,11 @@ jobs:
           check_group "mount id allocator"  "mnt_id_xa+__xa_alloc+__xa_erase" "mnt_id_ida+ida_alloc_range+ida_free"
           check_group "cache maintenance"   "dcache_clean_inval_poc+caches_clean_inval_pou" "__flush_dcache_area"
           check_group "kallsyms by name"    "kallsyms_on_each_match_symbol" "kallsyms_lookup_name" "kallsyms_on_each_symbol"
+          # close_fd_get_file() (5.15, fs/file.c:795) is file_close_fd() from 6.12 on
+          # (fs/file.c:784) with the same contract, and susfs_opath resolves whichever the
+          # kernel has. That makes it a rename pair, not two features: listed flat, one of
+          # the two would warn on every single variant.
+          check_group "fd-table close helper" "close_fd_get_file" "file_close_fd"
 
           # __static_call_update is resolved by name but is NOT required: lsm_hook.c falls back to
           # the compiled-in macro and logs which path it took.  arm64 builds without
@@ -550,8 +555,14 @@ jobs:
             printf '  %-34s %s\n' "__static_call_update" "$n"
           fi
 
+          #     fget_raw (susfs_opath.c) and the two syscall tables (susfs_fp_hook.c) are
+          #     resolved by name at runtime, so they cannot show up in the .ko's undefined
+          #     list and this loop is the only place a variant's answer for them is
+          #     recorded. fput is deliberately NOT here: it is EXPORT_SYMBOL'd and already
+          #     covered by the loader gate above and imports_guard.c.
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
+                   fget_raw sys_call_table compat_sys_call_table \
                    namespace_sem kallsyms_op modules_op kallsyms_lookup \
                    synchronize_rcu_tasks task_work_add \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
