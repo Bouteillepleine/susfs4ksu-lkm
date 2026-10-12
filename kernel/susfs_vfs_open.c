@@ -349,7 +349,11 @@ static struct susfs_vfs_leaf susfs_vfs_leaves[] = {
 	{ "__kmalloc", (void **)&susfs_k___kmalloc },
 	{ "__legitimize_mnt", (void **)&susfs_k___legitimize_mnt },
 	{ "__lookup_mnt", (void **)&susfs_k___lookup_mnt },
-	{ "__cond_resched", (void **)&susfs_k___cond_resched },
+	/* __cond_resched is NOT in this table on purpose: every entry here is required, and this one
+	 * is missing on the device this layer was measured on (5.15.180: it is a global function
+	 * whose only callers are the static inline cond_resched() sites, so LTO left no entity).
+	 * It is resolved optionally in susfs_vfs_open_init() instead - a walk that cannot yield the
+	 * CPU on a long path is slower for everyone else, not wrong. */
 	{ "atime_needs_update", (void **)&susfs_k_atime_needs_update },
 	{ "audit_log_path_denied", (void **)&susfs_k_audit_log_path_denied },
 	{ "d_alloc_parallel", (void **)&susfs_k_d_alloc_parallel },
@@ -1047,7 +1051,9 @@ static __nocfi void *susfs_vfs_memcpy(void *dst, const void *src, size_t n)
 
 static __nocfi void susfs_vfs_cond_resched(void)
 {
-	susfs_k___cond_resched();
+	/* Optional (see the leaf table): without it a long path walk simply never yields. */
+	if (susfs_k___cond_resched)
+		susfs_k___cond_resched();
 }
 
 static inline struct fd susfs_vfs_fdget_raw(unsigned int fd)
@@ -3447,6 +3453,11 @@ static int susfs_vfs_resolve_leaves(void)
 	susfs_k_mount_lock = (seqlock_t *)find_kernel_symbol_exact("mount_lock");
 	susfs_k_rename_lock = (seqlock_t *)find_kernel_symbol_exact("rename_lock");
 	susfs_k_sysctl_protected_symlinks = (int *)find_kernel_symbol_exact("sysctl_protected_symlinks");
+
+	/* Optional, and missing on the measured device: see the note in the leaf table. */
+	susfs_k___cond_resched = (int (*)(void))find_kernel_symbol_exact("__cond_resched");
+	if (!susfs_k___cond_resched)
+		pr_warn("susfs_vfs_open: '__cond_resched' not resolved - the vendored walk will not yield the CPU on a long path (slower for other tasks, not wrong)\n");
 
 	if (!susfs_k_mount_lock) {
 		pr_warn("susfs_vfs_open: 'mount_lock' not resolved - the walk cannot run\n");
