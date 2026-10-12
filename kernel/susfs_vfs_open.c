@@ -544,47 +544,24 @@ module_param_named(vopen_dbg, vopen_dbg, int, 0644);
 static char vopen_dbg_name[64];
 module_param_string(vopen_dbg_name, vopen_dbg_name, sizeof(vopen_dbg_name), 0644);
 
-/* 0 = refuse the hidden component immediately (no extra lookup at all), 1 = always the
- * same derived name for a directory (its negative dentry stays cached, so only the
- * first call pays a real lookup), 2 = a fresh derived name per call (every call pays a
- * real failing lookup).  Which of 1 and 2 is right is decided by what the benchmark's
- * B side costs: if B is a name that has been looked up before, its negative dentry is
- * cached and only mode 1 matches it; if B is looked up cold, only mode 2 does.  Mode 2
- * is the default because it can never come out CHEAPER than a name that is not there,
- * and being cheaper is the side channel.
+/* THE SHAPE IS FIXED, and there is deliberately no mode switch: a hidden component is
+ * answered by ONE lookup of a per-directory derived name, and whatever the filesystem
+ * says about that name is the answer.  This is upstream SUSFS's shape (it swaps the
+ * component for a fixed decoy name) and the measurements say it is the only shape that
+ * does not need per-filesystem tuning:
  *
- * MODE 3 (SUSFS_VFS_FAKE_DISCARD) is the structurally different one: no derived name, no
- * "cache hit that has to be refused", no second lookup.  The same name is looked up for real
- * - the filesystem does exactly the search a name that is not there makes it do - the
- * success is thrown away, and a NEGATIVE dentry for that name is left in the dcache.  The
- * result is that the hidden path and a name that is not there take the same route in BOTH
- * states: one real lookup and -ENOENT when the answer is cold, a negative dcache hit with
- * this layer not consulted when it is warm.  (Cold-then-warm itself is not a channel - every
- * path does it, via the VFS's retention of a hashed negative dentry, fs/dcache.c:642-667 -
- * which is exactly why leaving the negative is required: a shape that drops it, like
- * upstream's, stays cold forever and can be told apart by anyone repeating the same probe.)
- * Its residuals, all measurable, are at susfs_vfs_discard_hidden(): a filesystem whose HIT
- * is much more expensive than its miss (f2fs_iget can read a block for the inode), the
- * -EBUSY case of d_invalidate(), and vopen_neg=0 as the deliberate control that reproduces
- * the always-cold shape. */
-int vopen_fake = 2;
-module_param_named(vopen_fake, vopen_fake, int, 0644);
-
-/* Mode 3 only, and ON by default because it IS the mode's semantics: leave a NEGATIVE
- * dentry for the real name in the dcache, exactly the way a name that is not there leaves
- * one.  That is what makes the second and later lookups of the hidden path take the
- * identical route to the second and later lookups of a name that is not there - a negative
- * dcache hit, -ENOENT from d_flags_negative(), with this layer not consulted at all (the
- * verdict sees a NULL inode and answers false without doing anything).
- *
- * Turn it OFF only as a CONTROL: with 0 the hidden path answers -ENOENT and leaves nothing,
- * i.e. it stays cold on every call - which is the shape upstream SUSFS produces by dropping
- * the dentry (its "hit + re-look-up with a fixed name" leaves no negative either).  Running
- * -p 7 once with 1 and once with 0 is how that difference is demonstrated: with 0 the hidden
- * path never warms up while a name that is not there does, which is a state difference an
- * observer that repeats its probe would see. */
-bool vopen_neg = true;
-module_param_named(vopen_neg, vopen_neg, bool, 0644);
+ *   - FIXED per directory, not fresh per call.  A name that is not there is looked up
+ *     once and its negative dentry is then kept or not KEPT BY THE FILESYSTEM - retained
+ *     (ext4/f2fs) or dropped on the floor (procfs: proc_lookup_de() answers
+ *     ERR_PTR(-ENOENT) and caches nothing).  The derived name rides the same dcache with
+ *     the same retention rules in the same directory, so hidden and missing are cold and
+ *     warm together on either kind of filesystem, with no table to maintain.  A fresh
+ *     name per call is the one setting that is WRONG on a retaining filesystem: it stays
+ *     cold forever where a name that is not there has warmed up.
+ *   - Leaving a negative dentry for the REAL name instead does not compose: measured on a
+ *     non-retaining filesystem (procfs) it made the hidden path ~2.3us FASTER than a name
+ *     that is not there, i.e. the states stopped matching in the other direction.
+ */
 
 /* Measured on the device, and the measurement has a direction: turning this on made the
  * hidden path 6.8us SLOWER than a path that does not exist (diff -6775/-7240), because
@@ -594,9 +571,6 @@ module_param_named(vopen_neg, vopen_neg, bool, 0644);
  * that watches dcache-cached state), and it stays off. */
 bool vopen_drop;
 module_param_named(vopen_drop, vopen_drop, bool, 0644);
-
-bool vopen_drop_fake;
-module_param_named(vopen_drop_fake, vopen_drop_fake, bool, 0644);
 
 
 /* Countdown as well: writing N logs the next N verdict decisions, with their input
@@ -706,20 +680,6 @@ static atomic_t n_vopen_fake_try = ATOMIC_INIT(0);	/* derived-name lookup attemp
 static atomic_t n_vopen_fake_neg = ATOMIC_INIT(0);	/* ... came back as a negative dentry */
 static atomic_t n_vopen_fake_enoent = ATOMIC_INIT(0);	/* ... fs answered -ENOENT (procfs) */
 static atomic_t n_vopen_fake_other = ATOMIC_INIT(0);	/* ... some other error */
-
-/* Mode 3: how often the result of a REAL-name lookup was judged hidden and thrown away,
- * how often the filesystem refused to let its dentry go (-EBUSY from d_invalidate() - the
- * positive dentry then stays cached and the next call is a dcache hit, so the timing
- * advantage of a cache hit can come back for that entry), and how often a negative dentry
- * was left behind on purpose (vopen_neg). */
-static atomic_t n_vopen_discarded = ATOMIC_INIT(0);
-static atomic_t n_vopen_inval_fail = ATOMIC_INIT(0);
-static atomic_t n_vopen_neg_left = ATOMIC_INIT(0);
-/* Discards where the FILESYSTEM did not run: the dcache already held an answer, so this
- * call was cheaper than a cold lookup of a name that is not there.  Non-zero means the
- * positive dentry survived (d_invalidate() said -EBUSY, or the caller never went through
- * the slow path) - the counter to look at first when the -p 7 distribution is bimodal. */
-static atomic_t n_vopen_discard_cached = ATOMIC_INIT(0);
 
 /* The verdict counted at its own site: `calls` proves the check is reached for a
  * component, `true` proves the inode matched.  Compared with n_vopen_hidden (the refuse
@@ -1138,15 +1098,8 @@ static __nocfi noinline void susfs_vfs_frame_note(unsigned int slot,
  * =====================================================================
  */
 static u64 susfs_vfs_salt;
-static atomic64_t susfs_vfs_fake_seq = ATOMIC64_INIT(0);
 
 #define SUSFS_VFS_FAKE_LEN	16
-#define SUSFS_VFS_FAKE_FIXED	1
-#define SUSFS_VFS_FAKE_ROTATING	2
-/* mode 3: no derived name at all - the SAME name is looked up for real and the result is
- * then thrown away, so the answer is "this name does not resolve" (see
- * susfs_vfs_discard_hidden()). */
-#define SUSFS_VFS_FAKE_DISCARD	3
 
 static void susfs_vfs_fake_name(struct inode *parent, char *out)
 {
@@ -1154,9 +1107,9 @@ static void susfs_vfs_fake_name(struct inode *parent, char *out)
 	u64 mix;
 	int i;
 
+	/* Same directory, same name, on every call - see the parameter block for why a fixed
+	 * name is the shape that follows the filesystem's own negative-dentry retention. */
 	mix = susfs_vfs_salt ^ ((u64)parent->i_ino * 0x9E3779B97F4A7C15ULL);
-	if (READ_ONCE(vopen_fake) != SUSFS_VFS_FAKE_FIXED)
-		mix ^= (u64)atomic64_inc_return(&susfs_vfs_fake_seq) * 0xBF58476D1CE4E5B9ULL;
 
 	/* splitmix64's finaliser.  The name's whole purpose is that it cannot be
 	 * guessed, and the salt it is built from is 64 random bits - but a name derived
@@ -1195,13 +1148,6 @@ static __nocfi struct dentry *susfs_vfs_fake_lookup(struct dentry *dir, unsigned
 
 	if (!dir || !d_inode(dir))
 		return ERR_PTR(-ENOENT);
-	if (!READ_ONCE(vopen_fake))
-		return ERR_PTR(-ENOENT);
-	if (READ_ONCE(vopen_fake) == SUSFS_VFS_FAKE_DISCARD)
-		/* Mode 3 uses no derived name, so reaching here means some path above did not
-		 * take the discard route; answer the cheap refusal rather than invent a name
-		 * (n_vopen_discarded is what says whether that ever happens). */
-		return ERR_PTR(-ENOENT);
 
 	susfs_vfs_fake_name(d_inode(dir), name);
 	fake.hash_len = hashlen_create(susfs_vfs_full_name_hash(dir, name, SUSFS_VFS_FAKE_LEN),
@@ -1231,18 +1177,9 @@ static __nocfi struct dentry *susfs_vfs_fake_lookup(struct dentry *dir, unsigned
 		 * "not there" explicitly instead of letting the walk continue with a file
 		 * the caller never named. */
 		atomic_inc(&n_vopen_collide);
-		if (READ_ONCE(vopen_drop_fake))
-			d_invalidate(d);
 		dput(d);
 		return ERR_PTR(-ENOENT);
 	}
-
-	if (READ_ONCE(vopen_drop_fake))
-		/* Take the negative dentry back out, so the next call pays for a real
-		 * lookup again.  Without this the fixed-name mode converges on a cached
-		 * negative, which is CHEAPER than a cold "does not exist" - i.e. it would
-		 * hand the hidden path an advantage. */
-		d_invalidate(d);
 
 	return d;
 }
@@ -1271,8 +1208,6 @@ static __nocfi struct dentry *susfs_vfs_fake_lookup(struct dentry *dir, unsigned
  *      with no verdict at all before this fix
  *   3  walk_component(), after a slow lookup
  *   4  walk_component(), the commit point, just before step_into()
- *   5  the tail of __lookup_slow(), i.e. the verdict on what the filesystem found for the
- *      caller's own name (mode 3 only)
  */
 static __nocfi bool susfs_vfs_hidden_inode(struct dentry *dentry, int site)
 {
@@ -1296,118 +1231,6 @@ static __nocfi bool susfs_vfs_hidden_inode(struct dentry *dentry, int site)
 			inode->i_ino, inode->i_sb->s_dev, current_uid().val, (int)hidden);
 	}
 	return hidden;
-}
-
-/*
- * MODE 3: "the same name, really looked up, then judged not to exist".
- *
- * Called at the tail of __lookup_slow(), i.e. on the dentry that call ended up with after
- * the filesystem really searched the caller's OWN name (fs_searched says whether the
- * filesystem ran at all - it does not when the dcache already had an answer).  If that name
- * is one we hide, the answer is turned into the answer a name that is not there gets:
- *
- *   1. THE FILESYSTEM REALLY SEARCHED THE REAL NAME.  Not a derived name, not a second
- *      lookup: this is the same ->lookup() call, with the same name, doing the same work a
- *      lookup of a name that is not there makes it do.  That is the whole point of the
- *      mode, and it is why nothing here is a "re-lookup" - upstream's shape (drop the
- *      positive dentry, then look up the fixed name "..5.u.S") spends TWO lookups where a
- *      missing name spends one, which is separable by construction (measured here: the
- *      hit+derived-lookup shape ran 593ns slower than the missing-name path, and dropping
- *      the dentry first, 6.8us slower).
- *   2. THE SUCCESS IS THROWN AWAY: the inode the filesystem found does not become this
- *      walk's answer, and the dentry that carries it leaves the dcache.
- *   3. A NEGATIVE DENTRY FOR THE REAL NAME IS LEFT BEHIND (vopen_neg, default on).  This is
- *      the second watershed against upstream, and it is not about "matching a warm
- *      baseline": cold-then-warm is simply what every path does on this kernel, because the
- *      VFS retains a hashed dentry whose filesystem does not veto it (fs/dcache.c:642-667,
- *      retain_dentry() - the last reference is dropped and the dentry stays on the LRU,
- *      negative or not).  What keeping it buys is that the SECOND lookup of the hidden
- *      path takes the same route as the second lookup of a name that is not there: a
- *      negative dcache hit, -ENOENT out of d_flags_negative(), and this layer is not
- *      consulted at all (the verdict gets a NULL inode and returns false immediately).
- *      Upstream's shape leaves nothing behind, so its hidden path stays cold forever while
- *      a name that is not there warms up - a state difference, visible to anyone who
- *      repeats the same probe.  With vopen_neg=0 this mode deliberately reproduces that
- *      shape, as a control.
- *   4. ONLY THE POSITIVE ANSWER IS INVALIDATED, never a negative of ours: d_invalidate()
- *      takes this dentry out of the dcache (whether it is the one __lookup_slow allocated
- *      or the alias the filesystem returned through d_splice_alias() - both are "the
- *      positive answer" here), and it does not disturb anyone else: a holder keeps its
- *      dentry and its inode, the only visible effect being that the next lookup asks the
- *      filesystem again.  It can refuse with -EBUSY (a mountpoint, a busy directory), which
- *      is counted, because then that positive dentry stays cached and the next call is a
- *      dcache hit that does not make the filesystem search - the case that shows up as a
- *      fast mode in the -p 7 distribution.
- *   5. NO SECOND LOOKUP, NO DERIVED NAME, anywhere in this mode.  The lookup count of the
- *      hidden path is the lookup count of a name that is not there: one per cold call and
- *      zero per warm call.
- *
- * THE CONCURRENCY RULES, in the order they matter:
- *   (a) The discard happens AFTER d_lookup_done().  While the dentry is in the in-lookup
- *       state (DCACHE_PAR_LOOKUP) other lookups of the same name wait on its d_wait queue,
- *       and d_lookup_done() is what releases them with this dentry as the answer - dropping
- *       it before that call would hand a waiter a dentry that is about to be killed.
- *       __lookup_slow() already calls d_lookup_done() before this function runs.
- *   (b) Even in that order, a lookup that was already waiting on THIS dentry can come away
- *       holding it.  That is this mode's residual race: a positive dentry for a hidden name
- *       can reach that other walk for the few hundred nanoseconds until the discard lands.
- *       It cannot become a leak - the LSM layer answers the same inode with -ENOENT and the
- *       post-check takes the descriptor away - but it is a real difference from mode 2,
- *       where the dentry was never published as anything but negative (that is also why
- *       mode 3 keeps the walk's own answer negative instead of handing the positive one on).
- *   (c) That same window also means two threads looking up the SAME hidden name can each
- *       hash a negative for it: the filesystem path goes through the VFS's in-lookup
- *       protocol (d_alloc_parallel()) while this one inserts with a plain d_alloc()/d_add().
- *       Two negative dentries for one name are harmless - d_lookup() answers with the first,
- *       the duplicate is unreferenced and reclaimed through the LRU - and it only happens
- *       when two lookups of the same hidden name genuinely overlap.
- *
- * HONEST LIMIT: the cold call here costs what a filesystem HIT costs, and on a filesystem
- * whose hit is much more expensive than its miss that is more than the missing-name path
- * pays - f2fs_lookup() on a found entry calls f2fs_iget(), which can read a block for the
- * inode, while the miss path only fails a directory scan.  Nothing here can fix that (it is
- * what "the file exists" costs on that filesystem); the measurement that shows it is the
- * -p 7 p50 difference between vopen_fake=2 and vopen_fake=3 on that filesystem, and the
- * answer there is to keep mode 2.
- */
-static __nocfi struct dentry *susfs_vfs_discard_hidden(struct dentry *dir,
-						       const struct qstr *name,
-						       struct dentry *dentry,
-						       bool fs_searched)
-{
-	if (READ_ONCE(vopen_fake) != SUSFS_VFS_FAKE_DISCARD)
-		return dentry;
-	/* A negative or an errored answer is a miss already - leave it alone (this is B's
-	 * own path, and it is also what the warm state of A looks like). */
-	if (!dentry || IS_ERR(dentry) || d_is_negative(dentry))
-		return dentry;
-	if (!susfs_vfs_hidden_inode(dentry, 5))
-		return dentry;
-
-	atomic_inc(&n_vopen_discarded);
-	if (!fs_searched)
-		atomic_inc(&n_vopen_discard_cached);
-
-	/* d_invalidate() may refuse; either way the dentry stops being ours here. */
-	if (d_invalidate(dentry))
-		atomic_inc(&n_vopen_inval_fail);
-	dput(dentry);
-
-	if (!READ_ONCE(vopen_neg))
-		return ERR_PTR(-ENOENT);
-
-	/* Leave the negative a name that is not there leaves.  d_alloc() never returns an
-	 * existing dentry, so this cannot hand back the positive one we just threw away, and
-	 * d_add() with a NULL inode is exactly "this name is not here" in the dcache. */
-	{
-		struct dentry *neg = d_alloc(dir, name);
-
-		if (unlikely(!neg))
-			return ERR_PTR(-ENOMEM);
-		d_add(neg, NULL);
-		atomic_inc(&n_vopen_neg_left);
-		return neg;
-	}
 }
 
 static __nocfi void susfs_vfs_drop_hidden(struct dentry *dentry)
@@ -2646,11 +2469,6 @@ static __nocfi struct dentry *__lookup_slow(const struct qstr *name,
 	SUSFS_VFS_FRAME(SUSFS_VFS_FRAME___lookup_slow);
 	struct dentry *dentry, *old;
 	struct inode *inode = dir->d_inode;
-	/* mode 3 only: did the filesystem really search this name on this call?  The
-	 * d_revalidate branch below means the dcache already had an answer, and then the
-	 * filesystem did not run - which is a cheaper call than a cold one, so mode 3 counts
-	 * it (n_vopen_discard_cached) instead of pretending the two are the same. */
-	bool fs_searched = false;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
 
 	/* Don't go there if it's already dead */
@@ -2673,18 +2491,13 @@ again:
 		}
 	} else {
 		old = inode->i_op->lookup(inode, dentry, flags);
-		fs_searched = true;
 		d_lookup_done(dentry);
 		if (unlikely(old)) {
 			dput(dentry);
 			dentry = old;
 		}
 	}
-	/* MODE 3: the filesystem has really searched the caller's own name (either through
-	 * the ->lookup() above, or through the revalidate of a dentry the dcache already had),
-	 * and d_lookup_done() has released anyone waiting on it - so this is the point where
-	 * a hidden name is turned into the answer a name that is not there gets. */
-	return susfs_vfs_discard_hidden(dir, name, dentry, fs_searched);
+	return dentry;
 }
 
 static __nocfi struct dentry *lookup_slow(const struct qstr *name,
@@ -3024,15 +2837,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 			susfs_vfs_nd_of(nd)->hidden_last = 0;
 			atomic_inc(&n_vopen_wc_hot);
 			atomic_inc(&n_vopen_hidden);
-			if (READ_ONCE(vopen_fake) == SUSFS_VFS_FAKE_DISCARD) {
-				/* MODE 3: pay for a lookup of the SAME name and let the tail of
-				 * __lookup_slow() throw its result away - no derived name, and the
-				 * filesystem does the search a missing name would make it do. */
-				dentry = lookup_slow(&nd->last, nd->path.dentry,
-						     nd->flags & ~(LOOKUP_RCU | LOOKUP_PARENT));
-			} else {
-				dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
-			}
+			dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
 		} else {
 			dentry = lookup_slow(&nd->last, nd->path.dentry, nd->flags);
 			atomic_inc(&n_vopen_wc_plain);
@@ -3089,11 +2894,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 			susfs_vfs_drop_hidden(dentry);
 			dput(dentry);
 		}
-		if (READ_ONCE(vopen_fake) == SUSFS_VFS_FAKE_DISCARD)
-			dentry = lookup_slow(&nd->last, nd->path.dentry,
-					     nd->flags & ~(LOOKUP_RCU | LOOKUP_PARENT));
-		else
-			dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
+		dentry = susfs_vfs_fake_lookup(nd->path.dentry, nd->flags);
 		if (IS_ERR(dentry))
 			return ERR_CAST(dentry);
 		inode = NULL;	/* handle_mounts() derives it again, in ref-walk */
@@ -3816,9 +3617,6 @@ void susfs_vfs_open_dump(void)
 		atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
 		atomic_read(&n_vopen_wc_hot), atomic_read(&n_vopen_wc_plain),
 		atomic_read(&n_vopen_wc_cold), atomic_read(&n_vopen_wc_commit));
-	pr_info("susfs_vfs_open: mode3 discarded=%d cached=%d inval_fail=%d neg_left=%d\n",
-		atomic_read(&n_vopen_discarded), atomic_read(&n_vopen_discard_cached),
-		atomic_read(&n_vopen_inval_fail), atomic_read(&n_vopen_neg_left));
 	pr_info("susfs_vfs_open: verdict calls=%d true=%d | derived name try=%d neg=%d enoent=%d other=%d\n",
 		atomic_read(&n_vopen_verdict_calls), atomic_read(&n_vopen_verdict_true),
 		atomic_read(&n_vopen_fake_try), atomic_read(&n_vopen_fake_neg),
@@ -3872,9 +3670,9 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 			   (void *)r->lr, (void *)r->fp);
 	}
 
-	seq_printf(m, "\narmed=%d enable=%d fake=%d drop=%d drop_fake=%d 	frame=%d dbg=%d dbg_name=%s salt=%d\n",
-		   (int)READ_ONCE(susfs_vfs_armed), vopen_enable, vopen_fake,
-		   (int)vopen_drop, (int)vopen_drop_fake, vopen_frame, vopen_dbg,
+	seq_printf(m, "\narmed=%d enable=%d drop=%d frame=%d dbg=%d dbg_name=%s salt=%d\n",
+		   (int)READ_ONCE(susfs_vfs_armed), vopen_enable,
+		   (int)vopen_drop, vopen_frame, vopen_dbg,
 		   vopen_dbg_name[0] ? vopen_dbg_name : "-", (int)(susfs_vfs_salt != 0));
 	seq_printf(m, "enter: link_path_walk=%d lookup_last=%d walk_component=%d step_into=%d handle_mounts=%d lookup_fast=%d lookup_slow=%d\n",
 		   atomic_read(&n_vopen_enter_link_path_walk), atomic_read(&n_vopen_enter_lookup_last),
@@ -3886,10 +3684,6 @@ static int vopen_proc_show(struct seq_file *m, void *v)
 		   atomic_read(&n_vopen_fa_ref_hit), atomic_read(&n_vopen_fa_ref_miss),
 		   atomic_read(&n_vopen_wc_hot), atomic_read(&n_vopen_wc_plain),
 		   atomic_read(&n_vopen_wc_cold), atomic_read(&n_vopen_wc_commit));
-	seq_printf(m, "mode3: discarded=%d cached=%d inval_fail=%d neg_left=%d (vopen_neg=%d)\n",
-		   atomic_read(&n_vopen_discarded), atomic_read(&n_vopen_discard_cached),
-		   atomic_read(&n_vopen_inval_fail), atomic_read(&n_vopen_neg_left),
-		   (int)vopen_neg);
 	seq_printf(m, "verdict: calls=%d true=%d | derived name: try=%d neg=%d enoent=%d other=%d collide=%d\n",
 		   atomic_read(&n_vopen_verdict_calls), atomic_read(&n_vopen_verdict_true),
 		   atomic_read(&n_vopen_fake_try), atomic_read(&n_vopen_fake_neg),
@@ -4197,10 +3991,10 @@ __nocfi int susfs_vfs_open_init(void)
 			   (int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	SUSFS_LOGI("susfs_vfs_open armed: %u points (%u kernel / %u ours / %u inlined), fake=%d drop=%d drop_fake=%d proc=%d\n",
+	SUSFS_LOGI("susfs_vfs_open armed: %u points (%u kernel / %u ours / %u inlined), drop=%d proc=%d\n",
 		   (unsigned int)ARRAY_SIZE(susfs_vfs_bindings), susfs_vfs_asm_kernel,
-		   susfs_vfs_asm_ours, susfs_vfs_asm_inlined, vopen_fake,
-		   (int)vopen_drop, (int)vopen_drop_fake, vopen_proc_entry != NULL);
+		   susfs_vfs_asm_ours, susfs_vfs_asm_inlined,
+		   (int)vopen_drop, vopen_proc_entry != NULL);
 	susfs_vfs_open_dump();
 	return 0;
 }

@@ -462,7 +462,7 @@ static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
 		pos = putstr(pos, "\n  read: A and B must overlap in the SAME state (cold vs cold, or\n"
 				  "  warm vs warm).  One cold sample at the start of each side is the warm-up,\n"
 				  "  not a difference.  A bimodal A means some calls took another route - check\n"
-				  "  resolve:/verdict:/mode3: in /proc/susfs_vfs_open.\n");
+				  "  resolve:/verdict: in /proc/susfs_vfs_open.\n");
 		sys6(SYS_write, 1, (long)out, pos, 0, 0, 0);
 	}
 }
