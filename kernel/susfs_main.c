@@ -14,6 +14,7 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
+#include "susfs_vfs_open.h"	/* SUSFS_VFS_OPEN_NODE + the vendored O_PATH walk */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -49,6 +50,9 @@ static const char *const susfs_self_hide_paths[] = {
     /* The O_PATH layer's node: it reports the four sys_call_table/compat_sys_call_table
      * entries and the counters that say whether a wrapper ever ran. */
     SUSFS_OPATH_NODE,
+    /* The vendored O_PATH walk's node: the load-time assembly report, the leaf
+     * resolution table, the edge scan and the frame self-check. */
+    SUSFS_VFS_OPEN_NODE,
     /* The module's own sysfs directory is NOT here: it belongs to hide_module
      * (susfs_hide_syms.c), which adds and drops that rule at runtime. */
 };
@@ -105,6 +109,13 @@ static struct {
     { "ksu_umount_gate", susfs_ksu_umount_gate_init,	NULL,			false, false },
     { "lsm_hook",	layer_lsm_hook_init,		ksu_lsm_hook_exit,	false, false },
     { "sus_path",	sus_path_init,			sus_path_exit,		true,  false },
+    /* Before opath, because opath's wrappers call INTO this layer on every O_PATH call:
+     * arming the caller first would install table entries that answer through a
+     * half-resolved vendor layer.  NOT fatal - when this layer is off (any kernel line
+     * other than 5.15, or a required leaf symbol this device does not have) O_PATH keeps
+     * the post-check answer, which is exactly what arming opath alone did before this
+     * file existed. */
+    { "vfs_open",	susfs_vfs_open_init,		susfs_vfs_open_exit,	false, false },
     /* After sus_path, because this layer asks sus_path's rule table for every open it
      * post-checks - arming it first would install table entries that answer from a table
      * nobody has filled in yet.  NOT fatal: a failure here only means open(..., O_PATH) keeps

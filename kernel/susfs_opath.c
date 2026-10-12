@@ -67,6 +67,7 @@
 #include "susfs.h"		/* susfs_control_node_allowed(), sus_path_inode_hidden_public() */
 #include "susfs_opath.h"
 #include "susfs_fp_hook.h"
+#include "susfs_vfs_open.h"	/* the vendored O_PATH walk, which answers before the original entry */
 
 /* The AArch32 numbers.  No arm64 header defines them as __NR_*: they are what
  * arch/arm64/include/asm/unistd32.h is generated from, i.e.
@@ -271,18 +272,40 @@ static __nocfi long susfs_opath_post(long ret)
  * n_opath_seen is bumped here rather than in susfs_opath_post() so that a skipped ordinary open
  * still shows up as "a wrapper ran" - that counter is what tells a device bring-up apart
  * "the entry is not reached at all" from "the entry is reached and the O_PATH test says no". */
-#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg)			\
+/* The fourth parameter is the SUSFS_VFS_SITE_* number of this entry, or -1 for an entry the
+ * vendored walk does not implement.  Where it applies, the vendored layer (susfs_vfs_open.c) is
+ * asked FIRST, and only a false answer falls through to the original entry:
+ *   - it answers from the inode it resolved, i.e. inside the lookup, so a hidden component fails
+ *     with the cost structure of a component that is not there (the timing side channel the
+ *     post-check below cannot close), and
+ *   - the post-check is STILL run on its answer.  That is not redundancy for its own sake: this
+ *     file judges the inode the kernel (or the vendored walk) actually produced, so it is the
+ *     backstop for a TOCTOU window and for a hole in the vendored walk - the two failure modes
+ *     that would leak a descriptor.  Where this file is the only answer (a kernel line other
+ *     than 5.15, an unresolved leaf symbol, vopen_enable=0, or the AArch32 open/openat entries)
+ *     nothing changes at all.
+ * For openat2 the flags are not in a register, so the vendored layer does the one
+ * copy_from_user() of the caller's struct open_how and decides from the copied value; when the
+ * copy fails it declines and the original entry answers, which is the same errno it would have
+ * produced. */
+#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg, site)			\
 	static __nocfi long fn(const struct pt_regs *regs)		\
 	{								\
 		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
-		long ret;						\
+		long ret = -ENOSYS;					\
 									\
 		if (!orig)						\
 			return -ENOSYS;					\
-		ret = orig(regs);					\
 		atomic_inc(&n_opath_seen);				\
-		if ((flags_reg) >= 0 && !(regs->regs[flags_reg] & O_PATH))	\
-			return ret;					\
+		if ((flags_reg) >= 0 &&				\
+		    !(regs->regs[flags_reg] & O_PATH)) {		\
+			/* Ordinary open: the original entry, untouched. */	\
+			return orig(regs);				\
+		}							\
+		if ((site) >= 0 &&					\
+		    susfs_vfs_open_syscall((site), regs, &ret))		\
+			return susfs_opath_post(ret);			\
+		ret = orig(regs);					\
 		return susfs_opath_post(ret);				\
 	}
 
@@ -292,11 +315,11 @@ static susfs_syscall_fn_t opath_orig_compat_open;
 static susfs_syscall_fn_t opath_orig_compat_openat;
 static susfs_syscall_fn_t opath_orig_compat_openat2;
 
-SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2)
-SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2, SUSFS_VFS_SITE_OPENAT)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1, SUSFS_VFS_SITE_OPENAT2)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1, SUSFS_VFS_SITE_OPENAT2)
 
 /* The five entries.  nr < 0 means "no native entry": arm64 has no native open at all, and for
  * the AArch32 open(5) the native number 5 is setxattr (include/uapi/asm-generic/unistd.h:47) -
@@ -421,6 +444,14 @@ static void susfs_opath_dump_all(void)
 					 susfs_fp_compat_syscall_table(),
 					 h->nr_compat, h->sym);
 	}
+
+	/* The vendored walk's own report: one line per point saying which
+	 * implementation it ended up with (the kernel's entity or this module's copy),
+	 * the leaf resolution table, the edge scan and the frame self-check.  Printed
+	 * from here as well as from the vendor layer's own init(), because opath_dump=1
+	 * is the switch a bring-up uses to read the device's answers before anything is
+	 * installed. */
+	susfs_vfs_open_dump();
 }
 
 /* ---- /proc/susfs_opath ---- */
