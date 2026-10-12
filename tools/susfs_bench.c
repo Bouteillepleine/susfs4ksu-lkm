@@ -354,9 +354,9 @@ static u64 putdist(u64 pos, const char *label, const long *s, int n)
 			i++;
 		}
 		if (b < 6 || b >= nb - 6) {
-			pos = putnum(pos, (u64)((lo + b) * 100));
+			pos = putnum(out, pos, (u64)((lo + b) * 100));
 			pos = putstr(pos, ":");
-			pos = putnum(pos, (u64)cnt);
+			pos = putnum(out, pos, (u64)cnt);
 			pos = putstr(pos, " ");
 		} else if (b == 6 && nb > 12) {
 			pos = putstr(pos, "... ");
