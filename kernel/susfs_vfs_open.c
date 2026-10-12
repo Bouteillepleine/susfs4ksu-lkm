@@ -530,6 +530,17 @@ static int susfs_vfs_copy_open_how(const void __user *u, size_t usize, struct op
 int vopen_enable = 1;
 module_param_named(vopen_enable, vopen_enable, int, 0644);
 
+/* Verdict tracing, declared here with the other parameters: writing N to vopen_dbg logs the
+ * next N decisions with their input, filtered to vopen_dbg_name when that is non-empty (it
+ * has to be filtered - every process's O_PATH opens pass through this layer, so an unfiltered
+ * window drains before the benchmark starts, which is how the first trace came back without
+ * the benchmark's own component in it). */
+int vopen_dbg;
+module_param_named(vopen_dbg, vopen_dbg, int, 0644);
+
+static char vopen_dbg_name[64];
+module_param_string(vopen_dbg_name, vopen_dbg_name, sizeof(vopen_dbg_name), 0644);
+
 /* 0 = refuse the hidden component immediately (no extra lookup at all), 1 = always the
  * same derived name for a directory (its negative dentry stays cached, so only the
  * first call pays a real lookup), 2 = a fresh derived name per call (every call pays a
@@ -547,6 +558,17 @@ module_param_named(vopen_drop, vopen_drop, bool, 0644);
 bool vopen_drop_fake;
 module_param_named(vopen_drop_fake, vopen_drop_fake, bool, 0644);
 
+
+/* Countdown as well: writing N logs the next N verdict decisions, with their input
+ * (dentry name, inode, dev, uid) and their answer, and then stops.  This exists because
+ * the device reports a case that cannot happen if the verdict is asked the question the
+ * code thinks it asks: the post-check layer - the same predicate, in the same task, on
+ * the inode this layer's walk handed out - answers HIDDEN for /proc/susfs_kstat while
+ * this layer's own verdict answers "not hidden" for every one of 8640 walks (hidden=0,
+ * fa_* whatever, old layer deny +8000).  Two calls that cannot differ must not be
+ * guessed about, so from here on the verdict prints its input.  The parameter itself is
+ * declared up with the others. */
+
 /*
  * Name filter for the tracing below: with this set, only a component whose dentry name
  * matches it is logged.  Without it the log is useless on a phone - every process's
@@ -554,8 +576,6 @@ module_param_named(vopen_drop_fake, vopen_drop_fake, bool, 0644);
  * benchmark starts, which is exactly how the first trace came back with the benchmark's
  * own component missing.
  */
-static char vopen_dbg_name[64];
-module_param_string(vopen_dbg_name, vopen_dbg_name, sizeof(vopen_dbg_name), 0644);
 
 /*
  * True when this component should be traced (and consumes one from the vopen_dbg
@@ -588,16 +608,6 @@ static bool susfs_vfs_dbg_on(const char *name, unsigned int len)
 	return true;
 }
 
-/* Countdown as well: writing N logs the next N verdict decisions, with their input
- * (dentry name, inode, dev, uid) and their answer, and then stops.  This exists because
- * the device reports a case that cannot happen if the verdict is asked the question the
- * code thinks it asks: the post-check layer - the same predicate, in the same task, on
- * the inode this layer's walk handed out - answers HIDDEN for /proc/susfs_kstat while
- * this layer's own verdict answers "not hidden" for every one of 8640 walks (hidden=0,
- * fa_* whatever, old layer deny +8000).  Two calls that cannot differ must not be
- * guessed about, so from here on the verdict prints its input. */
-int vopen_dbg;
-module_param_named(vopen_dbg, vopen_dbg, int, 0644);
 
 /* Not a switch: writing N logs the next N frames and then stops by itself, so a
  * benchmark run cannot turn the self-check into a dmesg flood whose own cost would then
@@ -2744,7 +2754,7 @@ static __nocfi const char *walk_component(struct nameidata *nd, int flags)
 	atomic_inc(&n_vopen_enter_walk_component);
 	if (susfs_vfs_dbg_on(nd->last.name, nd->last.len))
 		pr_info("susfs_vfs_open: walk_component name=%.*s type=%d flags=%#x\n",
-			(int)nd->last.len, nd->last.name, nd->last_type, flags);
+			(int)nd->last.len, (const char *)nd->last.name, nd->last_type, flags);
 	struct dentry *dentry;
 	struct inode *inode;
 	unsigned seq;
@@ -3025,7 +3035,7 @@ static __nocfi const char *lookup_last(struct nameidata *nd)
 	atomic_inc(&n_vopen_enter_lookup_last);
 	if (susfs_vfs_dbg_on(nd->last.name, nd->last.len))
 		pr_info("susfs_vfs_open: lookup_last name=%.*s type=%d\n",
-			(int)nd->last.len, nd->last.name, nd->last_type);
+			(int)nd->last.len, (const char *)nd->last.name, nd->last_type);
 	if (nd->last_type == LAST_NORM && nd->last.name[nd->last.len])
 		nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
 
