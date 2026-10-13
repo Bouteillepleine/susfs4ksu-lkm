@@ -68,7 +68,15 @@ typedef long s64;
 #define O_DIRECTORY    0x10000
 
 #define STATX_BASIC_STATS 0x7ff
-#define MAX_SAMPLES 300
+/* Samples per side in `-p` mode.  It was 300, which is plenty for "is there a difference at all"
+ * but not for the question that actually decides a visibility test: an attacker is NOT allowed
+ * to pair calls (it does not know which path is hidden), so it has to work from the distribution
+ * alone - and its budget is cheap, since 20000 single calls is about 40ms of syscall time.  At
+ * that sample count the standard error of the mean is a few nanoseconds, so what this tool can
+ * resolve is a systematic offset of tens of nanoseconds, which is the honest measure of "could
+ * this be told apart".  The price is BSS: three long arrays of 20000 is 480KB in a static-pie
+ * tool, and the histogram below is capped at a fixed bucket count so it is unaffected. */
+#define MAX_SAMPLES 20000
 #define DBUF 4096
 
 static char out[512];
