@@ -557,10 +557,11 @@ jobs:
           check_group "mount id allocator"  "mnt_id_xa+__xa_alloc+__xa_erase" "mnt_id_ida+ida_alloc_range+ida_free"
           check_group "cache maintenance"   "dcache_clean_inval_poc+caches_clean_inval_pou" "__flush_dcache_area"
           check_group "kallsyms by name"    "kallsyms_on_each_match_symbol" "kallsyms_lookup_name" "kallsyms_on_each_symbol"
-          # close_fd_get_file() (5.15, fs/file.c:795) is file_close_fd() from 6.12 on
-          # (fs/file.c:784) with the same contract, and susfs_opath resolves whichever the
-          # kernel has. That makes it a rename pair, not two features: listed flat, one of
-          # the two would warn on every single variant.
+          # close_fd_get_file() (5.15, fs/file.c:795) became file_close_fd() (6.11+,
+          # fs/file.c:778), and the two do NOT share a signature: the first returns an int
+          # status and fills an out-param, the second returns the file.  susfs_opath keeps a
+          # separate pointer per name, so either one arms the layer - which is what this
+          # group asserts.  Listed flat, one of the two would warn on every single variant.
           check_group "fd-table close helper" "close_fd_get_file" "file_close_fd"
 
           # __static_call_update is resolved by name but is NOT required: lsm_hook.c falls back to
