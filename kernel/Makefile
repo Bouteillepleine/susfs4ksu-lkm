@@ -12,7 +12,7 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
               susfs_uname.o susfs_kstat.o sus_map.o sus_path.o sus_mount.o \
               spoof_cmdline.o susfs_open_redirect.o susfs_enable_log.o \
               susfs_avc_spoof.o susfs_supercall.o susfs_hide_syms.o imports_guard.o \
-              ksu_umount_gate.o susfs_fp_hook.o susfs_opath.o
+              ksu_umount_gate.o susfs_fp_hook.o susfs_opath.o susfs_vfs_open.o
 
 # 5.14+ replaced __flush_dcache_area/__flush_icache_range with
 # dcache_clean_inval_poc/caches_clean_inval_pou.  Detect which to use.
@@ -44,6 +44,21 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
 # fs/mount.h (struct mount + real_mount) is a private header; its includes are
 # all public, so -I$(srctree)/fs is enough to reach it via #include "mount.h".
 ccflags-y += -I$(srctree)/fs
+
+# Stack protector: arm64 got its per-task canary (read from sp_el0, no symbol involved) in 5.11,
+# and the module inherits the kernel's mode.  Below that the kernel uses the global
+# __stack_chk_guard, which the module then references - and that is the name `ksud insmod` cannot
+# resolve (its kallsyms walk stops at the first record that is not three fields, while the bundled
+# susfs_insmod reads the file to the end and does find it), so the load dies with
+# "Unknown symbol __stack_chk_guard".  Nothing is lost where the kernel predates the canary: the
+# guard would only protect this module's own stack.
+KSU_KERNEL_HAS_PER_TASK_GUARD := $(shell [ "$(VERSION)" -gt 5 ] && echo yes)
+ifeq ($(VERSION),5)
+KSU_KERNEL_HAS_PER_TASK_GUARD := $(shell [ "$(PATCHLEVEL)" -ge 11 ] && echo yes)
+endif
+ifneq ($(KSU_KERNEL_HAS_PER_TASK_GUARD),yes)
+ccflags-y += -fno-stack-protector
+endif
 
 # SELinux private headers are not needed: the LSM layer reaches SELinux through the live
 # security_hook_heads / static_calls_table (see kernel/lsm_hook.c), not through ss/ or flask.h,

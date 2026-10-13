@@ -67,6 +67,7 @@
 #include "susfs.h"		/* susfs_control_node_allowed(), sus_path_inode_hidden_public() */
 #include "susfs_opath.h"
 #include "susfs_fp_hook.h"
+#include "susfs_vfs_open.h"	/* the vendored O_PATH walk, which answers before the original entry */
 
 /* The AArch32 numbers.  No arm64 header defines them as __NR_*: they are what
  * arch/arm64/include/asm/unistd32.h is generated from, i.e.
@@ -107,6 +108,15 @@ static inline bool opath_has_landing_pad(const void *fn)
  * instead (the counters and the log say which name was missing). */
 static struct file *(*opath_fget_raw)(unsigned int fd);
 static int (*opath_close_fd_get_file)(unsigned int fd, struct file **res);
+/* ...and the two the dentry-drop experiment needs (opath_drop_dentry).  Resolved by name for
+ * the same reason as everything else here, and one more: taking their addresses directly would
+ * put new names into the module's undefined-symbol list, which the loaders and the CI's symbol
+ * gates read - an experiment must not move those.
+ * dget() is deliberately NOT in this list: on 5.15 it is a static inline in <linux/dcache.h>
+ * (lockref_get of d_lockref) with no kallsyms entry at all - measured on the device - so the
+ * inline is called directly below. */
+static void (*opath_d_invalidate)(struct dentry *dentry);
+static void (*opath_dput)(struct dentry *dentry);
 /* Which of the two names the kernel above answered to (see susfs_opath_init): only the log
  * needs it, and a log that prints a pointer without the name it came from cannot tell
  * close_fd_get_file from file_close_fd on a kernel where one of them is missing. */
@@ -119,12 +129,28 @@ static atomic_t n_opath_opath = ATOMIC_INIT(0);	/* of those, the O_PATH ones */
 static atomic_t n_opath_hidden = ATOMIC_INIT(0);	/* of those, sus_path said hidden */
 static atomic_t n_opath_deny = ATOMIC_INIT(0);	/* of those, the fd was taken away */
 static atomic_t n_opath_err = ATOMIC_INIT(0);	/* lookups that failed, or an fd not ours */
+static atomic_t n_opath_dropped = ATOMIC_INIT(0);	/* deny path: dentries invalidated (opath_drop_dentry) */
 
 int opath_test;
 module_param_named(opath_test, opath_test, int, 0644);
 
 int opath_dump;
 module_param_named(opath_dump, opath_dump, int, 0644);
+
+/* EXPERIMENT (2026-10-11).  Measured on the device with susfs_bench -p 7: a hidden path answers
+ * -ENOENT about 1.3 us FASTER than a path that does not exist at all (2787 vs 4092 ns at p50,
+ * 30/30 samples, perfectly separable) - because the hidden path took a successful, cached
+ * lookup and was then refused, while the other one paid a real lookup that failed.  If that is
+ * where the whole gap comes from, invalidating the hidden path's dentry on the way out closes it
+ * without vendoring a walk: the next lookup of that path is a real one again.
+ *
+ * Runtime-writable on purpose, so both states can be compared inside ONE loaded module:
+ *     echo 1 > /sys/module/susfs_guard_lkm/parameters/opath_drop_dentry
+ * It is an experiment, not the fix: the dentry is dropped for every caller (root re-looks it up
+ * and still sees the file, the LSM gate decides that), and a hidden path that is opened in a
+ * loop now pays a real lookup each time. */
+bool opath_drop_dentry;
+module_param_named(opath_drop_dentry, opath_drop_dentry, bool, 0644);
 
 /* Set by susfs_opath_exit() before it touches anything; read by the arm path.  There is no
  * lock around it, and that is deliberate - see the note in susfs_opath_exit(). */
@@ -165,10 +191,23 @@ static __nocfi long susfs_opath_post(long ret)
 
 	hidden = sus_path_inode_hidden_public(d_inode(f->f_path.dentry));
 
-	/* Release before deciding: the deny path takes an fd-table lock, and holding a file
-	 * reference across it buys nothing (the file is in this task's table and cannot go
-	 * away while its own syscall is running). */
-	fput(f);
+	/* The experiment: drop the dentry so that the NEXT lookup of this path is a real one.
+	 * dget() first, because d_invalidate() may drop the last reference while the file still
+	 * holds one - and it has to happen before fput(f), since the dentry comes from that file. */
+	if (hidden && READ_ONCE(opath_drop_dentry) && opath_d_invalidate && opath_dput) {
+		struct dentry *drop = f->f_path.dentry;
+
+		dget(drop);
+		fput(f);
+		opath_d_invalidate(drop);
+		opath_dput(drop);
+		atomic_inc(&n_opath_dropped);
+	} else {
+		/* Release before deciding: the deny path takes an fd-table lock, and holding a file
+		 * reference across it buys nothing (the file is in this task's table and cannot go
+		 * away while its own syscall is running). */
+		fput(f);
+	}
 
 	if (!hidden)
 		return ret;
@@ -233,18 +272,40 @@ static __nocfi long susfs_opath_post(long ret)
  * n_opath_seen is bumped here rather than in susfs_opath_post() so that a skipped ordinary open
  * still shows up as "a wrapper ran" - that counter is what tells a device bring-up apart
  * "the entry is not reached at all" from "the entry is reached and the O_PATH test says no". */
-#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg)			\
+/* The fourth parameter is the SUSFS_VFS_SITE_* number of this entry, or -1 for an entry the
+ * vendored walk does not implement.  Where it applies, the vendored layer (susfs_vfs_open.c) is
+ * asked FIRST, and only a false answer falls through to the original entry:
+ *   - it answers from the inode it resolved, i.e. inside the lookup, so a hidden component fails
+ *     with the cost structure of a component that is not there (the timing side channel the
+ *     post-check below cannot close), and
+ *   - the post-check is STILL run on its answer.  That is not redundancy for its own sake: this
+ *     file judges the inode the kernel (or the vendored walk) actually produced, so it is the
+ *     backstop for a TOCTOU window and for a hole in the vendored walk - the two failure modes
+ *     that would leak a descriptor.  Where this file is the only answer (a kernel line other
+ *     than 5.15, an unresolved leaf symbol, vopen_enable=0, or the AArch32 open/openat entries)
+ *     nothing changes at all.
+ * For openat2 the flags are not in a register, so the vendored layer does the one
+ * copy_from_user() of the caller's struct open_how and decides from the copied value; when the
+ * copy fails it declines and the original entry answers, which is the same errno it would have
+ * produced. */
+#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg, site)			\
 	static __nocfi long fn(const struct pt_regs *regs)		\
 	{								\
 		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
-		long ret;						\
+		long ret = -ENOSYS;					\
 									\
 		if (!orig)						\
 			return -ENOSYS;					\
-		ret = orig(regs);					\
 		atomic_inc(&n_opath_seen);				\
-		if ((flags_reg) >= 0 && !(regs->regs[flags_reg] & O_PATH))	\
-			return ret;					\
+		if ((flags_reg) >= 0 &&				\
+		    !(regs->regs[flags_reg] & O_PATH)) {		\
+			/* Ordinary open: the original entry, untouched. */	\
+			return orig(regs);				\
+		}							\
+		if ((site) >= 0 &&					\
+		    susfs_vfs_open_syscall((site), regs, &ret))		\
+			return susfs_opath_post(ret);			\
+		ret = orig(regs);					\
 		return susfs_opath_post(ret);				\
 	}
 
@@ -254,11 +315,11 @@ static susfs_syscall_fn_t opath_orig_compat_open;
 static susfs_syscall_fn_t opath_orig_compat_openat;
 static susfs_syscall_fn_t opath_orig_compat_openat2;
 
-SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2)
-SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2, SUSFS_VFS_SITE_OPENAT)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1, SUSFS_VFS_SITE_OPENAT2)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1, SUSFS_VFS_SITE_OPENAT2)
 
 /* The five entries.  nr < 0 means "no native entry": arm64 has no native open at all, and for
  * the AArch32 open(5) the native number 5 is setxattr (include/uapi/asm-generic/unistd.h:47) -
@@ -383,6 +444,14 @@ static void susfs_opath_dump_all(void)
 					 susfs_fp_compat_syscall_table(),
 					 h->nr_compat, h->sym);
 	}
+
+	/* The vendored walk's own report: one line per point saying which
+	 * implementation it ended up with (the kernel's entity or this module's copy),
+	 * the leaf resolution table, the edge scan and the frame self-check.  Printed
+	 * from here as well as from the vendor layer's own init(), because opath_dump=1
+	 * is the switch a bring-up uses to read the device's answers before anything is
+	 * installed. */
+	susfs_vfs_open_dump();
 }
 
 /* ---- /proc/susfs_opath ---- */
@@ -414,10 +483,11 @@ static int opath_proc_show(struct seq_file *m, void *v)
 	 * counters are what a bring-up is judged by - seen without opath means the wrapper runs
 	 * and every open it sees is not an O_PATH one, and hidden without deny would mean the fd
 	 * was not taken away. */
-	seq_printf(m, "seen=%d opath=%d hidden=%d deny=%d err=%d (opath_test=%d opath_dump=%d)\n",
+	seq_printf(m, "seen=%d opath=%d hidden=%d deny=%d err=%d dropped=%d (opath_test=%d opath_dump=%d opath_drop_dentry=%d)\n",
 		   atomic_read(&n_opath_seen), atomic_read(&n_opath_opath),
 		   atomic_read(&n_opath_hidden), atomic_read(&n_opath_deny),
-		   atomic_read(&n_opath_err), opath_test, opath_dump);
+		   atomic_read(&n_opath_err), atomic_read(&n_opath_dropped),
+		   opath_test, opath_dump, (int)opath_drop_dentry);
 	return 0;
 }
 
@@ -441,6 +511,18 @@ int susfs_opath_init(void)
 	}
 
 	opath_fget_raw = (void *)find_kernel_symbol_exact("fget_raw");
+
+	/* The three the dentry-drop experiment needs.  Only required when the switch is on: with
+	 * opath_drop_dentry=0 they are never called, and a kernel that has none of them should not
+	 * lose the layer over an experiment.  Turning the switch off when a name is missing is the
+	 * honest answer - a silently half-wired experiment would measure nothing. */
+	opath_d_invalidate = (void *)find_kernel_symbol_exact("d_invalidate");
+	opath_dput = (void (*)(struct dentry *))find_kernel_symbol_exact("dput");
+	if (opath_drop_dentry && (!opath_d_invalidate || !opath_dput)) {
+		pr_warn("opath: opath_drop_dentry is on but d_invalidate=%px dput=%px - the experiment stays off\n",
+			(void *)opath_d_invalidate, (void *)opath_dput);
+		opath_drop_dentry = false;
+	}
 
 	/* One function, two names: 6.11 reworked the fd-table internals, so what 5.15 calls
 	 * close_fd_get_file() (fs/file.c:795-805) is file_close_fd() from 6.12 on
