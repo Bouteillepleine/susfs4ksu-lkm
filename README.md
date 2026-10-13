@@ -1,3 +1,5 @@
+[English](README.en.md)
+
 # susfs4ksu-lkm
 
 SUSFS 的**可加载内核模块（LKM）移植版**：让 susfs 可以在不用重编译内核的情况下运行 。

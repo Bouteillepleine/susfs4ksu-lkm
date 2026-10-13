@@ -1,3 +1,5 @@
+[English](PROC_INTERFACES.en.md)
+
 # /proc 控制接口
 
 本模块（`susfs_guard_lkm`）的全部 `/proc` 节点。状态与 `reboot(2)` supercall 同步。
