@@ -106,7 +106,17 @@ echo "del <目标>"                                               > /proc/susfs_
 echo clear                                                      > /proc/susfs_open_redirect
 ```
 
-`uid_scheme` 取值 `0..4` **注意**这个功能并未完全实习 ，3,4不可用。
+`uid_scheme` 取值 `0..4`，越界在 `add` 阶段直接拒绝（`-EINVAL`）。当前实现（`kernel/susfs_open_redirect.c` 的 `or_uid_matches()`，枚举在 `kernel/susfs_abi.h`）：
+
+| 值 | 判定为"命中"的条件 |
+|---|---|
+| 0 | `uid % 100000 < 10000`（非 app 进程） |
+| 1 | `uid == 0` 且不在 su 域 |
+| 2 | 不在 su 域 |
+| 3 | KernelSU 报"这个进程会被 umount"（`susfs_is_current_proc_umounted_app()`） |
+| 4 | 同上——上游的 3 还额外要求 `uid >= 10000`，本实现里两者是同一个谓词 |
+
+反向伪装（`d_path()` / `statfs()` / fdinfo / `maps`）**不看**规则的 `uid_scheme`：它按 inode 标志 + "这个进程会被 umount" 判定，所以 **scheme 0 的规则对 app 进程同样做反向伪装**（与上游一致）。
 
 ---
 
