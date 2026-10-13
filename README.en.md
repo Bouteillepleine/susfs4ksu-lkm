@@ -14,8 +14,6 @@ Pick the `.ko` that matches the device kernel, e.g. a 5.15 device uses `susfs_gu
 ksud insmod /data/adb/loader/susfs_guard_lkm.ko
 ```
 
-If `ksud insmod` fails with an unknown-symbol error - reported on every release - load the same `.ko` with `susfs_insmod` instead: it works and the module is fully functional.
-
 **Non-KernelSU devices**: use the `susfs_insmod` loader shipped with the release:
 
 ```sh
