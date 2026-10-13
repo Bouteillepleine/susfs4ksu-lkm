@@ -1,6 +1,6 @@
 # /proc 控制接口
 
-本模块（`susfs_guard_lkm`）的全部 `/proc` 节点。状态与`reboot(2)`  supercall 同步。
+本模块（`susfs_guard_lkm`）的全部 `/proc` 节点。状态与 `reboot(2)` supercall 同步。
 
 **注意**
 
@@ -21,13 +21,14 @@
 | [`/proc/susfs_opath`](#procsusfs_opath) | `open(..., O_PATH)` 在隐藏路径上的覆盖自检 | —（只读；两个参数 `opath_test` / `opath_dump`） |
 
 节点只在 sus_path 的 LSM 层装上时才创建。
+
 ---
 
 ## /proc/susfs_kstat
 
 登记一个路径，让 app 看到的 `stat()`/`statx()`/`maps` 里的 inode 与时间戳变成登记时的值。
 
-**读**：每条规则一行，外加 `maps:` 行、每种 stat 号码一行（native 与 compat 各一组）、一条未列出号码的汇总行，以及 dirent 过滤器的统计块。
+**读**：每条规则一行，外加 `maps:` 行、每种 stat 号码一行（native 与 32 位表各一组）、一条未覆盖号码的汇总行，以及 dirent 过滤器的统计块。
 
 ```
 /data/local/tmp/procdoc/target ino=981881 dev=65099 flags=0xff3 [ino=981881 dev=65099 nlink=1 size=2 atime=1789400211.918607439 mtime=1789400211.930607439 ctime=1789400211.946607439 blocks=8 blksize=4096]
@@ -42,9 +43,9 @@ stat unlisted-nr hits=0 (stat-range numbers the dispatcher did not know: last 8 
   dirent (via the stat layer's entries): l64=0 compat=0 | no-filter(l64=0 compat=0) bad-ret(l64=0 compat=0) null-buf(l64=0 compat=0) no-rule(l64=0 compat=0) rewrite-fail=0 all-hidden=0 pending=0
 ```
 
-外层是登记目标，方括号里是伪装值。`maps:` 是 `maps` 行改写探针。`stat nr <名字> (<号码>):` 每行是一种 stat 号码的计数器：`ok` 是命中登记规则的次数、`rw` 是真正改写了缓冲的次数，`|` 之后是各条早退路径的计数（返回错误、没有缓冲、登记为空、门控拒绝、查不到规则、命中但没有 flag、uaccess 失败、窄写回）——"登记了"与"真的被命中"因此可以分开看。名字带 `/compat` 后缀的是 32 位表项那一行。`stat unlisted-nr` 汇总落在 stat 号码区间、但派发器不认识的号码，并回放最近 8 个。dirent 过滤器的统计块由 `sus_path.c` 的 `sus_path_dirent_stat_line()` 打印。
+外层是登记目标，方括号里是伪装值。`maps:` 是 `maps` 行改写探针。`stat nr <名字> (<号码>):` 每行是一种 stat 号码的计数器：`ok` 是命中登记规则的次数、`rw` 是真正改写了缓冲的次数，`|` 之后是各条早退路径的计数（返回错误、没有缓冲、登记为空、门控拒绝、查不到规则、命中但没有 flag、uaccess 失败、窄写回）——"登记了"与"真的被命中"因此可以分开看。名字带 `/compat` 后缀的是 32 位表那一行。`stat unlisted-nr` 汇总落在 stat 号码区间、但不被覆盖的号码，并回放最近 8 个。
 
-**覆盖范围**：由 `sys_call_table` / `compat_sys_call_table` 的 14 个表项接管（`kernel/susfs_kstat.c` 的 `kstat_hooks[]`），在原 syscall 返回后重写用户缓冲。native：`newfstatat`(79)、`fstat`(80)、`statx`(291)、`getdents64`(61)。AArch32：`fstatat64`(327)、`stat64`(195)、`lstat64`(196)、`fstat64`(197) → `struct stat64`；`stat`(106)、`lstat`(107)、`fstat`(108) → `struct compat_stat`（偏移 `st_dev+0 st_ino+4 st_nlink+10 st_size+20 st_blksize+24 st_blocks+28 atime+32/36 mtime+40/44 ctime+48/52`）；`statx`(397)；`getdents64`(217)、`getdents`(141)。**AArch32 的 `stat()`/`lstat()`/`fstat()` 已在覆盖范围内**（r18.1 起）。未列出号码仍会记进 `stat unlisted-nr hits=`，并出现在 "last 8 seen" 回放里。
+**覆盖范围**：native 与 AArch32（32 位表）的两条 syscall 表上共 14 处——两边的全部 stat 家族接口（`newfstatat` / `fstat` / `statx` 及 `stat64` / `lstat64` / `fstat64` / `fstatat64` / `stat` / `lstat` / `fstat`）加 `getdents64` / `getdents`。AArch32 的 `stat()` / `lstat()` / `fstat()` 自 r18.1 起也在覆盖范围内。未覆盖的号码仍会记进 `stat unlisted-nr hits=`，并出现在 "last 8 seen" 回放里。
 
 **写**：
 
@@ -65,7 +66,7 @@ echo clear                                                   > /proc/susfs_kstat
 
 `open(..., O_PATH)` 在 sus_path 隐藏路径上的覆盖自检。只读。
 
-**读**：每个被替换的表项一行，末尾一行汇总计数。
+**读**：每一处被接管的入口一行，末尾一行汇总计数。
 
 ```
 [1] opath/openat nr=56 nr_compat=0 installed=1 wrapper=ffffffc0… orig=ffffffc0… orig_compat=0000000000000000
@@ -76,13 +77,13 @@ echo clear                                                   > /proc/susfs_kstat
 seen=4940 opath=1078 hidden=5 deny=5 err=0 (opath_test=0 opath_dump=0)
 ```
 
-`installed=1` 表示该表项已替换；`orig` 是替换前的表项，卸载时按它还原；`nr=-1` 表示该表项只在 32 位表里（编号在 `nr_compat`）。计数：`seen` = wrapper 被调用的次数，`opath` = 其中确实是 `O_PATH` 打开的，`hidden` = 命中 sus_path 规则的，`deny` = descriptor 被收走并回 `-ENOENT` 的，`err` = 符号解析一类错误。
+`installed=1` 表示该入口已接管；`orig` 是接管前的值，卸载时按它还原；`nr=-1` 表示这只在 32 位表里（编号在 `nr_compat`）。计数：`seen` = 被调用次数，`opath` = 其中确实是 `O_PATH` 打开的，`hidden` = 命中 sus_path 规则的，`deny` = descriptor 被收走并回 `-ENOENT` 的，`err` = 内部错误。
 
 **参数**（`/sys/module/susfs_guard_lkm/parameters/`）：
 
 ```sh
-echo 3 > .../parameters/opath_test     # 只装第 3 个表项（1..5），其余不动
-echo 1 > .../parameters/opath_dump     # 只打印每个表项的值与符号，不替换任何东西
+echo 3 > .../parameters/opath_test     # 只装第 3 个入口（1..5），其余不动
+echo 1 > .../parameters/opath_dump     # 只打印每个入口的值与符号，不接管任何东西
 ```
 
 ---
@@ -106,22 +107,17 @@ echo "del <目标>"                                               > /proc/susfs_
 echo clear                                                      > /proc/susfs_open_redirect
 ```
 
-`uid_scheme` 取值 `0..4`，越界在 `add` 阶段直接拒绝（`-EINVAL`）。当前实现（`kernel/susfs_open_redirect.c` 的 `or_uid_matches()`，枚举在 `kernel/susfs_abi.h`）：
+`uid_scheme` 取值 `0..4`，越界在 `add` 阶段直接拒绝（`-EINVAL`）：
 
 | 值 | 判定为"命中"的条件 |
 |---|---|
-| 0 | `uid % 100000 < 10000`（非 app 进程） |
+| 0 | 非 app 进程（`uid % 100000 < 10000`） |
 | 1 | `uid == 0` 且不在 su 域 |
 | 2 | 不在 su 域 |
-| 3 | KernelSU 报"这个进程会被 umount"（`susfs_is_current_proc_umounted_app()`） |
-| 4 | KernelSU 报"这个进程会被 umount"，不带 uid 条件（`susfs_is_current_proc_umounted()`） |
+| 3 | uid 属于 app 且该 app 会被 umount |
+| 4 | 会被 umount，不看 uid |
 
-与上游的差别（`susfs.c:954-961`、`susfs_def.h:98-125`）：
-
-- **scheme 3**：上游是 `TIF_PROC_UMOUNTED && uid >= 10000`。本实现 uid 那一半相同，"是否已被 KernelSU umount"改为**按 uid 问 KernelSU**（`ksu_uid_should_umount`，issue #34），而上游是**每线程**标志 ⇒ 粒度不同：同一个 uid 下未被 umount 的进程（isolated service、KSU 白名单里的 app）上游不命中、本实现命中。符号解析不到时退回纯 `uid >= 10000` 并打印警告。
-- **scheme 4**：上游只要求 `TIF_PROC_UMOUNTED`、**不带 uid 条件**（含 init 派生的进程）。本实现的条件与之相同——`susfs_is_current_proc_umounted()` 没有 uid 那一半（此前误用了 `_app()` 版本，故曾比上游窄，已修）；粒度差别同 scheme 3：按 uid 问 KernelSU，而非每线程标志。符号解析不到时返回 false（上游在无 SUSFS 补丁的内核上该标志也永远为 0）。
-
-反向伪装（`d_path()` / `statfs()` / fdinfo / `maps`）**不看**规则的 `uid_scheme`：它按 inode 标志 + "这个进程会被 umount" 判定，所以 **scheme 0 的规则对 app 进程同样做反向伪装**（与上游一致）。
+反向伪装（`d_path()` / `statfs()` / fdinfo / `maps`）**不看**规则的 `uid_scheme`：判定只看"这个进程会不会被 umount"，所以 **scheme 0 的规则对 app 进程同样做反向伪装**。
 
 ---
 
@@ -143,7 +139,7 @@ echo clear                                                      > /proc/susfs_op
 
 ## /proc/susfs_hide_modules
 
-维护一份**模块列表**，把列表里的名字从 `/proc/modules` 的那一行去掉（包括root）、把 `/sys/module/<名字>` 从非 root 调用者眼前隐掉、并过滤 `/proc/kallsyms` 里 `module_name` 匹配的行。
+维护一份**模块列表**，把列表里的名字从 `/proc/modules` 的那一行去掉（包括 root）、把 `/sys/module/<名字>` 从非 root 调用者眼前隐掉、并过滤 `/proc/kallsyms` 里匹配的行。
 
 **读**：
 
@@ -208,7 +204,7 @@ echo clear               > /proc/susfs_path     # 清掉所有**普通**规则
 
 ---
 
-**残留风险（已知边界）**：第 2 级对**所有**规则生效，所以如果某条规则持有的 inode 真的被解除 hash、而它的号又被同一超级块里的另一个文件拿走，那条规则会连带隐藏那个文件。
+**残留风险（已知边界）**：一条规则持有的 inode 若真的被解除 hash、而它的号码又被同一超级块里的另一个文件拿走，该规则会连带隐藏那个文件。
 
 ## 隐藏 ≠ 访问控制（用之前必须知道）
 
