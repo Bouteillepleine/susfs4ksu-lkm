@@ -114,7 +114,12 @@ echo clear                                                      > /proc/susfs_op
 | 1 | `uid == 0` 且不在 su 域 |
 | 2 | 不在 su 域 |
 | 3 | KernelSU 报"这个进程会被 umount"（`susfs_is_current_proc_umounted_app()`） |
-| 4 | 同上——上游的 3 还额外要求 `uid >= 10000`，本实现里两者是同一个谓词 |
+| 4 | KernelSU 报"这个进程会被 umount"，不带 uid 条件（`susfs_is_current_proc_umounted()`） |
+
+与上游的差别（`susfs.c:954-961`、`susfs_def.h:98-125`）：
+
+- **scheme 3**：上游是 `TIF_PROC_UMOUNTED && uid >= 10000`。本实现 uid 那一半相同，"是否已被 KernelSU umount"改为**按 uid 问 KernelSU**（`ksu_uid_should_umount`，issue #34），而上游是**每线程**标志 ⇒ 粒度不同：同一个 uid 下未被 umount 的进程（isolated service、KSU 白名单里的 app）上游不命中、本实现命中。符号解析不到时退回纯 `uid >= 10000` 并打印警告。
+- **scheme 4**：上游只要求 `TIF_PROC_UMOUNTED`、**不带 uid 条件**（含 init 派生的进程）。本实现的条件与之相同——`susfs_is_current_proc_umounted()` 没有 uid 那一半（此前误用了 `_app()` 版本，故曾比上游窄，已修）；粒度差别同 scheme 3：按 uid 问 KernelSU，而非每线程标志。符号解析不到时返回 false（上游在无 SUSFS 补丁的内核上该标志也永远为 0）。
 
 反向伪装（`d_path()` / `statfs()` / fdinfo / `maps`）**不看**规则的 `uid_scheme`：它按 inode 标志 + "这个进程会被 umount" 判定，所以 **scheme 0 的规则对 app 进程同样做反向伪装**（与上游一致）。
 
