@@ -14,6 +14,8 @@ SUSFS 的**可加载内核模块（LKM）移植版**：让 susfs 可以在不用
 ksud insmod /data/adb/loader/susfs_guard_lkm.ko
 ```
 
+若 `ksud insmod` 报未知符号而加载失败（各版本都有用户反馈过），改用同一个 `.ko` 走 `susfs_insmod` 加载即可，功能正常。
+
 **非 KernelSU 设备**：用 release 附带的加载器 `susfs_insmod`：
 
 ```sh
