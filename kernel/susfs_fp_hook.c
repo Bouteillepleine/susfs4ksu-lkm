@@ -43,9 +43,13 @@
 #include "susfs_log.h"
 #include "susfs_fp_hook.h"
 
-/* The BTI landing pad of an indirect call target: 'bti c' (an unallocated HINT
- * on cores without BTI, so checking for it is correct either way). */
+/* Landing pads an indirect call may legally target.  PACIASP/PACIBSP are landing pads in
+ * their own right, which is why LLVM emits no 'bti c' for a function that already starts
+ * with one - every non-leaf wrapper here is such a function. */
 #define SUSFS_ARM64_BTI_C	0xd503245fu
+#define SUSFS_ARM64_BTI_JC	0xd50324dfu
+#define SUSFS_ARM64_PACIASP	0xd503233fu
+#define SUSFS_ARM64_PACIBSP	0xd503237fu
 
 static susfs_syscall_fn_t *sys_call_table_ptr;
 static susfs_syscall_fn_t *compat_sys_call_table_ptr;
@@ -178,17 +182,23 @@ void susfs_fp_dump_wrapper(const char *name, const void *fn)
 	}
 	pr_info("susfs_fp: %s at %px first insn 0x%08x (%s)\n", name, fn,
 		READ_ONCE(*(const u32 *)fn),
-		fp_has_landing_pad(fn) ? "bti c" : "NO LANDING PAD");
+		fp_has_landing_pad(fn) ? "landing pad ok" : "NO LANDING PAD");
 }
 
-/* An indirect call into us is checked against the target's BTI landing pad, so a
- * wrapper that does not start with 'bti c' would give "Oops - BTI" instead of
- * hiding anything.  The kernel itself is built with
- * -mbranch-protection=pac-ret+leaf+bti; the module's flags are ours to verify,
- * so verify them and refuse to install rather than find out the hard way. */
+/* An indirect call into us is checked against the target's BTI landing pad only when the
+ * kernel itself is built with +bti; without CONFIG_ARM64_BTI_KERNEL nothing checks BTYPE and
+ * any prologue is reachable.  Demanding 'bti c' alone refused every wrapper on both kinds of
+ * kernel, because a non-leaf function gets PACIASP instead - and that IS a call landing pad. */
 static bool fp_has_landing_pad(const void *fn)
 {
-	return READ_ONCE(*(const u32 *)fn) == SUSFS_ARM64_BTI_C;
+	u32 insn;
+
+	if (!IS_ENABLED(CONFIG_ARM64_BTI_KERNEL))
+		return true;
+
+	insn = READ_ONCE(*(const u32 *)fn);
+	return insn == SUSFS_ARM64_BTI_C || insn == SUSFS_ARM64_BTI_JC ||
+	       insn == SUSFS_ARM64_PACIASP || insn == SUSFS_ARM64_PACIBSP;
 }
 
 int susfs_fp_install(struct susfs_fp_hook *h)
@@ -222,7 +232,7 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 		return -EINVAL;
 	}
 	if (!h->wrapper || !fp_has_landing_pad((const void *)h->wrapper)) {
-		pr_warn("susfs_fp: %s does not start with 'bti c' (0x%08x) - not installed\n",
+		pr_warn("susfs_fp: %s has no BTI landing pad (0x%08x) - not installed\n",
 			h->name, h->wrapper ? READ_ONCE(*(const u32 *)h->wrapper) : 0);
 		return -EINVAL;
 	}
