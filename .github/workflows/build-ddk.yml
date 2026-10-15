@@ -749,6 +749,26 @@ jobs:
           path: /tmp/susfs_open_probe
           if-no-files-found: warn
 
+      # Scans a directory for the placeholder record a post-hoc dirent filter leaves behind: a
+      # 56-byte getdents64 buffer forces one record per call, so a chunk whose only record is
+      # hidden makes such a filter answer with d_ino 0 and an empty name.  Two public detectors
+      # key off exactly that, and a filter that decides before emitting never produces one.
+      - name: Build dirent-scan probe
+        run: |
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_dirent_scan tools/susfs_dirent_scan.c
+          file /tmp/susfs_dirent_scan
+          ls -la /tmp/susfs_dirent_scan
+
+      - name: Upload dirent-scan probe
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_dirent_scan
+          path: /tmp/susfs_dirent_scan
+          if-no-files-found: warn
+
       # mmap a file, touch it, then read /proc/self/pagemap and /proc/self/smaps_rollup *in the same process* - a shell
       # cannot do this, because the child that runs dd has its own mm and therefore its own addresses.
       - name: Build mmap/pagemap probe
