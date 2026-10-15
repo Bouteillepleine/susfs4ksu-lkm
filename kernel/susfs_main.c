@@ -123,6 +123,10 @@ static struct {
      * answering the pre-layer way (which is what the layer exists to fix, not what makes the
      * module useful), and every entry carries its own reason in the log. */
     { "opath",		susfs_opath_init,		susfs_opath_exit,	false, false },
+    /* After sus_path for the same reason as opath - it asks that rule table - and after
+     * susfs_fp_hook, whose table entry it installs.  NOT fatal: when it does not arm, the
+     * post-hoc filter in sus_path.c is still there and hiding continues, just detectably. */
+    { "dirent",		susfs_sus_dirent_init,		susfs_sus_dirent_exit,	false, false },
     { "uname",		susfs_uname_init,		susfs_uname_exit,	false, false },
     { "kstat",		susfs_kstat_init,		susfs_kstat_exit,	false, false },
     { "sus_map",	susfs_sus_map_init,		susfs_sus_map_exit,	false, false },
