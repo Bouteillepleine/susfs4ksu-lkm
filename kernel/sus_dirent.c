@@ -33,6 +33,7 @@
 #include <linux/file.h>
 #include <linux/uaccess.h>
 #include <linux/sched/signal.h>
+#include <linux/mutex.h>
 #include <linux/string.h>
 #include <asm/unistd.h>		/* __NR_getdents64 */
 #include <asm/ptrace.h>		/* struct pt_regs */
@@ -144,6 +145,7 @@ static __nocfi long sd_getdents64(const struct pt_regs *regs)
 	unsigned int count = (unsigned int)regs->regs[2];
 	struct sd_buf buf = {};
 	struct file *f;
+	bool pos_locked = false;
 	long error;
 
 	if (!orig)
@@ -165,6 +167,17 @@ static __nocfi long sd_getdents64(const struct pt_regs *regs)
 	if (!f)
 		return -EBADF;
 
+	/* What fdget_pos() does for the real syscall: a directory carries FMODE_ATOMIC_POS
+	 * (fs/open.c, S_ISREG || S_ISDIR), and without this lock two threads reading one shared
+	 * fd both start from the same f_pos and the listing repeats itself - measured at ~414
+	 * duplicates in 846 records before this was here.  The kernel only takes it when
+	 * file_count() > 1; taking it whenever the mode bit is set is the same lock in the same
+	 * order (f_pos_lock then i_rwsem inside iterate_dir), just without the fast path. */
+	if (f->f_mode & FMODE_ATOMIC_POS) {
+		mutex_lock(&f->f_pos_lock);
+		pos_locked = true;
+	}
+
 	error = sd_iterate_dir(f, &buf.ctx);
 	if (error >= 0)
 		error = buf.error;
@@ -177,6 +190,8 @@ static __nocfi long sd_getdents64(const struct pt_regs *regs)
 		else
 			error = (long)count - buf.count;
 	}
+	if (pos_locked)
+		mutex_unlock(&f->f_pos_lock);
 	fput(f);
 	return error;
 }
