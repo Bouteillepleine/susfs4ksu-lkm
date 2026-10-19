@@ -43,15 +43,17 @@ def main():
     low = min(kmis, key=lambda k: tuple(int(n) for n in k.split("-", 1)[1].split("."))).split("-", 1)[1]
     high = max(kmis, key=lambda k: tuple(int(n) for n in k.split("-", 1)[1].split("."))).split("-", 1)[1]
 
+    # The description is the status line on the KernelSU module card, so it starts out saying
+    # the module has not run yet and load.sh replaces it with the outcome of the boot - a
+    # device where the load failed and one where it worked should not look the same.
     module_prop = (
         "id=susfs_guard_lkm\n"
         "name=SUSFS Guard (LKM)\n"
         f"version={args.tag}\n"
         f"versionCode={version_code}\n"
         "author=inforcqb\n"
-        f"description=Loads the matching susfs_guard_lkm .ko for the device kernel on boot "
-        f"across {len(kmis)} arm64 KMIs ({low}-{high}). Loader only, no rules. "
-        "KernelSU-compatible. Reboot required.\n"
+        f"description=not loaded yet - loads the matching .ko on boot "
+        f"({len(kmis)} arm64 KMIs, {low}-{high}). Loader only, no rules.\n"
     )
     provenance = {
         "repository": "https://github.com/inforcqb/susfs4ksu-lkm",
