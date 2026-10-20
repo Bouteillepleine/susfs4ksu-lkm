@@ -1,5 +1,7 @@
 [中文](README.md)
 
+[x64 Device Compatibility](https://github.com/ymuuuu/susfs4ksu-lkm-x64)
+
 # susfs4ksu-lkm
 
 A loadable kernel module (LKM) port of SUSFS: run susfs without recompiling the kernel.
