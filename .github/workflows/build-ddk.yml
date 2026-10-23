@@ -36,8 +36,8 @@ jobs:
   # publishes gets its own build and its own artifact.
   #   5.10 → android12-5.10, android13-5.10   6.1  → android14-6.1 (kCFI starts here)   6.12 → android16-6.12 (static calls)
   #   5.15 → android13-5.15, android14-5.15   6.6  → android15-6.6                    6.18 → android17-6.18 (same as 6.12)
-  # There is no android14-6.6: Android 14 is 5.15/6.1 and Android 15 is 6.6.  The image tag is pinned to a date on
-  # purpose, so the same commit rebuilt later produces the same module.
+  # There is no android14-6.6: Android 14 is 5.15/6.1 and Android 15 is 6.6.  Each image is pinned by
+  # digest in the matrix below, so the same commit rebuilt later gets the same toolchain.
   #
   # 6.12 (Android 16) and 6.18 (Android 17) ARE built here, like every other variant: they are where LSM dispatch became
   # one static call per (hook, LSM slot) and security_hook_list lost its hlist node, which is a different mechanism with
@@ -45,30 +45,30 @@ jobs:
   # `dev` preview branch only; `main` now ships it too, so all eight variants are BLOCKING - a red 6.12 or 6.18 build
   # fails this workflow instead of being tolerated as experimental.
   module:
+    # Explicit: the required status contexts are "module (<variant>)".  Without this, adding
+    # `image` to the matrix entries changes the default job name and every PR stays BLOCKED.
+    name: module (${{ matrix.variant }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Pinned by digest, not by the date tag: a tag is mutable, and for a project whose output is
+      # kernel code the compiler's identity is part of the artifact.  The variant and its image live
+      # in the same entry, so they cannot drift apart.
       matrix:
-        variant:
-          - android12-5.10
-          - android13-5.10
-          - android13-5.15
-          - android14-5.15
-          - android14-6.1
-          - android15-6.6
-          # 6.12 (Android 16) is where LSM dispatch became per-hook static calls (static_calls_table) and
-          # security_hook_list lost its hlist node, so the < 6.12 head-insertion path cannot work there.  In the matrix
-          # so the >= 6.12 code path is compiled at all; BLOCKING like every other variant (the experimental /
-          # continue-on-error pair that used to carry it is gone on purpose - see the by-name symbol step below).
-          - android16-6.12
-          # 6.18 (Android 17) has the SAME static-call machinery as 6.12 (struct lsm_static_call /
-          # lsm_static_calls_table / security_hook_list and the 13 hook prototypes are field-for-field identical), so one
-          # `>= 6.12` implementation serves both; a separate entry only because the two DDK trees can drift.
-          - android17-6.18
+        include:
+          - { variant: android12-5.10, image: "ghcr.io/ylarod/ddk-min:android12-5.10-20260828@sha256:272ada1e61c525116032246df2a790d1ccec1804b7a9e0b09203c5e650dcb78e" }
+          - { variant: android13-5.10, image: "ghcr.io/ylarod/ddk-min:android13-5.10-20260828@sha256:e5ce038ba38408ad26aae1f2622cfb44dfbf6634b025bf197aa08beac0794f5b" }
+          - { variant: android13-5.15, image: "ghcr.io/ylarod/ddk-min:android13-5.15-20260828@sha256:9e68cd9fcab748584755d31ba88ef134efc938dbde17f258c2652315f6cd81cd" }
+          - { variant: android14-5.15, image: "ghcr.io/ylarod/ddk-min:android14-5.15-20260828@sha256:bbf697a8fe995704268eef710921c9d2ea4f146954690d7ea97887f3a4014a6a" }
+          - { variant: android14-6.1, image: "ghcr.io/ylarod/ddk-min:android14-6.1-20260828@sha256:1dd6ac340b627a90a4031d6d0df6b129d8cc949b139fb56032c898f023d3d5d3" }
+          - { variant: android15-6.6, image: "ghcr.io/ylarod/ddk-min:android15-6.6-20260828@sha256:51159bc935c75a282fc65bc87e02f16bd098d1cdf55dc558c4fdd0fcf7a132e2" }
+          - { variant: android16-6.12, image: "ghcr.io/ylarod/ddk-min:android16-6.12-20260828@sha256:fd3ec5cc71d7f2716212e9df8d5674a9afe68fb769282fcac87b83f207f949ee" }
+          - { variant: android17-6.18, image: "ghcr.io/ylarod/ddk-min:android17-6.18-20260828@sha256:fb8b66200bf402cf65a751060fc1aa29524b9fa8840feef16c7b196a4f3f0e6e" }
     container:
-      # DDK-min image with the GKI kernel headers (modules_prepare done), Module.symvers and the matching Clang toolchain:
-      # KMI freezing guarantees symbol CRCs match the GKI kernel of that release.
-      image: ghcr.io/ylarod/ddk-min:${{ matrix.variant }}-20260828
+      # DDK-min image with the GKI kernel headers (modules_prepare done), Module.symvers and the
+      # matching Clang toolchain: KMI freezing guarantees symbol CRCs match the GKI kernel of that
+      # release.  The image reference (tag + digest) comes from the matrix above.
+      image: ${{ matrix.image }}
       options: --privileged
 
     steps:
@@ -523,11 +523,9 @@ jobs:
           #     warning text would have been false for it.
           #
           # --- capabilities the module can reach by more than one spelling.  Which spelling a
-          #     tree carries is decided by its version, so a missing HALF is the normal case and
-          #     says nothing: 6.12+ has static_calls_table and no security_hook_heads, 5.10 has
-          #     __flush_dcache_area and neither of its successors, and so on.  Warning per symbol
-          #     made every variant noisy enough to hide a real absence, so warn per CAPABILITY:
-          #     only when no alternative is complete does the module actually lose the feature.
+          #     tree carries is version-related, but vendor backports exist; the groups below
+          #     follow the code's compile-time branch per variant instead of accepting a union of
+          #     every spelling a tree might have.
           check_group() {
             _label="$1"; shift
             _ok=""; _detail=""
@@ -547,20 +545,71 @@ jobs:
               echo "::warning::$_label: $S (variant $V) carries none of its spellings ($(echo $_detail)) - this feature cannot arm on this kernel"
             fi
           }
-          check_group "LSM hook table"      "static_calls_table+lsm_active_cnt" "security_hook_heads"
-          check_group "mount id allocator"  "mnt_id_xa+__xa_alloc+__xa_erase" "mnt_id_ida+ida_alloc_range+ida_free"
-          # patch_memory resolves the dcache and icache helpers SEPARATELY and accepts either
-          # spelling for each, so a kernel may legitimately carry a mixed pair.  One group per
-          # helper: locking them together reported NONE for a mix the module handles.
-          check_group "dcache flush"        "dcache_clean_inval_poc" "__flush_dcache_area"
-          check_group "icache flush"        "caches_clean_inval_pou" "__flush_icache_range"
-          check_group "kallsyms by name"    "kallsyms_on_each_match_symbol" "kallsyms_lookup_name" "kallsyms_on_each_symbol"
-          # close_fd_get_file() (5.15, fs/file.c:795) became file_close_fd() (6.11+,
-          # fs/file.c:778), and the two do NOT share a signature: the first returns an int
-          # status and fills an out-param, the second returns the file.  susfs_opath keeps a
-          # separate pointer per name, so either one arms the layer - which is what this
-          # group asserts.  Listed flat, one of the two would warn on every single variant.
-          check_group "fd-table close helper" "close_fd_get_file" "file_close_fd"
+          # fd: < 6.1 resolves close_fd_get_file only; 6.1+ tries close_fd_get_file then
+          # file_close_fd with one pointer.  LSM: < 6.12 security_hook_heads, >= 6.12
+          # static_calls_table.  mount: < 6.18 ida trio, 6.18 xarray trio.  kallsyms:
+          # kallsyms_on_each_match_symbol is USED only from 6.6 on (the gate is empirical: the
+          # 6.1 tree carries the symbol but the module does not bootstrap it there); below 6.6
+          # it is kallsyms_lookup_name plus kallsyms_lookup or kallsyms_on_each_symbol.
+          case "$V" in
+            android12-5.10|android13-5.10|android13-5.15|android14-5.15)
+              lsm_alt="security_hook_heads"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2=""
+              ks1="kallsyms_lookup_name+kallsyms_lookup"
+              ks2="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ks3=""
+              ;;
+            android14-6.1)
+              lsm_alt="security_hook_heads"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2="file_close_fd"
+              ks1="kallsyms_lookup_name+kallsyms_lookup"
+              ks2="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ks3=""
+              ;;
+            android15-6.6)
+              lsm_alt="security_hook_heads"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2="file_close_fd"
+              ks1="kallsyms_on_each_match_symbol"
+              ks2="kallsyms_lookup_name+kallsyms_lookup"
+              ks3="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ;;
+            android16-6.12)
+              lsm_alt="static_calls_table"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2="file_close_fd"
+              ks1="kallsyms_on_each_match_symbol"
+              ks2="kallsyms_lookup_name+kallsyms_lookup"
+              ks3="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ;;
+            android17-6.18)
+              lsm_alt="static_calls_table"
+              mount_alt="mnt_id_xa+__xa_alloc+__xa_erase"
+              fd2="file_close_fd"
+              ks1="kallsyms_on_each_match_symbol"
+              ks2="kallsyms_lookup_name+kallsyms_lookup"
+              ks3="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ;;
+            *)
+              echo "::error::no per-variant capability map for $V"
+              exit 1
+              ;;
+          esac
+          check_group "LSM hook table" "$lsm_alt"
+          check_group "mount id allocator" "$mount_alt"
+          if [ -n "$fd2" ]; then
+            check_group "fd-table close helper" "close_fd_get_file" "$fd2"
+          else
+            check_group "fd-table close helper" "close_fd_get_file"
+          fi
+          check_group "kallsyms by name" "$ks1" "$ks2" ${ks3:+"$ks3"}
+          # lsm_active_cnt is informational: only static_calls_table gates arming (lsm_hook.c
+          # pr_err's and continues when the count is absent).
+          if [ "$V" = "android16-6.12" ] || [ "$V" = "android17-6.18" ]; then
+            printf '  %-34s %s   (informational; absence is non-fatal)\n' "lsm_active_cnt" "$(sym_count lsm_active_cnt)"
+          fi
 
           # __static_call_update is resolved by name but is NOT required: lsm_hook.c falls back to
           # the compiled-in macro and logs which path it took.  arm64 builds without
@@ -573,19 +622,15 @@ jobs:
             printf '  %-34s %s\n' "__static_call_update" "$n"
           fi
 
-          #     fget_raw and close_fd_get_file (susfs_opath.c) ARE listed: both are resolved by
-          #     name at runtime, so neither can appear in the .ko's undefined list and this loop
-          #     is the only place a variant's answer for them is recorded.  close_fd_get_file is
-          #     not exported at all, so a 0 here means the O_PATH layer cannot arm on that
-          #     variant.  fput is deliberately NOT here: it is EXPORT_SYMBOL'd and used as an
-          #     ordinary import, which the loader gate above and imports_guard.c already cover.
+          #     fget_raw (susfs_opath.c) IS listed: it is resolved by name at runtime, so it
+          #     cannot appear in the .ko's undefined list and this loop is the only place a
+          #     variant's answer is recorded.  fput is deliberately NOT here: it is
+          #     EXPORT_SYMBOL'd and used as an ordinary import, which the loader gate above and
+          #     imports_guard.c already cover.
           #
-          #     close_fd_get_file() and file_close_fd() are the old and the new name of the same
-          #     helper - and 6.1 changed the SIGNATURE without changing the name (int status plus
-          #     an out-param became the file itself).  The module picks its prototype from the
-          #     kernel it is built for, so which name must resolve differs per variant: the
-          #     expected counts are close_fd_get_file: 1 on 5.10/5.15/6.1/6.6 and 0 on 6.12/6.18,
-          #     with file_close_fd the other way round.
+          #     close_fd_get_file/file_close_fd are covered by the fd-table group above: from
+          #     6.1 the module tries close_fd_get_file first and file_close_fd second; before
+          #     6.1 only close_fd_get_file resolves.
           #     The two syscall tables are listed for the same reason: susfs_fp_hook resolves them
           #     by name, and a 0 for either is what would stop every table-entry layer at once
           #     (the tables themselves obviously exist - this is about the symbol being in
@@ -593,7 +638,7 @@ jobs:
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
                    fget_raw sys_call_table compat_sys_call_table \
-                   namespace_sem kallsyms_op modules_op kallsyms_lookup \
+                   namespace_sem kallsyms_op modules_op \
                    synchronize_rcu_tasks task_work_add put_unused_fd \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
                    smaps_walk_ops smaps_shmem_walk_ops pagemap_ops; do
@@ -666,7 +711,7 @@ jobs:
   tools:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/ylarod/ddk-min:android14-6.1-20260828
+      image: ghcr.io/ylarod/ddk-min:android14-6.1-20260828@sha256:1dd6ac340b627a90a4031d6d0df6b129d8cc949b139fb56032c898f023d3d5d3
       options: --privileged
     steps:
       - name: Checkout module
@@ -763,7 +808,7 @@ jobs:
 
       - name: Upload dirent-scan probe
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: susfs_dirent_scan
           path: /tmp/susfs_dirent_scan
@@ -993,6 +1038,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Collect the toolchain images
+        run: |
+          python - <<'EOF'
+          import json, pathlib, re
+          text = pathlib.Path(".github/workflows/build-ddk.yml").read_text()
+          images = sorted(set(re.findall(
+              r"ghcr\.io/ylarod/ddk-min:[^@\s]+@sha256:[0-9a-f]{64}", text)))
+          if len(images) != 8:
+              raise SystemExit(f"expected 8 digest-pinned DDK images, found {len(images)}")
+          pathlib.Path("ddk-images.json").write_text(json.dumps(images, indent=2) + "\n")
+          EOF
+
       # The tag carries the ref and the commit because this is a build, not a release: the ZIP
       # from a PR run says so in its own name and in module.prop.  The ref's slashes are folded
       # to dashes FIRST: a branch called pr/someone would otherwise turn the output path into
@@ -1003,7 +1060,9 @@ jobs:
           set -euo pipefail
           tag="$(echo "$GITHUB_REF_NAME" | tr '/' '-')-$(git rev-parse --short HEAD)"
           python tools/pack_module.py --ko-dir ko --insmod bin/susfs_insmod \
-            --tag "$tag" --out "dist/susfs_guard_lkm-module-$tag-arm64.zip"
+            --tag "$tag" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --ddk-images ddk-images.json \
+            --out "dist/susfs_guard_lkm-module-$tag-arm64.zip"
           ls -l dist
 
       - name: Upload the flashable module
